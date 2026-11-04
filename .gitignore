@@ -1,0 +1,12 @@
+# Build output
+bin/
+obj/
+*.user
+.vs/
+
+# Derived from the "[DT] Big Fluffy Coat" mod mesh: not ours to redistribute
+FurRenderer/Assets/
+source/
+
+# Python
+__pycache__/

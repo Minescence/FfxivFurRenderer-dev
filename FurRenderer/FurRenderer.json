@@ -1,0 +1,18 @@
+{
+  "Author": "User",
+  "Name": "Fur Renderer",
+  "Punchline": "GPU strand fur for Hikari's Big Fluffy Coat.",
+  "Description": "Draws hundreds of thousands of skinned hair strands over Hikari's DT Big Fluffy Coat, grown offline with the TheSleeveExperiment Blender recipe. Local only.",
+  "InternalName": "FurRenderer",
+  "AssemblyVersion": "0.1.0.0",
+  "RepoUrl": "",
+  "ApplicableVersion": "any",
+  "Tags": ["visual", "gpose"],
+  "DalamudApiLevel": 15,
+  "LoadRequiredState": 0,
+  "LoadSync": false,
+  "LoadPriority": 0,
+  "CanUnloadAsync": false,
+  "IconUrl": "",
+  "ImageUrls": []
+}
