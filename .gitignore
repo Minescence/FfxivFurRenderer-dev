@@ -10,3 +10,6 @@ source/
 
 # Python
 __pycache__/
+
+# Session hand-off notes
+HANDOFF.md
