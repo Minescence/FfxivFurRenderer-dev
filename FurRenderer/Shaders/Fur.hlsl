@@ -210,7 +210,8 @@ float3 SceneLit(float3 color, float2 at, float depth)
     [unroll] for (int k = 0; k < 5; k++)
     {
         float2 s = SceneLuma.Load(int3(int2(at) + taps[k], 0));
-        if (UseSceneDepth != 0 && abs(s.y - depth) > 0.3)
+        // s.y is 0 only off-screen (out-of-bounds read), where there is no scene to take light from.
+        if (UseSceneDepth != 0 && (s.y == 0 || abs(s.y - depth) > 0.3))
             continue;
         luma += s.x;
         count++;

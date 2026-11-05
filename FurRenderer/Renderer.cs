@@ -456,9 +456,7 @@ internal sealed unsafe class Renderer : IDisposable
             D3D11_TEXTURE2D_DESC current;
             sceneCopy->GetDesc(&current);
             if (current.Width == bb.Width && current.Height == bb.Height && current.Format == bb.Format) return true;
-            Release(ref sceneCopySrv);
-            Release(ref sceneCopy);
-            Release(ref sceneLumaSrv); Release(ref sceneLumaRtv); Release(ref sceneLuma);
+            ReleaseSceneCopy();
         }
         var desc = new D3D11_TEXTURE2D_DESC
         {
@@ -471,10 +469,18 @@ internal sealed unsafe class Renderer : IDisposable
             if (device->CreateShaderResourceView((ID3D11Resource*)sceneCopy, null, out_).FAILED) { Release(ref sceneCopy); return false; }
         desc.Format = DXGI_FORMAT_R32G32_FLOAT;
         desc.BindFlags = (uint)(D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
-        fixed (ID3D11Texture2D** out_ = &sceneLuma) Check(device->CreateTexture2D(&desc, null, out_), "CreateTexture2D(scene luma)");
-        fixed (ID3D11RenderTargetView** out_ = &sceneLumaRtv) Check(device->CreateRenderTargetView((ID3D11Resource*)sceneLuma, null, out_), "CreateRenderTargetView(scene luma)");
-        fixed (ID3D11ShaderResourceView** out_ = &sceneLumaSrv) Check(device->CreateShaderResourceView((ID3D11Resource*)sceneLuma, null, out_), "CreateShaderResourceView(scene luma)");
-        return true;
+        bool created;
+        fixed (ID3D11Texture2D** out_ = &sceneLuma) created = device->CreateTexture2D(&desc, null, out_).SUCCEEDED;
+        if (created) fixed (ID3D11RenderTargetView** out_ = &sceneLumaRtv) created = device->CreateRenderTargetView((ID3D11Resource*)sceneLuma, null, out_).SUCCEEDED;
+        if (created) fixed (ID3D11ShaderResourceView** out_ = &sceneLumaSrv) created = device->CreateShaderResourceView((ID3D11Resource*)sceneLuma, null, out_).SUCCEEDED;
+        if (!created) ReleaseSceneCopy();
+        return created;
+    }
+
+    private void ReleaseSceneCopy()
+    {
+        Release(ref sceneCopySrv); Release(ref sceneCopy);
+        Release(ref sceneLumaSrv); Release(ref sceneLumaRtv); Release(ref sceneLuma);
     }
 
     /// <summary>Self-test: counts pure magenta (debug-solid) pixels in the back buffer, sampling every 4th pixel.</summary>
@@ -634,8 +640,7 @@ internal sealed unsafe class Renderer : IDisposable
         Release(ref furResolvedSrv); Release(ref furResolved);
         Release(ref rtv); Release(ref rtvTarget); Release(ref rtvOther); Release(ref rtvOtherTarget);
         Release(ref readback);
-        Release(ref sceneCopySrv); Release(ref sceneCopy);
-        Release(ref sceneLumaSrv); Release(ref sceneLumaRtv); Release(ref sceneLuma);
+        ReleaseSceneCopy();
         device->Release();
     }
 
