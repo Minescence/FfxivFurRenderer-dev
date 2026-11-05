@@ -112,6 +112,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 (fresh.ChildCount, fresh.ChildSpread, fresh.LengthScale, fresh.WidthScale, fresh.MinPixelWidth, fresh.Gravity);
             config.Version = 10;
         }
+        // 6 (the reference fit) turned every camera-facing stretch of fur into deep crimson bands and spots.
+        if (config.Version < 11) { config.FacingDepth = 2f; config.Version = 11; }
         interop = new GameInterop(clientState, objectTable, log);
         debugCapture = new DebugCapture(pluginInterface.GetPluginConfigDirectory(), config, interop.SetCamera, () => traceRequested = true);
         try

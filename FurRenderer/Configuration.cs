@@ -6,7 +6,7 @@ namespace FurRenderer;
 [Serializable]
 public sealed class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 10;
+    public int Version { get; set; } = 11;
 
     public bool Enabled { get; set; } = true;
     public bool OnlyInGpose { get; set; }
@@ -44,10 +44,11 @@ public sealed class Configuration : IPluginConfiguration
     /// <summary>
     /// Colour absorption through the fur depth (darker, more saturated roots) and how much more when looking down into it.
     /// Fitted through AgX to the reference renders: lit fur seen side-on is near the base colour plus sheen, fur pointing at
-    /// the camera is deep crimson.
+    /// the camera is deep crimson. That fit gave FacingDepth 6, which in game made bands and spots wherever the coat faces the
+    /// camera; 2 keeps a hint of it.
     /// </summary>
     public float Absorption { get; set; } = 0.4f;
-    public float FacingDepth { get; set; } = 6f;
+    public float FacingDepth { get; set; } = 2f;
     /// <summary>0 = synthetic lighting only; 1 = colour and lighting sampled from the game's lit coat under each strand root.</summary>
     public float SceneLighting { get; set; } = 1f;
     /// <summary>1 / the lit coat's brightness in full sun (about 0.66 linear here), so sunlit fur keeps its colour and shadows darken it.</summary>
