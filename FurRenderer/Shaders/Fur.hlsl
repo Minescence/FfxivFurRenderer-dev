@@ -31,6 +31,8 @@ struct StrandMatrix
 };
 StructuredBuffer<StrandMatrix> StrandMatrices : register(t9);
 RWStructuredBuffer<StrandMatrix> StrandMatricesOut : register(u0);
+Texture2D<float2> SurfaceLight : register(t11);       // 1/8 size with mips: the fur surface's luminance x coverage, coverage
+SamplerState LinearClamp : register(s0);
 Texture2D<float4> SceneColor : register(t10);         // copy of the lit frame (display-encoded) taken just before drawing
 
 cbuffer Frame : register(b0)
@@ -216,6 +218,19 @@ float3 SceneLit(float3 color, float2 at, float depth)
         luma += s.x;
         count++;
     }
+    // No surface here: a strand past the silhouette whose root is off-screen or hidden, up close hundreds of pixels from the
+    // surface it grows from. Unscaled it would glow in any scene darker than daylight. Each coarser level of the surface's light
+    // fills in what the finer ones lack.
+    if (count == 0)
+    {
+        static const float levels[4] = { 1, 3, 5, 8 };
+        [unroll] for (int k = 0; k < 4; k++)
+        {
+            float2 s = SurfaceLight.SampleLevel(LinearClamp, at / ViewportSize, levels[k]);
+            luma += (1 - count) * s.x;
+            count += (1 - count) * s.y;
+        }
+    }
     return count > 0 ? color * lerp(1.0, luma / count * SceneGain, SceneLighting) : color;
 }
 
@@ -285,6 +300,15 @@ float4 PSUnder(UnderOut i) : SV_Target
     float3 albedo = UndercoatColor * pow(max(BaseColor, 1e-3), Absorption * (1.0 + FacingDepth * LookingIn(facing)));
     albedo = lerp(albedo, BaseColor, EndOn(facing)); // the gaps between end-on strands, shaded like their tips
     return Output(SceneLit(albedo * (AmbientColor + diffuse * LightIntensity), i.pos.xy, LinearDepth(i.pos.z)));
+}
+
+// Into SurfaceLight, with VSUnder: what the game lit where its surface is the one this mesh draws (not what is in front of it).
+float2 PSSurfaceLight(UnderOut i) : SV_Target
+{
+    float2 s = SceneLuma.Load(int3(i.pos.xy * 8, 0));
+    if (abs(s.y - LinearDepth(i.pos.z)) > 0.1)
+        discard;
+    return float2(s.x, 1);
 }
 
 float4 PSMain(VsOut i, uint geometry : SV_Coverage, out uint coverage : SV_Coverage) : SV_Target

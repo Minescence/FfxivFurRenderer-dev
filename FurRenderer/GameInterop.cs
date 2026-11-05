@@ -25,6 +25,7 @@ internal sealed unsafe class GameInterop : IDisposable
     private const int GPoseObjectIndex = 201;
     private const ushort GlovesModelSetId = 239;
     private const ushort RingModelSetId = 122;
+    private const int CutsceneObjectEnd = 440; // actors spawned in GPose (Brio, Anamnesis) sit in the cutscene range
 
     private readonly IObjectTable objects;
     private readonly IClientState clientState;
@@ -33,15 +34,6 @@ internal sealed unsafe class GameInterop : IDisposable
     // Typed depth SRV created over a typeless resource, keyed by resource pointer.
     private nint depthSrvResource;
     private ID3D11ShaderResourceView* depthSrv;
-
-    // hkaSkeleton* -> inverse of the reference-pose model-space transform of every bone.
-    private readonly Dictionary<nint, Matrix4x4[]> bindInverseCache = [];
-
-    // Bone lookup resolved against one (character, skeleton set, name list); rebuilt when any of them changes.
-    private nint lookupCharacter;
-    private IReadOnlyList<string>? lookupNames;
-    private nint lookupSignature;
-    private (int Partial, int Bone)[] lookup = [];
 
     /// <summary>
     /// True when the last <see cref="TryGetCamera"/> read a reverse-Z projection (Render.Camera.StandardZ == false).
@@ -61,7 +53,6 @@ internal sealed unsafe class GameInterop : IDisposable
     public void Dispose()
     {
         ReleaseDepthSrv();
-        bindInverseCache.Clear();
     }
 
     /// <summary>How the device/context were resolved (for the debug log).</summary>
@@ -293,14 +284,14 @@ internal sealed unsafe class GameInterop : IDisposable
     /// Unverified assumption: bind and pose model spaces of partial skeletons other than the first are both relative to
     /// that partial's own root; bones in the main (body) partial are exact.
     /// </remarks>
-    public bool TryGetSkinMatrices(nint characterBase, IReadOnlyList<string> boneNames, Span<Matrix4x4> skin, Span<bool> found)
+    public bool TryGetSkinMatrices(nint characterBase, BoneLookup lookup, IReadOnlyList<string> boneNames, Span<Matrix4x4> skin, Span<bool> found)
     {
         var count = Math.Min(boneNames.Count, Math.Min(skin.Length, found.Length));
-        var human = AsHuman(characterBase);
-        if (human == null || human->Skeleton == null)
+        var character = AsCharacter(characterBase);
+        if (character == null || character->Skeleton == null)
             return false;
 
-        var skeleton = human->Skeleton;
+        var skeleton = character->Skeleton;
         var rootToWorld = RootToWorld(skeleton);
         for (var i = 0; i < count; i++)
         {
@@ -320,19 +311,19 @@ internal sealed unsafe class GameInterop : IDisposable
             signature = signature * 31 + (pose != null ? (nint)pose->Skeleton : 0);
         }
 
-        if (lookupCharacter != characterBase || lookupSignature != signature || !ReferenceEquals(lookupNames, boneNames) || lookup.Length != boneNames.Count)
-            RebuildLookup(characterBase, signature, skeleton, partialCount, boneNames);
+        if (lookup.Character != characterBase || lookup.Signature != signature || lookup.Bones.Length != boneNames.Count)
+            RebuildLookup(lookup, characterBase, signature, skeleton, partialCount, boneNames);
 
         var any = false;
         for (var i = 0; i < count; i++)
         {
-            var (partial, bone) = lookup[i];
+            var (partial, bone) = lookup.Bones[i];
             if (partial < 0)
                 continue;
 
             var pose = GetPose(skeleton, partial);
             if (pose == null || pose->Skeleton == null || bone >= pose->ModelPose.Length
-                || !bindInverseCache.TryGetValue((nint)pose->Skeleton, out var bindInverse) || bone >= bindInverse.Length)
+                || !lookup.BindInverse.TryGetValue((nint)pose->Skeleton, out var bindInverse) || bone >= bindInverse.Length)
                 continue;
 
             skin[i] = bindInverse[bone] * ToMatrix(pose->ModelPose.Data[bone]) * rootToWorld;
@@ -360,6 +351,100 @@ internal sealed unsafe class GameInterop : IDisposable
             return CoatSlot.Ring;
 
         return CoatSlot.None;
+    }
+
+    /// <summary>
+    /// Models using Hikari's fur textures, in the coat's slots (drawn from its baked assets, so only their colour is of use) or in
+    /// all the others. The texture paths stay game
+    /// paths under Penumbra; the model's file name is the mod's file on disk.
+    /// </summary>
+    public List<FurModel> FindFurModels(nint characterBase, bool coatSlots = false)
+    {
+        var models = new List<FurModel>();
+        var character = AsCharacter(characterBase);
+        if (character == null || character->Models == null)
+            return models;
+
+        var human = AsHuman(characterBase);
+        for (var slot = 0; slot < character->SlotCount; slot++)
+        {
+            var model = character->Models[slot];
+            if (model == null || model->ModelResourceHandle == null || model->Materials == null || (human != null && IsCoatSlot(human, slot)) != coatSlots)
+                continue;
+
+            var fur = 0u;
+            var first = -1;
+            for (var m = 0; m < Math.Min(model->MaterialCount, 32); m++)
+            {
+                var material = model->Materials[m];
+                if (material == null || material->MaterialResourceHandle == null || !UsesFurTexture(material->MaterialResourceHandle))
+                    continue;
+                fur |= 1u << m;
+                if (first < 0)
+                    first = m;
+            }
+
+            if (fur == 0)
+                continue;
+            var path = model->ModelResourceHandle->FileName.ToString();
+            models.Add(new FurModel(path[(path.LastIndexOf('|') + 1)..], fur, model->EnabledAttributeIndexMask, slot, first));
+        }
+
+        return models;
+    }
+
+    private static bool UsesFurTexture(FFXIVClientStructs.FFXIV.Client.System.Resource.Handle.MaterialResourceHandle* material)
+    {
+        for (var t = 0; t < material->TextureCount; t++)
+            if (material->TexturePath(t).AsSpan().StartsWith("chara/common/texture/minamotohikari/fur_"u8))
+                return true;
+        return false;
+    }
+
+    private static bool IsCoatSlot(Human* human, int slot) => slot switch
+    {
+        2 => human->Arms.Id == GlovesModelSetId,
+        8 => human->RFinger.Id == RingModelSetId,
+        9 => human->LFinger.Id == RingModelSetId,
+        _ => false,
+    };
+
+    /// <summary>Visible monster-type actors that can be fur props: the player's minion, or every other actor in GPose.</summary>
+    public List<nint> GetProps()
+    {
+        var props = new List<nint>();
+        if (FFXIVClientStructs.FFXIV.Client.Game.GameMain.IsInGPose())
+        {
+            var manager = FFXIVClientStructs.FFXIV.Client.Game.Object.GameObjectManager.Instance();
+            if (manager != null)
+                for (var i = GPoseObjectIndex + 1; i < CutsceneObjectEnd; i++)
+                    AddProp(props, manager->Objects.IndexSorted[i].Value);
+        }
+        else
+        {
+            var target = GetTargetObject();
+            if (target != null)
+                AddProp(props, (FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)((Character*)target)->CompanionData.CompanionObject);
+        }
+
+        return props;
+    }
+
+    private static void AddProp(List<nint> props, FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject* gameObject)
+    {
+        var character = gameObject == null ? null : AsCharacter((nint)gameObject->DrawObject);
+        if (character != null && character->GetModelType() == CharacterBase.ModelType.Monster && character->DrawObject.IsVisible)
+            props.Add((nint)character);
+    }
+
+    /// <summary>The live colour table (dye applied) of a slot's material, not AddRef'd; null while there is none.</summary>
+    public ID3D11Texture2D* GetColorTable(nint characterBase, int slot, int material)
+    {
+        var character = AsCharacter(characterBase);
+        if (character == null || character->ColorTableTextures == null || material >= CharacterBase.MaterialsPerSlot)
+            return null;
+        var table = character->ColorTableTextures[slot * CharacterBase.MaterialsPerSlot + material];
+        return table == null ? null : (ID3D11Texture2D*)table->D3D11Texture2D;
     }
 
     /// <summary>True if the target's body model is male (c0101-family asset), false for female (c0201-family).</summary>
@@ -429,15 +514,17 @@ internal sealed unsafe class GameInterop : IDisposable
 
     private static Human* AsHuman(nint address)
     {
+        var character = AsCharacter(address);
+        return character != null && character->GetModelType() == CharacterBase.ModelType.Human ? (Human*)address : null;
+    }
+
+    private static CharacterBase* AsCharacter(nint address)
+    {
         if (address == 0)
             return null;
 
         var drawObject = (DrawObject*)address;
-        if (drawObject->Object.GetObjectType() != ObjectType.CharacterBase)
-            return null;
-
-        var character = (CharacterBase*)address;
-        return character->GetModelType() == CharacterBase.ModelType.Human ? (Human*)address : null;
+        return drawObject->Object.GetObjectType() == ObjectType.CharacterBase ? (CharacterBase*)address : null;
     }
 
     private static hkaPose* GetPose(Skeleton* skeleton, int partial)
@@ -460,9 +547,9 @@ internal sealed unsafe class GameInterop : IDisposable
         return Matrix4x4.CreateScale(scale) * Matrix4x4.CreateFromQuaternion(rotation) * Matrix4x4.CreateTranslation(translation);
     }
 
-    private void RebuildLookup(nint characterBase, nint signature, Skeleton* skeleton, int partialCount, IReadOnlyList<string> boneNames)
+    private static void RebuildLookup(BoneLookup lookup, nint characterBase, nint signature, Skeleton* skeleton, int partialCount, IReadOnlyList<string> boneNames)
     {
-        bindInverseCache.Clear();
+        lookup.BindInverse.Clear();
         var byName = new Dictionary<string, (int Partial, int Bone)>();
         for (var p = 0; p < partialCount; p++)
         {
@@ -471,7 +558,7 @@ internal sealed unsafe class GameInterop : IDisposable
                 continue;
 
             var havok = pose->Skeleton;
-            bindInverseCache[(nint)havok] = BuildBindInverse(havok);
+            lookup.BindInverse[(nint)havok] = BuildBindInverse(havok);
             for (var b = 0; b < havok->Bones.Length; b++)
             {
                 var name = havok->Bones[b].Name.String;
@@ -480,13 +567,12 @@ internal sealed unsafe class GameInterop : IDisposable
             }
         }
 
-        lookup = new (int, int)[boneNames.Count];
-        for (var i = 0; i < lookup.Length; i++)
-            lookup[i] = byName.GetValueOrDefault(boneNames[i], (-1, -1));
+        lookup.Bones = new (int, int)[boneNames.Count];
+        for (var i = 0; i < lookup.Bones.Length; i++)
+            lookup.Bones[i] = byName.GetValueOrDefault(boneNames[i], (-1, -1));
 
-        lookupCharacter = characterBase;
-        lookupSignature = signature;
-        lookupNames = boneNames;
+        lookup.Character = characterBase;
+        lookup.Signature = signature;
     }
 
     private static Matrix4x4[] BuildBindInverse(hkaSkeleton* havok)
@@ -523,6 +609,17 @@ internal sealed unsafe class GameInterop : IDisposable
         depthSrv = null;
         depthSrvResource = 0;
     }
+}
+
+/// <summary>A model drawn with Hikari's fur textures: its file, which of its materials use them, and where its colour table lives.</summary>
+internal readonly record struct FurModel(string Path, uint FurMaterials, uint EnabledAttributes, int Slot, int FirstFurMaterial);
+
+/// <summary>A bone list resolved against one character's skeletons; rebuilt when either changes.</summary>
+internal sealed class BoneLookup
+{
+    public nint Character, Signature;
+    public (int Partial, int Bone)[] Bones = [];
+    public readonly Dictionary<nint, Matrix4x4[]> BindInverse = []; // hkaSkeleton* -> inverse of the reference-pose model-space transform of every bone
 }
 
 internal enum CoatSlot

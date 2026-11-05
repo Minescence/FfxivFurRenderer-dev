@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Game.Command;
@@ -22,28 +23,54 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private readonly DebugCapture debugCapture;
     private Renderer? renderer;
     private string? rendererError;
-    private string? loadedAssetName;
-    private string? assetError;
     private readonly IDataManager dataManager;
-    private volatile Matrix4x4[]? deform; // race deformer per bone of the loaded asset
     private bool[] found = new bool[Renderer.MaxBones];
     private volatile FrameSnapshot? snapshot;
+    private readonly Dictionary<string, FurItem> items = []; // by model, enabled submeshes and wearer race; main thread
+    private readonly List<FurItem> retiring = [];
+    private readonly ConcurrentQueue<FurItem> retiredItems = new();
+    private readonly ConcurrentQueue<(FurItem Item, nint Table)> colorReads = new(); // tables AddRef'd for the render thread
+    private bool reloadItems;
+    private int frame;
+
+    private const int RetireAfterFrames = 300;
+    // Row 0 of Hikari's materials, undyed. Such items take the configured fur colour so an outfit matches the coat; dyes and
+    // other colours (the white boots, the red boa) show as they are.
+    private static readonly Vector3 UndyedFur = new(0.984f, 0.615f, 0.603f);
+
+    /// <summary>A fur-bearing model: growing, or ready to draw.</summary>
+    private sealed class FurItem
+    {
+        public required string Name;
+        public Task<FurAsset?>? Growth;
+        public Matrix4x4[]? Deform; // race deformer per bone; set by the growth task
+        public string[] BoneNames = [];
+        public int StrandCount;
+        public readonly BoneLookup Lookup = new();
+        public int LastUsed;
+        public nint ColorTable;
+        public volatile FurAsset? Upload; // held for the render thread, then dropped: the strands stay on the GPU only
+        public Renderer.FurBuffers? Buffers; // render thread
+        public Vector3? Color; // render thread; null = the configured colour
+    }
+
+    private readonly record struct ItemDraw(FurItem Item, Matrix4x4[] Skin);
+
+    // The scene's light is read off the game's own lit item, dye included: without this a dark dye darkens the fur twice, as its
+    // colour and again as less light. Capped because a near-black item's pixels are mostly sheen, which no dye darkens.
+    private static float LightGain(Vector3 dye)
+    {
+        var luminance = new Vector3(0.2126f, 0.7152f, 0.0722f);
+        return Math.Min(Vector3.Dot(UndyedFur, luminance) / Math.Max(Vector3.Dot(dye, luminance), 1e-3f), 16f);
+    }
 
     /// <summary>Main-thread state for one frame, consumed by the render thread.</summary>
     private sealed class FrameSnapshot
     {
         public string? Skip;
         public bool Gpose;
-        public nint Character;
-        public string AssetName = "";
-        public string LoadKey = ""; // asset + wearer race: the race deformer is rebuilt on load
-        public ushort Race, ModelRace;
-        public Dictionary<string, string>? Parents;
-        public byte[]? Pbd;
-        public string PbdSource = "";
-        public Matrix4x4[]? Skin;
-        public int Bones;
-        public string BonesInfo = "";
+        public readonly List<ItemDraw> Items = [];
+        public int Growing, Bones, MissingBones;
         public Matrix4x4 View, Proj;
     }
     private bool windowOpen;
@@ -55,6 +82,10 @@ public sealed unsafe class Plugin : IDalamudPlugin
     // back buffer, so drawing right after that bind puts the fur under the UI (approach from Gaolbreak's capturer).
     private delegate void DoSetTargetDelegate(ImmediateContext* self, RenderCommandSetTarget* command);
     private readonly Hook<DoSetTargetDelegate>? setTargetHook;
+    // Hook.Original throws once the hook is disposed, which took the game down on a reload with the render thread in the detour.
+    private readonly DoSetTargetDelegate? originalSetTarget;
+    private volatile bool disposing;
+    private int detoursRunning;
     private int backBufferBinds, lastFrameBinds;
     private int furDraws;
     private readonly System.Diagnostics.Stopwatch cadenceWatch = new();
@@ -117,6 +148,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         try
         {
             setTargetHook = hooks.HookFromAddress<DoSetTargetDelegate>(ImmediateContext.Addresses.DoSetTargetCommand.Value, SetTargetDetour);
+            originalSetTarget = setTargetHook.Original;
             setTargetHook.Enable();
             Diag("hook", "DoSetTargetCommand hooked");
         }
@@ -176,8 +208,26 @@ public sealed unsafe class Plugin : IDalamudPlugin
         // itself, which starts on the previous Tick's frame as Present returns: about one frame in nine drew with the camera
         // of the frame before, and with the camera moving towards the coat (ground collision) the whole fur failed the depth test.
         var snap = new FrameSnapshot { Gpose = FFXIVClientStructs.FFXIV.Client.Game.GameMain.IsInGPose() };
-        Fill(snap);
+        frame++;
+        foreach (var (key, item) in items)
+        {
+            if (!reloadItems && frame - item.LastUsed < RetireAfterFrames) continue;
+            items.Remove(key);
+            retiring.Add(item);
+        }
+        reloadItems = false;
+        // Dalamud stops calling a draw handler that throws, which would freeze the fur on its last pose.
+        try { Fill(snap); }
+        catch (Exception ex)
+        {
+            snap.Items.Clear();
+            snap.Skip = "fur update failed: " + ex.Message;
+            Diag("fill", ex.ToString());
+        }
         snapshot = snap;
+        // Only now: the render thread frees these before it reads the snapshot, so it can't still be drawing them.
+        foreach (var item in retiring) retiredItems.Enqueue(item);
+        retiring.Clear();
         if (testCases != null) StepSelfTest();
         var debugResult = debugCapture.Tick(
             () => interop.TryGetDevice(out _, out var c) && interop.TryGetBackBuffer(out var b) ? ((nint)c, (nint)b) : null,
@@ -189,6 +239,20 @@ public sealed unsafe class Plugin : IDalamudPlugin
     }
 
     private void SetTargetDetour(ImmediateContext* self, RenderCommandSetTarget* command)
+    {
+        Interlocked.Increment(ref detoursRunning);
+        try
+        {
+            if (disposing) originalSetTarget?.Invoke(self, command);
+            else DrawAroundSetTarget(self, command);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref detoursRunning);
+        }
+    }
+
+    private void DrawAroundSetTarget(ImmediateContext* self, RenderCommandSetTarget* command)
     {
         try
         {
@@ -217,7 +281,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             log.Error(ex, "SetTarget detour failed");
         }
 
-        setTargetHook!.Original(self, command);
+        originalSetTarget?.Invoke(self, command);
         try
         {
             var rtm = RenderTargetManager.Instance();
@@ -331,37 +395,130 @@ public sealed unsafe class Plugin : IDalamudPlugin
     {
         if (!config.Enabled) { snap.Skip = "disabled"; return false; }
         if (config.OnlyInGpose && !snap.Gpose) { snap.Skip = "waiting for GPose"; return false; }
-        snap.Character = interop.GetTargetCharacterBase();
-        if (snap.Character == 0) { snap.Skip = "no target character"; return false; }
-        var slot = interop.GetCoatSlot(snap.Character);
-        var male = interop.IsMale(snap.Character);
-        if (slot == CoatSlot.None && config.RequireCoatEquipped) { snap.Skip = "coat not equipped"; return false; }
-        snap.AssetName = $"coat_{(slot == CoatSlot.Ring ? "ril" : "glv")}_{(male ? "m" : "f")}.furasset";
-        (snap.Race, snap.ModelRace) = (interop.GetRaceSexId(snap.Character), (ushort)(male ? 101 : 201));
-        snap.LoadKey = $"{snap.AssetName}@c{snap.Race:D4}";
-        if (snap.LoadKey != loadedAssetName)
-        {
-            snap.Parents = interop.GetBoneParents(snap.Character);
-            (snap.Pbd, snap.PbdSource) = ReadPbd(interop.GetTargetObjectIndex());
-        }
+        var character = interop.GetTargetCharacterBase();
+        if (character == 0) { snap.Skip = "no target character"; return false; }
         if (!interop.TryGetCamera(out snap.View, out snap.Proj)) { snap.Skip = "camera unavailable"; return false; }
         Diag("camera", $"StandardZ-derived reverseZ {interop.LastCameraReverseZ}; proj row3 {snap.Proj.M31:G4} {snap.Proj.M32:G4} {snap.Proj.M33:G4} {snap.Proj.M34:G4}; row4 {snap.Proj.M41:G4} {snap.Proj.M42:G4} {snap.Proj.M43:G4} {snap.Proj.M44:G4}");
-        // The asset (and its bone list) is loaded on the render thread; until it matches, the render thread waits a frame.
-        var asset = renderer?.Asset;
-        if (asset == null || snap.LoadKey != loadedAssetName) return true;
-        var bones = asset.BoneNames.Length;
+        var race = interop.GetRaceSexId(character);
+        var slot = interop.GetCoatSlot(character);
+        if (slot != CoatSlot.None || !config.RequireCoatEquipped)
+        {
+            var male = interop.IsMale(character);
+            var name = $"coat_{(slot == CoatSlot.Ring ? "ril" : "glv")}_{(male ? "m" : "f")}.furasset";
+            var key = $"{name}@c{race:D4}";
+            if (!items.TryGetValue(key, out var coat))
+            {
+                var path = Path.Combine(AssetDirectory, name);
+                items[key] = coat = StartItem(character, (ushort)(male ? 101 : 201), race, name, () => FurAsset.Load(path));
+            }
+            if (AddDraw(snap, character, coat) && interop.FindFurModels(character, coatSlots: true) is [var worn, ..])
+                QueueColorRead(coat, interop.GetColorTable(character, worn.Slot, worn.FirstFurMaterial));
+        }
+        AddFurModels(snap, character, race);
+        foreach (var prop in interop.GetProps())
+            AddFurModels(snap, prop, 0); // props have their own skeletons: no race deformer
+        if (snap.Items.Count == 0 && snap.Growing == 0) snap.Skip = "no fur items";
+        return true;
+    }
+
+    private void AddFurModels(FrameSnapshot snap, nint character, ushort race)
+    {
+        foreach (var fur in interop.FindFurModels(character))
+        {
+            // Props by actor: two with the same minion have their own bones and colour tables.
+            var key = $"{fur.Path}|{fur.FurMaterials:X}|{fur.EnabledAttributes:X}@{(race != 0 ? race : character):X}";
+            if (!items.TryGetValue(key, out var item))
+            {
+                var name = Path.GetFileName(fur.Path);
+                // shortcut: takes the model's race from its file name, as all 46 surveyed models keep it; a renamed file gets no
+                // race deformer. Upgrade: ask Penumbra.GetGameObjectResourcePaths.V5 for the game path.
+                var named = System.Text.RegularExpressions.Regex.Match(name, @"^c([0-9]{4})");
+                var modelRace = race != 0 && named.Success ? ushort.Parse(named.Groups[1].Value) : race;
+                items[key] = item = StartItem(character, modelRace, race, name, () => FurGrower.Grow(ReadModel(fur.Path), fur.FurMaterials, fur.EnabledAttributes));
+            }
+            // shortcut: one colour per model, its first fur material's; only one boots option has two. Upgrade: per-mesh colour.
+            if (AddDraw(snap, character, item))
+                QueueColorRead(item, interop.GetColorTable(character, fur.Slot, fur.FirstFurMaterial));
+        }
+    }
+
+    private byte[] ReadModel(string path)
+        => Path.IsPathRooted(path) ? File.ReadAllBytes(path)
+            : dataManager.GetFile(path)?.Data ?? throw new FileNotFoundException("model not in the game data", path);
+
+    // Growth runs off the game's threads (under a second); its deformer inputs are game state, so they are read here.
+    private FurItem StartItem(nint character, ushort modelRace, ushort race, string name, Func<FurAsset?> build)
+    {
+        var parents = modelRace != race ? interop.GetBoneParents(character) : null;
+        byte[]? pbd = null;
+        var pbdSource = "";
+        if (parents != null) (pbd, pbdSource) = ReadPbd(interop.GetTargetObjectIndex());
+        var item = new FurItem { Name = name, LastUsed = frame };
+        item.Growth = Task.Run(() =>
+        {
+            try
+            {
+                var asset = build();
+                if (asset == null)
+                {
+                    Diag("item " + name, $"skipped: no fur surface, or {FurGrower.MaxStrands:N0} strands or more");
+                    return null;
+                }
+                if (asset.BoneNames.Length > Renderer.MaxBones) throw new InvalidDataException($"{asset.BoneNames.Length} bones; max {Renderer.MaxBones}");
+                var chain = pbd == null ? null : RaceDeformer.Chain(pbd, modelRace, race);
+                if (chain is { Count: > 0 } && parents != null) item.Deform = RaceDeformer.PerBone(asset.BoneNames, chain, parents);
+                Diag("item " + name, $"{asset.StrandCount:N0} strands, {asset.BoneNames.Length} bones; race c{modelRace:D4} -> c{race:D4}: " +
+                    (parents == null ? "none needed" : pbd == null ? "human.pbd unavailable" : chain == null ? "no deformer chain" : $"{chain.Count} deformer step(s)") + $" {pbdSource}");
+                return asset;
+            }
+            catch (Exception ex)
+            {
+                Diag("item " + name, "failed: " + ex.Message);
+                log.Warning(ex, "Failed to prepare fur for {Name}", name);
+                return null;
+            }
+        });
+        return item;
+    }
+
+    // False while the item is growing or has nothing to draw.
+    private bool AddDraw(FrameSnapshot snap, nint character, FurItem item)
+    {
+        item.LastUsed = frame;
+        if (item.Growth is { } growth)
+        {
+            if (!growth.IsCompleted) { snap.Growing++; return false; }
+            item.Growth = null;
+            if (growth.Result is { } asset) (item.BoneNames, item.StrandCount, item.Upload) = (asset.BoneNames, asset.StrandCount, asset);
+        }
+        var bones = item.BoneNames.Length;
+        if (bones == 0) return false;
         var skin = new Matrix4x4[bones];
-        if (!interop.TryGetSkinMatrices(snap.Character, asset.BoneNames, skin, found.AsSpan(0, bones))) { snap.Skip = "skeleton unavailable"; return false; }
-        if (deform is { } d && d.Length == bones)
+        if (!interop.TryGetSkinMatrices(character, item.Lookup, item.BoneNames, skin, found.AsSpan(0, bones))) return false;
+        if (item.Deform is { } d)
             for (var i = 0; i < bones; i++) skin[i] = d[i] * skin[i];
         var missing = 0;
         for (var i = 0; i < bones; i++) if (!found[i]) missing++;
-        (snap.Skin, snap.Bones, snap.BonesInfo) = (skin, bones, $"bones missing {missing}/{bones}");
+        if (missing > 0) Diag("bones " + item.Name, $"missing {missing}/{bones}");
+        snap.Bones += bones;
+        snap.MissingBones += missing;
+        snap.Items.Add(new ItemDraw(item, skin));
         return true;
+    }
+
+    private void QueueColorRead(FurItem item, ID3D11Texture2D* table)
+    {
+        if ((nint)table == item.ColorTable) return;
+        item.ColorTable = (nint)table;
+        if (table == null) return;
+        table->AddRef();
+        colorReads.Enqueue((item, (nint)table));
     }
 
     private void RenderFur(ID3D11Texture2D* boundTarget)
     {
+        // Before reading the snapshot: see OnDraw.
+        while (retiredItems.TryDequeue(out var retired)) retired.Buffers?.Dispose();
         if (!config.Enabled) { status = "disabled"; return; }
         var gpose = FFXIVClientStructs.FFXIV.Client.Game.GameMain.IsInGPose();
         if (config.OnlyInGpose && !gpose) { status = "waiting for GPose"; return; }
@@ -378,12 +535,28 @@ public sealed unsafe class Plugin : IDalamudPlugin
         var snap = snapshot;
         if (snap == null) { status = "waiting for first frame"; return; }
         if (snap.Skip != null) { status = snap.Skip; return; }
-        if (snap.LoadKey != loadedAssetName && snap.Parents != null) LoadAsset(snap);
-        var asset = renderer.Asset;
-        if (asset == null) { status = "asset missing: " + assetError; return; }
-        if (snap.Skin == null || snap.Bones != asset.BoneNames.Length) { status = "waiting for skeleton"; return; }
-        var bones = snap.Bones;
-        Diag("bones", snap.BonesInfo);
+        while (colorReads.TryDequeue(out var read))
+        {
+            var diffuse = renderer.ReadTableDiffuse(context, (ID3D11Texture2D*)read.Table);
+            ((ID3D11Texture2D*)read.Table)->Release();
+            read.Item.Color = diffuse is { } c && Vector3.Distance(c, UndyedFur) > 0.02f ? c : null;
+            Diag("colour " + read.Item.Name, $"table row 0 {diffuse?.ToString() ?? "unreadable"}");
+        }
+        var draws = new List<FurDraw>(snap.Items.Count);
+        var strands = 0;
+        foreach (var (item, skin) in snap.Items)
+        {
+            if (item.Upload is { } asset)
+            {
+                item.Upload = null;
+                try { item.Buffers = renderer.CreateBuffers(asset); }
+                catch (InvalidOperationException ex) { Diag("item " + item.Name, "failed: " + ex.Message); }
+            }
+            if (item.Buffers is not { } buffers) continue;
+            draws.Add(new FurDraw(buffers, skin, item.Color ?? config.BaseColor, item.Color is { } dye ? LightGain(dye) : 1f));
+            strands += item.StrandCount;
+        }
+        if (draws.Count == 0) { status = snap.Growing > 0 ? "growing fur" : "waiting for fur"; return; }
         var (view, proj, gpose2) = (snap.View, snap.Proj, snap.Gpose);
         gpose = gpose2;
         if (!interop.TryGetBackBuffer(out var backBuffer)) { status = "no back buffer"; return; }
@@ -401,8 +574,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             if (config.UseSceneDepth) interop.TryGetSceneDepth(out depth, out dw, out dh);
             Diag("depth", config.UseSceneDepth ? interop.DepthInfo : "disabled in settings");
             var density = gpose ? config.GposeDensity : config.Density;
-            var count = (int)(asset.StrandCount * Math.Clamp(density, 0f, 1f));
-            renderer.Draw(context, backBuffer, depth, new Vector2(dw, dh), snap.Skin.AsSpan(0, bones), view, proj, count, gpose ? config.GposeChildCount : config.ChildCount, config);
+            renderer.Draw(context, backBuffer, depth, new Vector2(dw, dh), draws, view, proj, density, gpose ? config.GposeChildCount : config.ChildCount, config);
             furDraws++;
             lastFurTarget = (nint)backBuffer;
             ID3D11Resource* depthTexture = null;
@@ -410,7 +582,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             debugCapture.OnFurDrawn(context, backBuffer, (ID3D11Texture2D*)depthTexture);
             if (depthTexture != null) depthTexture->Release();
             Diag("draw", renderer.LastDrawInfo);
-            status = $"drawing {count:N0}/{asset.StrandCount:N0} strands ({snap.AssetName}); {snap.BonesInfo}; depth {(depth != null ? $"{dw}x{dh}" : "off")}";
+            status = $"drawing {(int)(strands * Math.Clamp(density, 0f, 1f)):N0}/{strands:N0} strands in {draws.Count} item(s){(snap.Growing > 0 ? $", {snap.Growing} growing" : "")}; bones missing {snap.MissingBones}/{snap.Bones}; depth {(depth != null ? $"{dw}x{dh}" : "off")}";
         }
         finally
         {
@@ -437,30 +609,6 @@ public sealed unsafe class Plugin : IDalamudPlugin
         {
             log.Warning(ex, "Failed to read {Path}", resolved);
             return (dataManager.GetFile(gamePath)?.Data, gamePath + " (fallback)");
-        }
-    }
-
-    private void LoadAsset(FrameSnapshot snap)
-    {
-        var name = snap.AssetName;
-        loadedAssetName = snap.LoadKey;
-        assetError = null;
-        try
-        {
-            var asset = FurAsset.Load(Path.Combine(AssetDirectory, name));
-            var pbd = snap.Pbd;
-            var chain = pbd == null ? null : RaceDeformer.Chain(pbd, snap.ModelRace, snap.Race);
-            deform = chain is { Count: > 0 } ? RaceDeformer.PerBone(asset.BoneNames, chain, snap.Parents!) : null;
-            renderer!.SetAsset(asset);
-            Diag("asset", $"loaded {name}: {asset.StrandCount:N0} strands, {asset.BoneNames.Length} bones; race c{snap.ModelRace:D4} -> c{snap.Race:D4}: " +
-                (pbd == null ? "human.pbd unavailable" : chain == null ? "no deformer chain" : $"{chain.Count} deformer step(s)") + $" from {snap.PbdSource}");
-        }
-        catch (Exception ex)
-        {
-            renderer!.SetAsset(null);
-            assetError = $"{name}: {ex.Message}";
-            Diag("asset", "load failed " + assetError);
-            log.Warning(ex, "Failed to load fur asset {Name}", name);
         }
     }
 
@@ -523,7 +671,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             changed |= Slider("Depth UV scale (0 = auto)", () => config.DepthUvScaleOverride, v => config.DepthUvScaleOverride = v, 0f, 2f);
             changed |= Check("Debug: solid magenta", () => config.DebugSolid, v => config.DebugSolid = v);
             changed |= Check("Temporal dither", () => config.TemporalDither, v => config.TemporalDither = v);
-            if (ImGui.Button("Reload asset")) loadedAssetName = null;
+            if (ImGui.Button("Reload fur")) reloadItems = true;
             ImGui.SameLine();
             if (ImGui.Button("Reset settings")) { CopyDefaults(); changed = true; }
         }
@@ -564,8 +712,16 @@ public sealed unsafe class Plugin : IDalamudPlugin
     public void Dispose()
     {
         pluginInterface.UiBuilder.Draw -= OnDraw;
+        // A draw in progress on the render thread has to finish before its resources go.
+        disposing = true;
+        Thread.MemoryBarrier(); // pairs with the detour's increment: either it sees disposing, or this sees its count
+        var waited = System.Diagnostics.Stopwatch.StartNew();
+        while (Volatile.Read(ref detoursRunning) > 0 && waited.ElapsedMilliseconds < 10000) Thread.Sleep(1); // the first draw compiles the shaders
         setTargetHook?.Dispose();
         commandManager.RemoveHandler(CommandName);
+        foreach (var item in items.Values) item.Buffers?.Dispose();
+        while (retiredItems.TryDequeue(out var retired)) retired.Buffers?.Dispose();
+        while (colorReads.TryDequeue(out var read)) ((ID3D11Texture2D*)read.Table)->Release();
         renderer?.Dispose();
         (interop as IDisposable)?.Dispose();
     }
