@@ -1,6 +1,7 @@
 // Strand fur: each instance is one strand of 4 points (3 segments) expanded into an 8-vertex camera-facing ribbon.
-// Passes, all into a multisampled fur layer: VSUnder/PSUnder draw the coat surface (undercoat), VSMain/PSMain the strands
-// with per-sample stochastic coverage; the resolved layer (premultiplied) is blended over the frame by VSComposite/PSComposite.
+// Passes: CSStrandMatrices skins each baked strand and PSSceneLuma reduces the frame to what SceneLit reads; then, all into a
+// multisampled fur layer, VSUnder/PSUnder draw the coat surface (undercoat), VSMain/PSMain the strands with per-sample
+// stochastic coverage; the resolved layer (premultiplied) is blended over the frame by VSComposite/PSComposite.
 // Matrices are row-major and used as mul(v, M) to match System.Numerics.
 #pragma pack_matrix(row_major)
 
@@ -14,7 +15,7 @@ StructuredBuffer<float4> Points : register(t0);       // xyz model/bind space, w
 StructuredBuffer<SkinData> Skins : register(t1);
 StructuredBuffer<float4> Bones : register(t2);        // 4 rows per bone (explicit rows: no matrix-packing ambiguity)
 Texture2D<float> SceneDepth : register(t3);
-Texture2D<float4> SceneColor : register(t4);          // copy of the lit frame (display-encoded) taken just before drawing
+Texture2D<float2> SceneLuma : register(t4);           // per pixel: the frame's linear luminance and the scene's view distance
 struct MeshVertex
 {
     float3 position;
@@ -24,6 +25,13 @@ StructuredBuffer<MeshVertex> MeshVertices : register(t5);
 StructuredBuffer<SkinData> MeshSkins : register(t6);
 Texture2D<float4> FurLayer : register(t7);            // resolved fur layer, premultiplied by coverage
 Texture2DMS<float> FurDepth : register(t8);           // the fur layer's own depth
+struct StrandMatrix
+{
+    float3 r0, r1, r2, r3;  // SkinMatrix rows without w (only mul(float4(p, 1), m).xyz is taken)
+};
+StructuredBuffer<StrandMatrix> StrandMatrices : register(t9);
+RWStructuredBuffer<StrandMatrix> StrandMatricesOut : register(u0);
+Texture2D<float4> SceneColor : register(t10);         // copy of the lit frame (display-encoded) taken just before drawing
 
 cbuffer Frame : register(b0)
 {
@@ -69,6 +77,17 @@ float4x4 SkinMatrix(SkinData s)
     return m;
 }
 
+// SkinMatrix per baked strand, once per frame instead of in each of its children's 8 vertices. Threads of the last group past
+// the buffer's end read zeros and their writes are dropped (out-of-bounds UAV writes are discarded).
+[numthreads(64, 1, 1)]
+void CSStrandMatrices(uint3 id : SV_DispatchThreadID)
+{
+    float4x4 m = SkinMatrix(Skins[id.x]);
+    StrandMatrix o;
+    o.r0 = m[0].xyz; o.r1 = m[1].xyz; o.r2 = m[2].xyz; o.r3 = m[3].xyz;
+    StrandMatricesOut[id.x] = o;
+}
+
 uint HashU(uint3 v)
 {
     v = v * 1664525u + 1013904223u;
@@ -111,7 +130,8 @@ VsOut VSMain(uint vid : SV_VertexID, uint instance : SV_InstanceID)
         rootModel += (a * cos(angle) + cross(g, a) * sin(angle)) * ChildSpread * sqrt(Hash(uint3(strand, child, 5u)));
         lengthFactor = 0.8 + 0.3 * Hash(uint3(strand, child, 23u));
     }
-    float4x4 m = SkinMatrix(Skins[strand]);
+    StrandMatrix sm = StrandMatrices[strand];
+    float4x4 m = float4x4(float4(sm.r0, 0), float4(sm.r1, 0), float4(sm.r2, 0), float4(sm.r3, 1));
     float3 rootWorld = mul(float4(rootModel, 1), m).xyz;
     float3 p = PointWorld(strand, i, m, rootModel, rootWorld, lengthFactor);
     float3 tangent = normalize(PointWorld(strand, min(i + 1, 3), m, rootModel, rootWorld, lengthFactor) - PointWorld(strand, i > 0 ? i - 1 : 0, m, rootModel, rootWorld, lengthFactor));
@@ -189,19 +209,32 @@ float3 SceneLit(float3 color, float2 at, float depth)
     float luma = 0, count = 0;
     [unroll] for (int k = 0; k < 5; k++)
     {
-        int2 p = int2(at) + taps[k];
-        if (UseSceneDepth != 0 && abs(LinearDepth(SceneDepth.Load(int3(float2(p) * DepthUvScale, 0))) - depth) > 0.3)
+        float2 s = SceneLuma.Load(int3(int2(at) + taps[k], 0));
+        if (UseSceneDepth != 0 && abs(s.y - depth) > 0.3)
             continue;
-        luma += dot(pow(saturate(SceneColor.Load(int3(p, 0)).rgb), OutputGamma), float3(0.2126, 0.7152, 0.0722));
+        luma += s.x;
         count++;
     }
     return count > 0 ? color * lerp(1.0, luma / count * SceneGain, SceneLighting) : color;
 }
 
+// What SceneLit reads, once per pixel instead of per tap and fragment.
+float2 PSSceneLuma(float4 pos : SV_Position) : SV_Target
+{
+    int2 p = int2(pos.xy);
+    return float2(dot(pow(saturate(SceneColor.Load(int3(p, 0)).rgb), OutputGamma), float3(0.2126, 0.7152, 0.0722)),
+                  LinearDepth(SceneDepth.Load(int3(float2(p) * DepthUvScale, 0))));
+}
+
 float4 Output(float3 color)
 {
     color *= Exposure;
-    return float4(lerp(pow(saturate(color), 1.0 / OutputGamma), Agx(color), AgxToneMap), 1.0);
+    float3 display;
+    [branch] if (AgxToneMap >= 1) // the default: skip the gamma curve it would blend away
+        display = Agx(color);
+    else
+        display = lerp(pow(saturate(color), 1.0 / OutputGamma), Agx(color), AgxToneMap);
+    return float4(display, 1.0);
 }
 
 // How directly the view looks down into the fur (cosine between view and fur direction). Fitted to Cycles renders of the
