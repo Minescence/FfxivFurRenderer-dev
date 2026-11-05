@@ -1,0 +1,10 @@
+<Project>
+  <!-- The baked assets hold the mod's mesh, so they must never reach a zip. Development loads them from the output folder. -->
+  <Target Name="PackagePlugin" AfterTargets="Build">
+    <DalamudPackager ProjectDir="$(ProjectDir)"
+                     OutputPath="$(OutputPath)"
+                     AssemblyName="$(AssemblyName)"
+                     MakeZip="$(Configuration.Equals('Release'))"
+                     Exclude="Assets\coat_glv_f.furasset;Assets\coat_glv_m.furasset;Assets\coat_ril_f.furasset;Assets\coat_ril_m.furasset" />
+  </Target>
+</Project>

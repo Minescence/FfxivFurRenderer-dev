@@ -391,13 +391,13 @@ public sealed unsafe class Plugin : IDalamudPlugin
         log.Info("[{Key}] {Message}", key, message);
     }
 
-    private bool Fill(FrameSnapshot snap)
+    private void Fill(FrameSnapshot snap)
     {
-        if (!config.Enabled) { snap.Skip = "disabled"; return false; }
-        if (config.OnlyInGpose && !snap.Gpose) { snap.Skip = "waiting for GPose"; return false; }
+        if (!config.Enabled) { snap.Skip = "disabled"; return; }
+        if (config.OnlyInGpose && !snap.Gpose) { snap.Skip = "waiting for GPose"; return; }
         var character = interop.GetTargetCharacterBase();
-        if (character == 0) { snap.Skip = "no target character"; return false; }
-        if (!interop.TryGetCamera(out snap.View, out snap.Proj)) { snap.Skip = "camera unavailable"; return false; }
+        if (character == 0) { snap.Skip = "no target character"; return; }
+        if (!interop.TryGetCamera(out snap.View, out snap.Proj)) { snap.Skip = "camera unavailable"; return; }
         Diag("camera", $"StandardZ-derived reverseZ {interop.LastCameraReverseZ}; proj row3 {snap.Proj.M31:G4} {snap.Proj.M32:G4} {snap.Proj.M33:G4} {snap.Proj.M34:G4}; row4 {snap.Proj.M41:G4} {snap.Proj.M42:G4} {snap.Proj.M43:G4} {snap.Proj.M44:G4}");
         var race = interop.GetRaceSexId(character);
         var slot = interop.GetCoatSlot(character);
@@ -420,7 +420,6 @@ public sealed unsafe class Plugin : IDalamudPlugin
         foreach (var prop in interop.GetProps())
             AddFurModels(snap, prop, 0); // props have their own skeletons: no race deformer
         if (snap.Items.Count == 0 && snap.Growing == 0) snap.Skip = "no fur items";
-        return true;
     }
 
     private void AddFurModels(FrameSnapshot snap, nint character, ushort race, bool coatSlots = false)
@@ -559,8 +558,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
             strands += item.StrandCount;
         }
         if (draws.Count == 0) { status = snap.Growing > 0 ? "growing fur" : "waiting for fur"; return; }
-        var (view, proj, gpose2) = (snap.View, snap.Proj, snap.Gpose);
-        gpose = gpose2;
+        var (view, proj) = (snap.View, snap.Proj);
+        gpose = snap.Gpose;
         if (!interop.TryGetBackBuffer(out var backBuffer)) { status = "no back buffer"; return; }
         if (boundTarget != null)
         {

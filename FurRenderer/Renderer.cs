@@ -98,7 +98,7 @@ internal sealed unsafe class Renderer : IDisposable
     private ID3D11ShaderResourceView* surfaceLightSrv;
 
     public const int MaxBones = 256;
-    private const float AssetDensityFraction = 0.10f; // tools/grow_coat_fur.py AMOUNT used for the shipped assets, and FurGrower's density
+    private const float AssetDensityFraction = 0.10f; // tools/grow_coat_fur.py AMOUNT used for the baked assets, and FurGrower's density
 
     public Renderer(ID3D11Device* device, string shaderPath, byte[] source)
     {
@@ -279,11 +279,11 @@ internal sealed unsafe class Renderer : IDisposable
     public string LastDrawInfo { get; private set; } = "";
 
     /// <summary>Draws <paramref name="density"/> of each item's strands. Returns false (and draws nothing) if that is none.</summary>
-    public bool Draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* backBuffer, ID3D11ShaderResourceView* sceneDepth, Vector2 depthSize,
+    public void Draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* backBuffer, ID3D11ShaderResourceView* sceneDepth, Vector2 depthSize,
         List<FurDraw> draws, Matrix4x4 view, Matrix4x4 proj, float density, int childCount, Configuration cfg)
     {
         density = Math.Clamp(density, 0f, 1f);
-        if (draws.Count == 0 || density <= 0) return false;
+        if (draws.Count == 0 || density <= 0) return;
         D3D11_TEXTURE2D_DESC bbDesc;
         backBuffer->GetDesc(&bbDesc);
         EnsureTargets(backBuffer, bbDesc);
@@ -492,7 +492,6 @@ internal sealed unsafe class Renderer : IDisposable
                 ctx1->Release();
             }
         }
-        return true;
     }
 
     private static bool IsReverseZ(Matrix4x4 proj)

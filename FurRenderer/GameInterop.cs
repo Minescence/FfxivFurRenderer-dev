@@ -1,18 +1,15 @@
 using System.Numerics;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game.Character;
-using FFXIVClientStructs.FFXIV.Client.Graphics.Kernel;
 using FFXIVClientStructs.FFXIV.Client.Graphics.Render;
 using FFXIVClientStructs.FFXIV.Client.Graphics.Scene;
 using FFXIVClientStructs.Havok.Animation.Rig;
 using TerraFX.Interop.DirectX;
-using TerraFX.Interop.Windows;
 using static TerraFX.Interop.Windows.Windows;
 using CharacterBase = FFXIVClientStructs.FFXIV.Client.Graphics.Scene.CharacterBase;
 using Device = FFXIVClientStructs.FFXIV.Client.Graphics.Kernel.Device;
 using Texture = FFXIVClientStructs.FFXIV.Client.Graphics.Kernel.Texture;
 using Skeleton = FFXIVClientStructs.FFXIV.Client.Graphics.Render.Skeleton;
-using PartialSkeleton = FFXIVClientStructs.FFXIV.Client.Graphics.Render.PartialSkeleton;
 
 namespace FurRenderer;
 
@@ -487,28 +484,6 @@ internal sealed unsafe class GameInterop : IDisposable
     {
         var target = GetTargetObject();
         return target == null ? -1 : target->ObjectIndex;
-    }
-
-    /// <summary>Model file of every equipment slot, for diagnostics.</summary>
-    public string ModelInfo(nint characterBase)
-    {
-        var human = AsHuman(characterBase);
-        if (human == null) return "?";
-        var parts = new List<string>();
-        for (var i = 0; i < human->CharacterBase.SlotCount; i++)
-        {
-            var model = human->CharacterBase.Models[i];
-            if (model != null && model->ModelResourceHandle != null)
-                parts.Add($"{i}:{model->ModelResourceHandle->FileName}");
-        }
-        return string.Join(" | ", parts);
-    }
-
-    /// <summary>Customize race/tribe of the target, for diagnostics.</summary>
-    public string RaceInfo(nint characterBase)
-    {
-        var human = AsHuman(characterBase);
-        return human == null ? "?" : $"race {human->Customize.Race} tribe {human->Customize.Tribe} sex {human->Customize.Sex}";
     }
 
     private static Human* AsHuman(nint address)

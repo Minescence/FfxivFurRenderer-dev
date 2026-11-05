@@ -1,7 +1,8 @@
 // Strand fur: each instance is one strand of 4 points (3 segments) expanded into an 8-vertex camera-facing ribbon.
-// Passes: CSStrandMatrices skins each baked strand and PSSceneLuma reduces the frame to what SceneLit reads; then, all into a
-// multisampled fur layer, VSUnder/PSUnder draw the coat surface (undercoat), VSMain/PSMain the strands with per-sample
-// stochastic coverage; the resolved layer (premultiplied) is blended over the frame by VSComposite/PSComposite.
+// Passes: PSSceneLuma reduces the frame to what SceneLit reads, PSSurfaceLight keeps the fur surface's share of it, and
+// CSStrandMatrices skins each strand; then, all into a multisampled fur layer, VSUnder/PSUnder draw the fur surface
+// (undercoat), VSMain/PSMain the strands with per-sample stochastic coverage; the resolved layer (premultiplied) is blended
+// over the frame by VSComposite/PSComposite.
 // Matrices are row-major and used as mul(v, M) to match System.Numerics.
 #pragma pack_matrix(row_major)
 
