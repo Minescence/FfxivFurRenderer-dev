@@ -49,7 +49,7 @@ The goal is to make the installed Penumbra coat (`C:\Penumbra\[Hikari][DT] - Big
 - **`tools/grow_coat_fur.py`:** runs the reference's exact hair stack (`Curves.002`) on the coat surface inside the reference .blend.
   - Recipe: guides at 30k/m², 5 cm, 4 points; children at 1M/m²; clump 0.3; radius 0.3 mm; random trim 0.025.
   - It exports strands in **game model space** (the coat's bind space), so the runtime skins them with the same bone palette the game uses for the coat. This removes the Blender→game calibration problem for the coat.
-  - Root skin is interpolated barycentrically from the coat triangle each root sits on (max root distance 0), so it is exact.
+  - Root skin is interpolated barycentrically from the coat triangle each root sits on (max root distance 0), keeping up to 8 influences like the game. Top-4 dropped 15–25% of the weight at the back collar and shifted roots ~2 cm, leaving two holes (k4s.5).
   - Output is in `source/coat-fur/`: `coat.furstrands`, `coat.furskin` (bone index = MDL bone list in `coat-fur.json`), and `coat-fur-preview.blend`.
 - **Density:**
   - The default amount 0.05 gives 430,786 strands, which is the reference's viewport density.
@@ -57,7 +57,7 @@ The goal is to make the installed Penumbra coat (`C:\Penumbra\[Hikari][DT] - Big
   - Plan: about 0.4M in real time, plus a GPose "quality" setting with 1–2M strands rendered wider at the tips.
 - **Follow-ups:**
   - The 6.43 m² of surface includes interior and overlapping puff faces, so some strands grow where they can't be seen. Cull roots that can't be seen from outside before raising density.
-  - The coat model keeps rendering in game as the base. Its parallax fur reads as the undercoat (Phase 5 is likely unnecessary).
+  - The coat model keeps rendering in game, but its salmon texture showed through end-on fur. The plugin now draws the coat surface itself (undercoat, .furasset v3) under the strands.
   - The Gloves model is c0201 only. Male (c0101) and ring variants need the same run against their MDLs.
 
 ## Phase 0 — runtime spike (unblocked; no .blend needed)
@@ -80,7 +80,7 @@ Prove that we can draw depth-correct, skinned geometry into the scene. Each item
 
 ## Phase 2 — GPU strands
 
-- 2.1 Skin the guides in a compute shader (linear blend skinning, 4 weights) from the bone matrices in 0.4.
+- 2.1 Skin the guides in a compute shader (linear blend skinning, 8 weights; .furasset v3 adds the undercoat mesh) from the bone matrices in 0.4.
 - 2.2 Children: deferred (see 1.1). Load the exported strands directly. Add GPU children only if the density needs to go above 374k.
 - 2.3 Vertex shader expands strands into camera-facing ribbons from `SV_VertexID` (no vertex buffer). Width is clamped to ≥ 1 px, with alpha scaled by true width / 1 px to stop shimmer.
 - 2.4 Budget target: 200k strands × 6 segments in real time and 1M in GPose on an RTX 3070. Measure with GPU timestamps.
@@ -128,3 +128,25 @@ Implemented; Release build passes; **not yet run in game**.
 - Reference material (from the .blend): Chiang hair BSDF, colour (0.641, 0.205, 0.328) × intercept, roughness 1, coat 1, tip fade from 25%, AgX view transform, render density 1e6/m² (asset baked at 10%).
 - Added: AgX tone map + exposure, depth absorption (colour^path, longer path when looking into the fur), broad sheen, GPU child strands.
 - Debug requests gained "camera" {yaw (deg from facing), pitch, distance} and "trace"; captures are taken on the render thread.
+
+### 2026-11-05 look-dev pass 3
+- Undercoat: `grow_coat_fur.py` exports the coat surface (`coat.furmesh`), packed into .furasset v3 and skinned like the strands. Colour = BaseColor x UndercoatDarken (0.3, the reference emitter Material.004), with the same depth absorption as a strand root. Black was tried (the reference render looks black under the fur) but at real-time density it shows as speckle.
+- Fur layer: 8x MSAA (4x fallback) with per-sample stochastic coverage (SV_Coverage), resolved and composited premultiplied. This replaces the per-pixel dither that made pixelated tips and floating pixels.
+- End-on widening is now energy-preserving (wider at proportionally lower coverage), so whorls show depth instead of a solid cap.
+- Colour fit: reference patches fitted through AgX as k x base^p. Lit side-on fur is p ~0.6 (base plus white sheen), band sides p ~1.9, whorl cores p ~2.8. Defaults are now Absorption 0.4, linear FacingDepth 6, Specular 0.3, RootDarken 0 (config v7). FacingDepth is view-dependent by design; the user flagged angle-dependent shade before (v6 zeroed it).
+- Full reference density (10 children) dropped the game to about 20 fps and still left gaps in creases, so density is not the lever.
+- The sheen is shadowed by the depth factor too (RootDarken..1 along the strand); unshadowed, roots seen side-on went grey (the coat creator's "black turns grey under the lighting").
+- Close up the alpha that stands in for missing density (CoverageScale) saturates; the remainder now widens the ribbon, so silhouettes no longer thin out to see-through.
+- SceneLit ignores taps more than 30 cm from the shaded depth (background seen past a silhouette).
+- Measured fur-layer opacity (black fur vs fur off): fully opaque inside the silhouette, partial only in a 10-20 px fringe. The "transparent" veil near silhouettes is pale side-on strands lying over crimson end-on strands, not the background or the undercoat (a 10x brighter undercoat changes nothing there).
+- Debug captures with "scale" > 1 point-sample and exaggerate noise; use "scale":1 with "crop" for edge work.
+- Look target on the actual coat: `tools/render_coat_fur.py` renders the reference fur stack on the game coat in Cycles (CPU; a GPU render froze the game). Renders and facing maps are in `source/reference/coat/`. They show pale, opaque silhouettes and crimson only in partings and where the view runs along the fur.
+- Colour vs surface facing in those renders: exponent p ~0.6-0.8 up to facing 0.7, 1.1 at 0.85, 1.5 at 0.92, ~2.1 above 0.98 (both views agree). The FacingDepth response is now facing^8 (was linear), for strands and undercoat. The linear response tinted all camera-facing fur crimson, which showed through the pale side-on strands near silhouettes as a translucent veil.
+- Ellipse at the coat edge (seen only in the user's frames): the user runs ReShade (Ipsusu preset: KeepUI, MultiLUT, Glamarye). The game leaves the back buffer alpha at about the red channel, and KeepUI skips all effects where alpha >= 0.8 (it reads that as UI). The fur left the game's alpha alone, so fur over the pale coat went ungraded and fur over the background was graded, with a hard edge at the coat silhouette. The composite now fades the frame alpha by coverage (alpha = 0 under fur).
+- Tip speckle: the tip fade went through the per-sample dither (isolated pixels at 1-3/8 coverage). The fade is now a width taper in the vertex shader (coverage unchanged), which MSAA smooths; with FadeStart 1 the tips were already clean. The dither is also stratified over the samples the strand covers (input SV_Coverage), which cuts per-pixel noise where coverage < 1.
+- Debug captures: "atPresent": true grabs at Present instead of after the fur draw; "alpha": true saves the alpha channel. At-Present captures did not show the ReShade ellipse, so they may be taken before ReShade's effects (unverified).
+- Alpha alone did not fix it: Glamarye fake GI reads depth (GI desaturated and weighted by depth, local AO by depth difference), so fur past the coat silhouette still shaded as background. The renderer now writes the nearest fur depth into the game depth buffer (R24G8, own DSV) where the fur layer is at least half opaque, after the composite. Own MSAA depth is now R32_TYPELESS with an SRV. Skipped when scene depth is off or not frame-sized.
+- Debug captures: "depth": true saves the game scene depth after the fur draw (grey = sqrt of the 24-bit value).
+- No shadows (user, 2026-11-05): the synthetic light is a fixed world direction from above plus flat ambient, so it ignores the game sun, cast shadows and occlusion. The game-lit path (SceneLighting) was already in the code but the user config had it at 0, and gain 4 clipped sunlit fur to white (game coat linear luma: about 0.66 in full sun, 0.05-0.08 in shadow). Config v8 sets SceneLighting 1 and SceneGain 1.5 (default 1.5); captures f_front_v8/f_back_v8 show the tail shadow and darker undersides. The front Cycles render (front0) has the same crimson facing bands, so FacingDepth is not the bug. Not done: strand-level Kajiya-Kay highlights still use the fixed LightDir, not the game sun.
+- White tips / grey black fur (user, 2026-11-05): the Kajiya-Kay sheen is added white and scaled by lerp(RootDarken, 1, t), and at roughness-1 width it covers every strand, so Specular 0.3 added about 0.27 white that grows root to tip. Black BaseColor rendered mid-grey (captures w_black vs w_black_s0). Config v9: Specular 0.05 (default 0.05, about hair Fresnel); black now renders charcoal with form, pink loses the frost (f_front_v9, f_front_v9_black).
+- Defaults = user tuning (user, 2026-11-05): the user pressed Reset settings, which dropped their in-game strand tuning against the reference renders, and asked for Reset to give that look. Config v10 makes these the defaults and restores them: ChildCount 3, ChildSpread 0.01, LengthScale 1.5, WidthScale 1.065, MinPixelWidth 0.595, Gravity 0 (captures v10_front, v10_side). FacingDepth stays 6: the reference renders (session images 5-7) show the same crimson centres where the sleeve rolls face the camera; the user had reported them as darkening toward the camera just before.

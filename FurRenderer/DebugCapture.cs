@@ -13,8 +13,11 @@ namespace FurRenderer;
 /// config directory:
 /// <code>{ "set": { "Gravity": 0.5, "BaseColor": { "X": 1, "Y": 0, "Z": 0 } }, "frames": 10, "capture": "name", "scale": 2,
 ///         "crop": [x, y, w, h], "camera": { "yaw": 180, "pitch": -10, "distance": 3 } }</code>
-/// The plugin applies "set" (not saved to the config file), waits "frames", then writes captures/name.png (the presented
-/// frame, downscaled by "scale", optionally cropped first in full-resolution pixels) and debug-result.txt.
+/// The plugin applies "set" (not saved to the config file), waits "frames", then writes captures/name.png (the frame right
+/// after the fur draw, downscaled by "scale", optionally cropped first in full-resolution pixels) and debug-result.txt.
+/// "atPresent": true grabs the presented frame instead, including whatever the game draws after the fur.
+/// "alpha": true saves the frame's alpha channel as grey (ReShade's KeepUI reads it as a UI mask).
+/// "depth": true saves the game's scene depth after the fur draw instead (grey = sqrt of the stored depth, 24-bit depth only).
 /// </summary>
 internal sealed unsafe class DebugCapture
 {
@@ -27,6 +30,9 @@ internal sealed unsafe class DebugCapture
     private string? captureName;
     private int scale = 2;
     private int[]? crop;
+    private bool atPresent;
+    private bool alpha;
+    private bool depth;
     private readonly List<string> applied = new();
     // Render-thread capture: armed at Present, filled by the render thread right after the fur draw, saved at the next Present.
     private volatile bool armed;
@@ -55,7 +61,7 @@ internal sealed unsafe class DebugCapture
             return null;
         }
         if (waitFrames > 0 && --waitFrames > 0) return null;
-        if (captureName != null && waitFrames == 0)
+        if (captureName != null && waitFrames == 0 && !atPresent)
         {
             // Hand the grab to the render thread; the swap chain read at Present races the render thread's next frame.
             waitFrames = -1;
@@ -70,9 +76,10 @@ internal sealed unsafe class DebugCapture
             var path = Path.Combine(directory, "captures", captureName + ".png");
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
             if (armed && ++armedFrames < 60) return null;
-            if (armed)
+            if (armed || atPresent)
             {
                 // Fur never drew (disabled, wrong draw point...): fall back to the presented frame.
+                result += armed ? "; fur not drawn, captured at Present" : "; captured at Present";
                 armed = false;
                 var target = acquire();
                 if (target != null)
@@ -80,7 +87,6 @@ internal sealed unsafe class DebugCapture
                     try { Grab((ID3D11DeviceContext*)target.Value.Ctx, (ID3D11Texture2D*)target.Value.BackBuffer); }
                     finally { release(target.Value.BackBuffer); }
                 }
-                result += "; fur not drawn, captured at Present";
             }
             if (grabbed is { } rgb)
             {
@@ -107,10 +113,10 @@ internal sealed unsafe class DebugCapture
     }
 
     /// <summary>Render thread, right after the fur draw (before the UI): grabs the frame when a capture is armed.</summary>
-    public void OnFurDrawn(ID3D11DeviceContext* ctx, ID3D11Texture2D* target)
+    public void OnFurDrawn(ID3D11DeviceContext* ctx, ID3D11Texture2D* target, ID3D11Texture2D* sceneDepth)
     {
         if (!armed) return;
-        Grab(ctx, target);
+        Grab(ctx, depth && sceneDepth != null ? sceneDepth : target);
         armed = false;
     }
 
@@ -131,6 +137,9 @@ internal sealed unsafe class DebugCapture
         applied.Clear();
         captureName = null;
         crop = null;
+        atPresent = false;
+        alpha = false;
+        depth = false;
         scale = 2;
         var frames = 10;
         try
@@ -159,6 +168,9 @@ internal sealed unsafe class DebugCapture
             if (root.TryGetProperty("capture", out var c)) captureName = string.Concat(c.GetString()!.Split(Path.GetInvalidFileNameChars()));
             if (root.TryGetProperty("scale", out var s)) scale = Math.Max(1, s.GetInt32());
             if (root.TryGetProperty("crop", out var r)) crop = r.EnumerateArray().Select(e => e.GetInt32()).ToArray();
+            if (root.TryGetProperty("atPresent", out var ap)) atPresent = ap.GetBoolean();
+            if (root.TryGetProperty("alpha", out var al)) alpha = al.GetBoolean();
+            if (root.TryGetProperty("depth", out var dp)) depth = dp.GetBoolean();
         }
         catch (Exception ex)
         {
@@ -174,7 +186,8 @@ internal sealed unsafe class DebugCapture
         backBuffer->GetDesc(&desc);
         var bgra = desc.Format is DXGI_FORMAT_B8G8R8A8_UNORM or DXGI_FORMAT_B8G8R8A8_UNORM_SRGB or DXGI_FORMAT_B8G8R8A8_TYPELESS;
         var rgba = desc.Format is DXGI_FORMAT_R8G8B8A8_UNORM or DXGI_FORMAT_R8G8B8A8_UNORM_SRGB or DXGI_FORMAT_R8G8B8A8_TYPELESS;
-        if (!bgra && !rgba) throw new NotSupportedException($"back buffer format {desc.Format}");
+        var d24 = desc.Format == DXGI_FORMAT_R24G8_TYPELESS;
+        if (!bgra && !rgba && !d24) throw new NotSupportedException($"back buffer format {desc.Format}");
 
         var stagingDesc = desc;
         stagingDesc.Usage = D3D11_USAGE_STAGING;
@@ -207,9 +220,14 @@ internal sealed unsafe class DebugCapture
                 {
                     var p = row + (x0 + x * scale) * 4;
                     var o = (y * ow + x) * 3;
-                    rgb[o] = bgra ? p[2] : p[0];
-                    rgb[o + 1] = p[1];
-                    rgb[o + 2] = bgra ? p[0] : p[2];
+                    if (d24)
+                    {
+                        rgb[o] = rgb[o + 1] = rgb[o + 2] = (byte)(255 * Math.Sqrt((p[0] | p[1] << 8 | p[2] << 16) / 16777215.0));
+                        continue;
+                    }
+                    rgb[o] = alpha ? p[3] : bgra ? p[2] : p[0];
+                    rgb[o + 1] = alpha ? p[3] : p[1];
+                    rgb[o + 2] = alpha ? p[3] : bgra ? p[0] : p[2];
                 }
             }
             ctx->Unmap((ID3D11Resource*)staging, 0);

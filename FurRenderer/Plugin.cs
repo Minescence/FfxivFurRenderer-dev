@@ -95,6 +95,23 @@ public sealed unsafe class Plugin : IDalamudPlugin
             config.Version = 5;
         }
         if (config.Version < 6) { config.FacingDepth = 0f; config.Version = 6; } // view-dependent darkening changed the shade with camera angle
+        if (config.Version < 7) // colour fit to the reference renders, with the undercoat under the fur
+        {
+            var fresh = new Configuration();
+            (config.BaseColor, config.RootDarken, config.Specular, config.Absorption, config.FacingDepth, config.UndercoatDarken) =
+                (fresh.BaseColor, fresh.RootDarken, fresh.Specular, fresh.Absorption, fresh.FacingDepth, fresh.UndercoatDarken);
+            config.Version = 7;
+        }
+        // Without the game's lighting the fur had no shadows; gain 4 clipped sunlit fur to white.
+        if (config.Version < 8) { config.SceneLighting = 1f; config.SceneGain = 1.5f; config.Version = 8; }
+        if (config.Version < 9) { config.Specular = 0.05f; config.Version = 9; } // white sheen frosted the tips and greyed dark colours
+        if (config.Version < 10) // strand defaults are now the user's in-game tuning against the reference
+        {
+            var fresh = new Configuration();
+            (config.ChildCount, config.ChildSpread, config.LengthScale, config.WidthScale, config.MinPixelWidth, config.Gravity) =
+                (fresh.ChildCount, fresh.ChildSpread, fresh.LengthScale, fresh.WidthScale, fresh.MinPixelWidth, fresh.Gravity);
+            config.Version = 10;
+        }
         interop = new GameInterop(clientState, objectTable, log);
         debugCapture = new DebugCapture(pluginInterface.GetPluginConfigDirectory(), config, interop.SetCamera, () => traceRequested = true);
         try
@@ -391,7 +408,10 @@ public sealed unsafe class Plugin : IDalamudPlugin
             renderer.Draw(context, backBuffer, depth, new Vector2(dw, dh), snap.Skin.AsSpan(0, bones), view, proj, count, gpose ? config.GposeChildCount : config.ChildCount, config);
             furDraws++;
             lastFurTarget = (nint)backBuffer;
-            debugCapture.OnFurDrawn(context, backBuffer);
+            ID3D11Resource* depthTexture = null;
+            if (depth != null) depth->GetResource(&depthTexture);
+            debugCapture.OnFurDrawn(context, backBuffer, (ID3D11Texture2D*)depthTexture);
+            if (depthTexture != null) depthTexture->Release();
             Diag("draw", renderer.LastDrawInfo);
             status = $"drawing {count:N0}/{asset.StrandCount:N0} strands ({snap.AssetName}); {snap.BonesInfo}; depth {(depth != null ? $"{dw}x{dh}" : "off")}";
         }
@@ -478,6 +498,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         {
             changed |= Color("Base colour (linear)", () => config.BaseColor, v => config.BaseColor = v);
             changed |= Slider("Root brightness", () => config.RootDarken, v => config.RootDarken = v, 0f, 1f);
+            changed |= Slider("Undercoat brightness", () => config.UndercoatDarken, v => config.UndercoatDarken = v, 0f, 1f);
             changed |= Slider("Per-strand variation", () => config.HueJitter, v => config.HueJitter = v, 0f, 0.5f);
             changed |= Color("Ambient", () => config.AmbientColor, v => config.AmbientColor = v);
             var dir = config.LightDirection;

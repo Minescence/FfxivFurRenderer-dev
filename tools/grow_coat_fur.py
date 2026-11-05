@@ -10,7 +10,9 @@ After growing, strands whose root has fewer than 1 of 16 hemisphere rays escapin
 
 Outputs (OUT_DIR):
   coat.furstrands  'FURS', u32 version=1, u32 curves, u32 pointsPerCurve; per point float3 position (game model space, Y-up, metres) + float radius
-  coat.furskin     u32 curves; per curve u16[4] bone index (into the MDL bone-name list) + f32[4] weights, root skin interpolated barycentrically
+  coat.furskin     u32 curves; per curve u16[8] bone index (into the MDL bone-name list) + f32[8] weights, root skin interpolated barycentrically
+  coat.furmesh     u32 vertices, u32 triangles; per vertex float3 position + float3 smooth normal (game model space); per vertex
+                   u16[8] bone index + f32[8] weights; triangles x u32[3] indices. The coat faces the fur grows on (undercoat).
   coat-fur.json    counts, bone names, recipe values
 """
 import bpy, bmesh, json, os, struct, sys
@@ -100,6 +102,14 @@ _, weld = np.unique(np.round(pos_game * 1e4).astype(np.int64), axis=0, return_in
 weld = weld.reshape(-1)
 smooth = np.zeros((weld.max() + 1, 3)); np.add.at(smooth, weld, normals)
 smooth = smooth[weld]; smooth /= np.linalg.norm(smooth, axis=1, keepdims=True).clip(1e-8)
+# Undercoat: the coat surface itself, drawn under the fur in the emitter's colour (the reference's Material.004).
+used, tri = np.unique(faces, return_inverse=True)
+with open(os.path.join(out_dir, "coat.furmesh"), "wb") as f:
+    f.write(struct.pack("<II", len(used), len(faces)))
+    f.write(np.concatenate([pos_game[used], smooth[used]], axis=1).astype("<f4").tobytes())
+    rec = np.empty(len(used), np.dtype([("i", "<u2", 8), ("w", "<f4", 8)])); rec["i"] = joints[used]; rec["w"] = weights[used]
+    f.write(rec.tobytes())
+    f.write(tri.reshape(-1).astype("<u4").tobytes())
 me.shade_smooth()
 me.normals_split_custom_set_from_vertices(to_blender(smooth).tolist())
 coat = bpy.data.objects.new("HikariCoat", me)
@@ -155,7 +165,7 @@ sin_t = np.sqrt(1 - cos_t ** 2); phi = k_ * np.pi * (3 - 5 ** 0.5)
 hemi = np.stack([sin_t * np.cos(phi), sin_t * np.sin(phi), cos_t], axis=1)  # z = along normal
 roots = p.reshape(n, ppc, 3)[:, 0]
 nrm_b = to_blender(normals)
-skin_idx = np.zeros((n, 4), "<u2"); skin_w = np.zeros((n, 4), "<f4"); miss = 0.0
+skin_idx = np.zeros((n, 8), "<u2"); skin_w = np.zeros((n, 8), "<f4"); miss = 0.0
 kept = np.zeros(n, bool)
 root_n = np.zeros((n, 3))
 for c in range(n):
@@ -189,7 +199,8 @@ for c in range(n):
         for jj, ww in zip(joints[vi], weights[vi]):
             if ww > 0:
                 acc[int(jj)] = acc.get(int(jj), 0.0) + bary[k] * ww
-    top = sorted(acc.items(), key=lambda kv: -kv[1])[:4]
+    # Up to 8, like the game's DT skinning: top-4 drops 15-25% of the weight at the back collar and shifts roots ~2 cm.
+    top = sorted(acc.items(), key=lambda kv: -kv[1])[:8]
     total = sum(w for _, w in top) or 1.0
     for k, (jj, ww) in enumerate(top):
         skin_idx[c, k] = jj; skin_w[c, k] = ww / total

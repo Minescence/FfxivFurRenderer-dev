@@ -1,11 +1,13 @@
 // Strand fur: each instance is one strand of 4 points (3 segments) expanded into an 8-vertex camera-facing ribbon.
+// Passes, all into a multisampled fur layer: VSUnder/PSUnder draw the coat surface (undercoat), VSMain/PSMain the strands
+// with per-sample stochastic coverage; the resolved layer (premultiplied) is blended over the frame by VSComposite/PSComposite.
 // Matrices are row-major and used as mul(v, M) to match System.Numerics.
 #pragma pack_matrix(row_major)
 
 struct SkinData
 {
-    uint bones;      // 4 x u8 bone indices
-    float4 weights;
+    uint2 bones;     // 8 x u8 bone indices (unused: index 0, weight 0)
+    float4 w0, w1;
 };
 
 StructuredBuffer<float4> Points : register(t0);       // xyz model/bind space, w radius
@@ -13,6 +15,15 @@ StructuredBuffer<SkinData> Skins : register(t1);
 StructuredBuffer<float4> Bones : register(t2);        // 4 rows per bone (explicit rows: no matrix-packing ambiguity)
 Texture2D<float> SceneDepth : register(t3);
 Texture2D<float4> SceneColor : register(t4);          // copy of the lit frame (display-encoded) taken just before drawing
+struct MeshVertex
+{
+    float3 position;
+    float3 normal;
+};
+StructuredBuffer<MeshVertex> MeshVertices : register(t5);
+StructuredBuffer<SkinData> MeshSkins : register(t6);
+Texture2D<float4> FurLayer : register(t7);            // resolved fur layer, premultiplied by coverage
+Texture2DMS<float> FurDepth : register(t8);           // the fur layer's own depth
 
 cbuffer Frame : register(b0)
 {
@@ -28,7 +39,8 @@ cbuffer Frame : register(b0)
     uint UseSceneDepth;    uint TemporalDither; uint DebugSolid; float Gravity;   // Gravity: droop towards world -Y
     float SurfaceLighting; float SceneLighting; float SceneGain; uint HasSceneColor;
     float Exposure;        float AgxToneMap;   uint ChildCount;   float ChildSpread;   // ChildCount strands drawn per baked strand
-    float Absorption;      float FacingDepth;  float CoverageScale; float Padding;          // AgxToneMap: 0 = gamma only, 1 = AgX like the reference render   // SceneLighting: 0 = synthetic only, 1 = colour/light from the game's lit coat             // 0 = pure Kajiya-Kay, 1 = soft lighting from the growth direction
+    float Absorption;      float FacingDepth;  float CoverageScale; uint SampleCount;          // AgxToneMap: 0 = gamma only, 1 = AgX like the reference render   // SceneLighting: 0 = synthetic only, 1 = colour/light from the game's lit coat             // 0 = pure Kajiya-Kay, 1 = soft lighting from the growth direction
+    float3 UndercoatColor; float Padding;
 };
 
 struct VsOut
@@ -50,20 +62,25 @@ float4x4 Bone(uint b)
 
 float4x4 SkinMatrix(SkinData s)
 {
-    float4x4 m = Bone(s.bones & 0xFF) * s.weights.x;
-    m += Bone((s.bones >> 8) & 0xFF) * s.weights.y;
-    m += Bone((s.bones >> 16) & 0xFF) * s.weights.z;
-    m += Bone((s.bones >> 24) & 0xFF) * s.weights.w;
+    float w[8] = { s.w0.x, s.w0.y, s.w0.z, s.w0.w, s.w1.x, s.w1.y, s.w1.z, s.w1.w };
+    float4x4 m = 0;
+    [unroll] for (uint k = 0; k < 8; k++)
+        m += Bone((s.bones[k / 4] >> (k % 4 * 8)) & 0xFF) * w[k];
     return m;
 }
 
-float Hash(uint3 v)
+uint HashU(uint3 v)
 {
     v = v * 1664525u + 1013904223u;
     v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
     v ^= v >> 16u;
     v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
-    return (v.x & 0x00FFFFFF) / 16777216.0;
+    return v.x;
+}
+
+float Hash(uint3 v)
+{
+    return (HashU(v) & 0x00FFFFFF) / 16777216.0;
 }
 
 float3 PointWorld(uint strand, uint i, float4x4 m, float3 rootModel, float3 rootWorld, float lengthFactor)
@@ -107,20 +124,28 @@ VsOut VSMain(uint vid : SV_VertexID, uint instance : SV_InstanceID)
 
     float radius = Points[strand * 4 + i].w * WidthScale;
     float worldPerPixel = 2.0 * dist / (abs(Proj._22) * ViewportSize.y);
-    float halfWidth = max(radius, 0.5 * MinPixelWidth * worldPerPixel);
-    // A ribbon seen end-on shrinks to a dot, leaving bald whorls wherever fur points at the camera; widen it there
-    // (sideLen = sin of the angle between strand and view) without lowering its coverage.
-    float endOnWiden = min(1.0 / max(sideLen, 1e-3), 3.0);
+    // Seen end-on a ribbon shrinks to a dot, so whorls show the deep roots and undercoat between strands (the reference's
+    // crimson cores). Spread those dots wider at proportionally lower coverage so they average out instead of speckling
+    // (sideLen = sin of the angle between strand and view).
+    float halfWidth = max(radius, 0.5 * MinPixelWidth * worldPerPixel) * min(1.0 / max(sideLen, 1e-3), 3.0);
+    // Coverage stands in for the reference strands the asset doesn't hold (CoverageScale). Close up it saturates, so spend
+    // the rest on width; otherwise silhouettes thin out to see-through.
+    float cover = radius / halfWidth * CoverageScale;
+    halfWidth *= max(cover, 1.0);
+    // Reference material: opaque to FadeStart of the length, then a linear fade to the tip. Done as a taper, which MSAA
+    // smooths; fading alpha instead went through the per-sample dither and speckled the tips.
+    float t = i / 3.0;
+    halfWidth *= t <= FadeStart ? 1.0 : saturate(1.0 - (t - FadeStart) / (1.0 - FadeStart));
 
     VsOut o;
-    o.world = p + sideDir * side * halfWidth * endOnWiden;
+    o.world = p + sideDir * side * halfWidth;
     o.pos = mul(float4(o.world, 1), ViewProj);
     o.tangent = tangent;
     o.growth = length(tip) > 1e-6 ? normalize(tip) : tangent;
     float4 rootClip = mul(float4(rootWorld, 1), ViewProj);
     o.root = float3((rootClip.xy / rootClip.w * float2(0.5, -0.5) + 0.5) * ViewportSize, rootClip.w);
-    o.t = i / 3.0;
-    o.coverage = saturate(radius / halfWidth * CoverageScale);
+    o.t = t;
+    o.coverage = saturate(cover);
     o.strand = instance;
     return o;
 }
@@ -148,22 +173,104 @@ float3 Agx(float3 c)
     return saturate(mul(x, outset));
 }
 
-float4 PSMain(VsOut i) : SV_Target
+bool BehindScene(float4 pos)
 {
-    if (UseSceneDepth != 0)
-    {
-        float scene = SceneDepth.Load(int3(i.pos.xy * DepthUvScale, 0));
-        if (LinearDepth(i.pos.z) > LinearDepth(scene) + DepthBiasMeters)
-            discard;
-    }
+    return UseSceneDepth != 0 && LinearDepth(pos.z) > LinearDepth(SceneDepth.Load(int3(pos.xy * DepthUvScale, 0))) + DepthBiasMeters;
+}
 
+// Scales by how brightly the game lit its coat at pixel 'at', so the fur follows the scene's sun, lamps and shadows. Only
+// brightness is taken (not the coat texture's colour), averaged over a few taps so texture detail doesn't streak along strands.
+// Taps more than 30 cm from 'depth' (view distance) are background seen past a silhouette and would shade the fringe with it.
+float3 SceneLit(float3 color, float2 at, float depth)
+{
+    if (HasSceneColor == 0 || SceneLighting <= 0)
+        return color;
+    static const int2 taps[5] = { int2(0, 0), int2(-4, -4), int2(4, -4), int2(-4, 4), int2(4, 4) };
+    float luma = 0, count = 0;
+    [unroll] for (int k = 0; k < 5; k++)
+    {
+        int2 p = int2(at) + taps[k];
+        if (UseSceneDepth != 0 && abs(LinearDepth(SceneDepth.Load(int3(float2(p) * DepthUvScale, 0))) - depth) > 0.3)
+            continue;
+        luma += dot(pow(saturate(SceneColor.Load(int3(p, 0)).rgb), OutputGamma), float3(0.2126, 0.7152, 0.0722));
+        count++;
+    }
+    return count > 0 ? color * lerp(1.0, luma / count * SceneGain, SceneLighting) : color;
+}
+
+float4 Output(float3 color)
+{
+    color *= Exposure;
+    return float4(lerp(pow(saturate(color), 1.0 / OutputGamma), Agx(color), AgxToneMap), 1.0);
+}
+
+// How directly the view looks down into the fur (cosine between view and fur direction). Fitted to Cycles renders of the
+// reference fur on this coat: the colour exponent barely moves until facing 0.7, then climbs steeply (about facing^8).
+// A broad (linear) response tinted all camera-facing fur, which showed through the pale side-on strands near silhouettes.
+float LookingIn(float facing)
+{
+    return pow(saturate(facing), 8.0);
+}
+
+// The coat surface under the fur, in the emitter's colour (reference Material.004: fur colour x 0.3, rough metal). Without it
+// the game's own coat shows through wherever the fur is seen end-on or thins out.
+struct UnderOut
+{
+    float4 pos : SV_Position;
+    float3 world : WORLDPOS;
+    float3 normal : NORMAL;
+};
+
+UnderOut VSUnder(uint vid : SV_VertexID)
+{
+    MeshVertex v = MeshVertices[vid];
+    float4x4 m = SkinMatrix(MeshSkins[vid]);
+    UnderOut o;
+    o.world = mul(float4(v.position, 1), m).xyz;
+    o.normal = mul(float4(v.normal, 0), m).xyz;
+    o.pos = mul(float4(o.world, 1), ViewProj);
+    return o;
+}
+
+float4 PSUnder(UnderOut i) : SV_Target
+{
+    if (BehindScene(i.pos))
+        discard;
+    float3 n = normalize(i.normal);
+    n *= dot(n, CameraPos - i.world) < 0 ? -1.0 : 1.0;
+    float diffuse = saturate(dot(n, normalize(LightDir)) * 0.5 + 0.5);
+    // Lit like a strand root: light reaches the surface through the fur (absorption as in PSMain at the root).
+    float facing = LookingIn(dot(n, normalize(CameraPos - i.world)));
+    float3 albedo = UndercoatColor * pow(max(BaseColor, 1e-3), Absorption * (1.0 + FacingDepth * facing));
+    return Output(SceneLit(albedo * (AmbientColor + diffuse * LightIntensity), i.pos.xy, LinearDepth(i.pos.z)));
+}
+
+float4 PSMain(VsOut i, uint geometry : SV_Coverage, out uint coverage : SV_Coverage) : SV_Target
+{
+    coverage = 0xFF;
+    if (BehindScene(i.pos))
+        discard;
     if (DebugSolid != 0)
         return float4(1, 0, 1, 1);
 
-    // Reference material: opaque to 25% of the length, then linear fade to the tip.
-    float alpha = (i.t <= FadeStart ? 1.0 : saturate(1.0 - (i.t - FadeStart) / (1.0 - FadeStart))) * i.coverage * Opacity;
-    float noise = Hash(uint3(i.pos.xy, TemporalDither != 0 ? FrameIndex : 0u) + uint3(0, 0, i.strand * 7919u));
-    if (noise >= alpha)
+    float alpha = i.coverage * Opacity;
+    // Stochastic transparency per MSAA sample, stratified: of the samples this strand covers, keep alpha of them (the
+    // fraction dithered), starting at a random sample per strand and pixel so overlapping strands still add up.
+    // Independent per-sample coin flips gave a pixel at alpha 0.2 anywhere from 0 to 4 of 8 samples (speckled tips).
+    uint bits = HashU(uint3(i.pos.xy, (TemporalDither != 0 ? FrameIndex : 0u) + i.strand * 7919u));
+    uint kept = (uint)(alpha * countbits(geometry) + (bits & 0xFFFF) / 65536.0);
+    uint turn = (bits >> 16) % SampleCount;
+    coverage = 0;
+    [unroll] for (uint k = 0; k < 8; k++)
+    {
+        uint s = (k + turn) % SampleCount;
+        if (k < SampleCount && kept > 0 && ((geometry >> s) & 1))
+        {
+            coverage |= 1u << s;
+            kept--;
+        }
+    }
+    if (coverage == 0)
         discard;
 
     // Kajiya-Kay with very rough highlights (reference: roughness 1).
@@ -182,29 +289,51 @@ float4 PSMain(VsOut i) : SV_Target
     float spec = pow(sqrt(saturate(1.0 - th * th)), 3.0) * Specular;
 
     float jitter = 1.0 + (Hash(uint3(i.strand, 17u, 3u)) - 0.5) * 2.0 * HueJitter;
-    float3 albedo = BaseColor * lerp(RootDarken, 1.0, i.t) * jitter;
+    float3 albedo = BaseColor * jitter;
     // Light reaching deep into the fur has passed through many strands (Beer-Lambert: colour^path), which makes roots and
     // fur seen end-on (looking down into it) darker and more saturated, like the reference's magenta partings.
-    float facing = saturate(dot(normalize(i.growth), v));
-    albedo *= pow(max(BaseColor, 1e-3), Absorption * (1.0 - i.t) * (1.0 + FacingDepth * facing * facing));
-    float3 color = albedo * (AmbientColor + diffuse * LightIntensity) + spec * LightIntensity;
+    float facing = LookingIn(dot(normalize(i.growth), v));
+    albedo *= pow(max(BaseColor, 1e-3), Absorption * (1.0 - i.t) * (1.0 + FacingDepth * facing));
+    // Light reaching this depth of the fur (reference: colour x intercept, black at the root). It shades the sheen too, or
+    // roots go grey wherever they are seen side-on (silhouettes, partings).
+    float shadow = lerp(RootDarken, 1.0, i.t);
+    float3 color = (albedo * (AmbientColor + diffuse * LightIntensity) + spec * LightIntensity) * shadow;
 
-    // Scale by how brightly the game lit the coat around the strand root, so the fur follows the scene's sun, lamps and
-    // shadows. Only brightness is taken (not the coat texture's colour), averaged over a few taps so texture detail
-    // doesn't streak along strands. Falls back to the strand's own pixel when the root is off-screen or hidden.
-    if (HasSceneColor != 0 && SceneLighting > 0)
+    // Light from the game's coat around the strand root; the strand's own pixel when the root is off-screen or hidden by
+    // something other than the character (a root just behind the coat's own silhouette keeps the coat in front of it).
+    float2 at = i.root.xy;
+    float depth = i.root.z;
+    bool onScreen = all(at >= 4) && all(at < ViewportSize - 4) && i.root.z > 0;
+    if (!onScreen || (UseSceneDepth != 0 && LinearDepth(SceneDepth.Load(int3(at * DepthUvScale, 0))) < i.root.z - 0.3))
     {
-        float2 at = i.root.xy;
-        bool onScreen = all(at >= 4) && all(at < ViewportSize - 4) && i.root.z > 0;
-        if (!onScreen || (UseSceneDepth != 0 && LinearDepth(SceneDepth.Load(int3(at * DepthUvScale, 0))) < i.root.z - 0.05))
-            at = i.pos.xy;
-        static const int2 taps[5] = { int2(0, 0), int2(-4, -4), int2(4, -4), int2(-4, 4), int2(4, 4) };
-        float luma = 0;
-        [unroll] for (int k = 0; k < 5; k++)
-            luma += dot(pow(saturate(SceneColor.Load(int3(int2(at) + taps[k], 0)).rgb), OutputGamma), float3(0.2126, 0.7152, 0.0722));
-        color *= lerp(1.0, luma / 5 * SceneGain, SceneLighting);
+        at = i.pos.xy;
+        depth = LinearDepth(i.pos.z);
     }
-    color *= Exposure;
-    color = lerp(pow(saturate(color), 1.0 / OutputGamma), Agx(color), AgxToneMap);
-    return float4(color, 1.0);
+    return Output(SceneLit(color, at, depth));
+}
+
+float4 VSComposite(uint vid : SV_VertexID) : SV_Position
+{
+    return float4(float2((vid << 1) & 2, vid & 2) * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+
+float4 PSComposite(float4 pos : SV_Position) : SV_Target
+{
+    return FurLayer.Load(int3(pos.xy, 0));
+}
+
+// Writes the nearest fur depth into the game's depth buffer where the fur is at least half opaque. Without it ReShade's
+// depth effects (fake GI, AO) shade fur past the coat's silhouette as the background behind it.
+float PSDepth(float4 pos : SV_Position) : SV_Depth
+{
+    if (FurLayer.Load(int3(pos.xy, 0)).a < 0.5)
+        discard;
+    float nearest = FurDepth.Load(int2(pos.xy), 0);
+    [unroll] for (uint k = 1; k < 8; k++)
+    {
+        float d = FurDepth.Load(int2(pos.xy), k);
+        if (k < SampleCount && LinearDepth(d) < LinearDepth(nearest))
+            nearest = d;
+    }
+    return nearest;
 }
