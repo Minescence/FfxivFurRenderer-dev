@@ -354,8 +354,7 @@ internal sealed unsafe class GameInterop : IDisposable
     }
 
     /// <summary>
-    /// Models using Hikari's fur textures, in the coat's slots (drawn from its baked assets, so only their colour is of use) or in
-    /// all the others. The texture paths stay game
+    /// Models using Hikari's fur textures, in the coat's slots or in all the others. The texture paths stay game
     /// paths under Penumbra; the model's file name is the mod's file on disk.
     /// </summary>
     public List<FurModel> FindFurModels(nint characterBase, bool coatSlots = false)

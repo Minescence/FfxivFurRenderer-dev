@@ -406,13 +406,15 @@ public sealed unsafe class Plugin : IDalamudPlugin
             var male = interop.IsMale(character);
             var name = $"coat_{(slot == CoatSlot.Ring ? "ril" : "glv")}_{(male ? "m" : "f")}.furasset";
             var key = $"{name}@c{race:D4}";
-            if (!items.TryGetValue(key, out var coat))
+            var path = Path.Combine(AssetDirectory, name);
+            // Baked assets hold the mod's mesh, so releases can't ship them: there the coat grows from the worn model like any other item.
+            if (items.TryGetValue(key, out var coat) || File.Exists(path))
             {
-                var path = Path.Combine(AssetDirectory, name);
-                items[key] = coat = StartItem(character, (ushort)(male ? 101 : 201), race, name, () => FurAsset.Load(path));
+                coat ??= items[key] = StartItem(character, (ushort)(male ? 101 : 201), race, name, () => FurAsset.Load(path));
+                if (AddDraw(snap, character, coat) && interop.FindFurModels(character, coatSlots: true) is [var worn, ..])
+                    QueueColorRead(coat, interop.GetColorTable(character, worn.Slot, worn.FirstFurMaterial));
             }
-            if (AddDraw(snap, character, coat) && interop.FindFurModels(character, coatSlots: true) is [var worn, ..])
-                QueueColorRead(coat, interop.GetColorTable(character, worn.Slot, worn.FirstFurMaterial));
+            else AddFurModels(snap, character, race, coatSlots: true);
         }
         AddFurModels(snap, character, race);
         foreach (var prop in interop.GetProps())
@@ -421,9 +423,9 @@ public sealed unsafe class Plugin : IDalamudPlugin
         return true;
     }
 
-    private void AddFurModels(FrameSnapshot snap, nint character, ushort race)
+    private void AddFurModels(FrameSnapshot snap, nint character, ushort race, bool coatSlots = false)
     {
-        foreach (var fur in interop.FindFurModels(character))
+        foreach (var fur in interop.FindFurModels(character, coatSlots))
         {
             // Props by actor: two with the same minion have their own bones and colour tables.
             var key = $"{fur.Path}|{fur.FurMaterials:X}|{fur.EnabledAttributes:X}@{(race != 0 ? race : character):X}";
@@ -434,7 +436,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 // race deformer. Upgrade: ask Penumbra.GetGameObjectResourcePaths.V5 for the game path.
                 var named = System.Text.RegularExpressions.Regex.Match(name, @"^c([0-9]{4})");
                 var modelRace = race != 0 && named.Success ? ushort.Parse(named.Groups[1].Value) : race;
-                items[key] = item = StartItem(character, modelRace, race, name, () => FurGrower.Grow(ReadModel(fur.Path), fur.FurMaterials, fur.EnabledAttributes));
+                items[key] = item = StartItem(character, modelRace, race, name, () => FurGrower.Grow(ReadModel(fur.Path), fur.FurMaterials, fur.EnabledAttributes, coatSlots ? FurGrower.MaxCoatStrands : FurGrower.MaxStrands));
             }
             // shortcut: one colour per model, its first fur material's; only one boots option has two. Upgrade: per-mesh colour.
             if (AddDraw(snap, character, item))

@@ -9,8 +9,8 @@ namespace FurRenderer;
 /// </summary>
 internal static class FurGrower
 {
-    /// <summary>Items at or above this are skipped (the coat, the largest item drawn, has 980k).</summary>
-    public const int MaxStrands = 980_000;
+    /// <summary>Items at or above this are skipped, except the coat: 980k strands on the female model, 1.2M on the male.</summary>
+    public const int MaxStrands = 980_000, MaxCoatStrands = 1_300_000;
 
     // Mod files set the time and memory taken. Far above the largest surveyed (84,789 vertices, 127,488 triangles).
     private const int MaxVertices = 2_000_000, MaxIndices = 6_000_000;
@@ -30,10 +30,10 @@ internal static class FurGrower
     private static readonly HashSet<string> BelowFaceBones = ["j_kubi", "j_ago"];
     private const float HeadLengthFactor = 0.5f;
 
-    /// <summary>Null when there is no fur surface or it would take <see cref="MaxStrands"/> or more strands.</summary>
+    /// <summary>Null when there is no fur surface or it would take <paramref name="maxStrands"/> or more strands.</summary>
     /// <param name="furMaterials">Bit per model material: the ones whose meshes grow fur.</param>
     /// <param name="enabledAttributes">Model.EnabledAttributeIndexMask: the game keeps a submesh if all its attribute bits are enabled.</param>
-    public static FurAsset? Grow(byte[] file, uint furMaterials, uint enabledAttributes)
+    public static FurAsset? Grow(byte[] file, uint furMaterials, uint enabledAttributes, int maxStrands = MaxStrands)
     {
         var surface = Surface.Read(file, furMaterials, enabledAttributes);
         var triangles = surface.Triangles;
@@ -47,7 +47,7 @@ internal static class FurGrower
             cumulative[t] = area;
         }
         var strands = (int)Math.Round(area * StrandsPerM2);
-        if (strands == 0 || strands >= MaxStrands) return null;
+        if (strands == 0 || strands >= maxStrands) return null;
 
         var border = surface.BorderSamples();
         var rng = new Random(246);
