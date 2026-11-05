@@ -24,7 +24,6 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private string? rendererError;
     private string? loadedAssetName;
     private string? assetError;
-    private readonly IFramework framework;
     private readonly IDataManager dataManager;
     private volatile Matrix4x4[]? deform; // race deformer per bone of the loaded asset
     private bool[] found = new bool[Renderer.MaxBones];
@@ -71,12 +70,11 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private int testCase, testFrame;
     private (int Bind, bool Depth, bool Solid, bool Enabled) testSaved;
 
-    public Plugin(IDalamudPluginInterface pluginInterface, ICommandManager commandManager, IClientState clientState, IObjectTable objectTable, IGameInteropProvider hooks, IPluginLog log, IFramework framework, IDataManager dataManager)
+    public Plugin(IDalamudPluginInterface pluginInterface, ICommandManager commandManager, IClientState clientState, IObjectTable objectTable, IGameInteropProvider hooks, IPluginLog log, IDataManager dataManager)
     {
         this.pluginInterface = pluginInterface;
         this.commandManager = commandManager;
         this.log = log;
-        this.framework = framework;
         this.dataManager = dataManager;
         config = pluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
         if (config.Version < 2) { config.BackBufferBind = -1; config.Version = 2; } // v1 defaults drew over the UI
@@ -133,7 +131,6 @@ public sealed unsafe class Plugin : IDalamudPlugin
         pluginInterface.UiBuilder.DisableCutsceneUiHide = true;
         pluginInterface.UiBuilder.DisableGposeUiHide = true;
         pluginInterface.UiBuilder.Draw += OnDraw;
-        framework.Update += OnFrameworkUpdate;
         pluginInterface.UiBuilder.OpenConfigUi += () => windowOpen = true;
         pluginInterface.UiBuilder.OpenMainUi += () => windowOpen = true;
     }
@@ -174,6 +171,13 @@ public sealed unsafe class Plugin : IDalamudPlugin
         }
 
         if (DrawAtPresent) SafeRenderFur(null);
+        // Poses and camera for the frame the render thread draws next, taken after the game's Tick. Reading them live on the
+        // render thread raced the animation update (one-frame T-poses). Taking them at Framework.Update raced the render thread
+        // itself, which starts on the previous Tick's frame as Present returns: about one frame in nine drew with the camera
+        // of the frame before, and with the camera moving towards the coat (ground collision) the whole fur failed the depth test.
+        var snap = new FrameSnapshot { Gpose = FFXIVClientStructs.FFXIV.Client.Game.GameMain.IsInGPose() };
+        Fill(snap);
+        snapshot = snap;
         if (testCases != null) StepSelfTest();
         var debugResult = debugCapture.Tick(
             () => interop.TryGetDevice(out _, out var c) && interop.TryGetBackBuffer(out var b) ? ((nint)c, (nint)b) : null,
@@ -323,15 +327,6 @@ public sealed unsafe class Plugin : IDalamudPlugin
         log.Info("[{Key}] {Message}", key, message);
     }
 
-    // Runs before the game's Tick, so poses and camera are final for the frame the render thread draws next. Reading them live
-    // from the render thread raced the main thread's animation update (one-frame T-poses, jitter, fur lagging the camera).
-    private void OnFrameworkUpdate(IFramework _)
-    {
-        var snap = new FrameSnapshot { Gpose = FFXIVClientStructs.FFXIV.Client.Game.GameMain.IsInGPose() };
-        Fill(snap);
-        snapshot = snap;
-    }
-
     private bool Fill(FrameSnapshot snap)
     {
         if (!config.Enabled) { snap.Skip = "disabled"; return false; }
@@ -379,7 +374,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         }
         if (renderer == null) { status = "renderer init failed: " + rendererError; return; }
 
-        // Bones and camera come from the main thread (see OnFrameworkUpdate): this runs on the render thread.
+        // Bones and camera come from the main thread (see OnDraw): this runs on the render thread.
         var snap = snapshot;
         if (snap == null) { status = "waiting for first frame"; return; }
         if (snap.Skip != null) { status = snap.Skip; return; }
@@ -569,7 +564,6 @@ public sealed unsafe class Plugin : IDalamudPlugin
     public void Dispose()
     {
         pluginInterface.UiBuilder.Draw -= OnDraw;
-        framework.Update -= OnFrameworkUpdate;
         setTargetHook?.Dispose();
         commandManager.RemoveHandler(CommandName);
         renderer?.Dispose();
