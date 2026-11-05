@@ -212,6 +212,13 @@ float LookingIn(float facing)
     return pow(saturate(facing), 8.0);
 }
 
+// Seen end-on, the asset's sparse strands (a fraction of the reference density) let the dark roots and undercoat show between
+// the tips where a full pelt would hide them: a dark groove that follows the camera. How much to shade those as tips instead.
+float EndOn(float facing)
+{
+    return 0.8 * smoothstep(0.5, 1.0, facing);
+}
+
 // The coat surface under the fur, in the emitter's colour (reference Material.004: fur colour x 0.3, rough metal). Without it
 // the game's own coat shows through wherever the fur is seen end-on or thins out.
 struct UnderOut
@@ -240,8 +247,9 @@ float4 PSUnder(UnderOut i) : SV_Target
     n *= dot(n, CameraPos - i.world) < 0 ? -1.0 : 1.0;
     float diffuse = saturate(dot(n, normalize(LightDir)) * 0.5 + 0.5);
     // Lit like a strand root: light reaches the surface through the fur (absorption as in PSMain at the root).
-    float facing = LookingIn(dot(n, normalize(CameraPos - i.world)));
-    float3 albedo = UndercoatColor * pow(max(BaseColor, 1e-3), Absorption * (1.0 + FacingDepth * facing));
+    float facing = dot(n, normalize(CameraPos - i.world));
+    float3 albedo = UndercoatColor * pow(max(BaseColor, 1e-3), Absorption * (1.0 + FacingDepth * LookingIn(facing)));
+    albedo = lerp(albedo, BaseColor, EndOn(facing)); // the gaps between end-on strands, shaded like their tips
     return Output(SceneLit(albedo * (AmbientColor + diffuse * LightIntensity), i.pos.xy, LinearDepth(i.pos.z)));
 }
 
@@ -292,11 +300,12 @@ float4 PSMain(VsOut i, uint geometry : SV_Coverage, out uint coverage : SV_Cover
     float3 albedo = BaseColor * jitter;
     // Light reaching deep into the fur has passed through many strands (Beer-Lambert: colour^path), which makes roots and
     // fur seen end-on (looking down into it) darker and more saturated, like the reference's magenta partings.
-    float facing = LookingIn(dot(normalize(i.growth), v));
-    albedo *= pow(max(BaseColor, 1e-3), Absorption * (1.0 - i.t) * (1.0 + FacingDepth * facing));
+    float cosView = dot(normalize(i.growth), v);
+    float buried = (1.0 - i.t) * (1.0 - EndOn(cosView));
+    albedo *= pow(max(BaseColor, 1e-3), Absorption * buried * (1.0 + FacingDepth * LookingIn(cosView)));
     // Light reaching this depth of the fur (reference: colour x intercept, black at the root). It shades the sheen too, or
     // roots go grey wherever they are seen side-on (silhouettes, partings).
-    float shadow = lerp(RootDarken, 1.0, i.t);
+    float shadow = lerp(RootDarken, 1.0, 1.0 - buried);
     float3 color = (albedo * (AmbientColor + diffuse * LightIntensity) + spec * LightIntensity) * shadow;
 
     // Light from the game's coat around the strand root; the strand's own pixel when the root is off-screen or hidden by
