@@ -29,13 +29,14 @@ Texture2DMS<float> FurDepth : register(t8);           // the fur layer's own dep
 struct StrandMatrix
 {
     float3 r0, r1, r2, r3;  // SkinMatrix rows without w (only mul(float4(p, 1), m).xyz is taken)
-    uint2 color;            // SurfaceColor as halves: r | g << 16, b | light gain << 16
+    uint3 color;            // SurfaceColor as halves: r | g << 16, b | light gain << 16; then its 'brightest' as a float
 };
 StructuredBuffer<StrandMatrix> StrandMatrices : register(t9);
 RWStructuredBuffer<StrandMatrix> StrandMatricesOut : register(u0);
 Texture2D<float2> SurfaceLight : register(t11);       // 1/8 size with mips: the fur surface's luminance x coverage, coverage
 SamplerState LinearClamp : register(s0);
 Texture2D<float4> SceneColor : register(t10);         // copy of the lit frame (display-encoded) taken just before drawing
+Texture2D<float4> SceneAlbedo : register(t29);        // the game's GBuffer 2: rgb = square root of the diffuse colour it lit each pixel with
 // Per strand root / undercoat vertex: x = rank of its fur material among the item's | 0x10000 when y holds its UV (u | v << 16,
 // halves). Baked assets have no UVs.
 StructuredBuffer<uint2> StrandSurfaces : register(t12);
@@ -97,10 +98,11 @@ struct VsOut
     nointerpolation float4 surface : SURFACE;   // SurfaceColor of the strand's material
     // Per strand copy: brightness jitter, the scene light at the root (SceneLit's scale) and whether the root is usable for it.
     nointerpolation float3 shade : SHADE;
+    nointerpolation float brightest : BRIGHTEST; // SurfaceColor's
 };
 
 float LinearDepth(float d);
-float3 SceneLit(float3 color, float2 at, float depth, float gain);
+float3 SceneLit(float3 color, float2 at, float depth, float gain, float brightest);
 
 float4x4 Bone(uint b)
 {
@@ -132,7 +134,8 @@ float3 TableRow(Texture2D<float4> table, uint row)
 }
 
 // See SurfaceColor. 'mask' bits: 1 = the table is bound, 16 = the index map, 256 = the diffuse map.
-float4 MaterialColor(Texture2D<float4> table, Texture2D<float4> index, Texture2D<float4> diffuse, uint mask, bool mapped, float2 uv, float2 dx, float2 dy)
+float4 MaterialColor(Texture2D<float4> table, Texture2D<float4> index, Texture2D<float4> diffuse, uint mask, bool mapped, float2 uv, float2 dx, float2 dy,
+                     out float brightest)
 {
     // As the game's character shaders: the index map's red picks a pair of table rows and its green blends them (row 0 without
     // one; every installed fur material's fur_id selects row 0 on all texels), times the diffuse map squared.
@@ -162,6 +165,7 @@ float4 MaterialColor(Texture2D<float4> table, Texture2D<float4> index, Texture2D
         tint = d * d / max(dot(mean * mean, Luminance), 1e-3);
     }
     float3 game = row * tint; // what the game draws there
+    brightest = mask & 1 ? dot(row, Luminance) : 1e9; // without the table the game's colour is unknown
     bool undyed = !(mask & 1) || distance(row, UndyedFur) <= 0.02;
     float3 color = undyed && RecolorUndyed != 0 ? BaseColor : row;
     return float4(color * tint, min(dot(UndyedFur, Luminance) / max(dot(game, Luminance), 1e-3), 16.0));
@@ -172,8 +176,9 @@ float4 MaterialColor(Texture2D<float4> table, Texture2D<float4> index, Texture2D
 // lit item, dye and texture included, so without the gain a dark dye darkens the fur twice, as its colour and again as less
 // light. It also takes the texture's brightness back out: SceneLit's taps already hold it, averaged, and twice would square
 // its contrast. Capped because a near-black item's pixels are mostly sheen, which no dye darkens. dx, dy: uv's screen
-// derivatives (0 = the finest mip).
-float4 SurfaceColor(uint material, float2 uv, float2 dx, float2 dy)
+// derivatives (0 = the finest mip). 'brightest': the luminance of its colour table row, which its diffuse colour in GBuffer 2
+// never exceeds (the diffuse map is at most 1), so SceneLit can leave out other surfaces.
+float4 SurfaceColor(uint material, float2 uv, float2 dx, float2 dy, out float brightest)
 {
     bool mapped = (material & 0x10000) != 0;
     material = min(material & 0xFFFF, 3u); // an item's fifth fur material and up share the fourth's textures
@@ -181,10 +186,10 @@ float4 SurfaceColor(uint material, float2 uv, float2 dx, float2 dy)
     float4 result = 0;
     switch (material)
     {
-        case 0: result = MaterialColor(ColorTable0, IndexMap0, DiffuseMap0, mask, mapped, uv, dx, dy); break;
-        case 1: result = MaterialColor(ColorTable1, IndexMap1, DiffuseMap1, mask, mapped, uv, dx, dy); break;
-        case 2: result = MaterialColor(ColorTable2, IndexMap2, DiffuseMap2, mask, mapped, uv, dx, dy); break;
-        default: result = MaterialColor(ColorTable3, IndexMap3, DiffuseMap3, mask, mapped, uv, dx, dy); break;
+        case 0: result = MaterialColor(ColorTable0, IndexMap0, DiffuseMap0, mask, mapped, uv, dx, dy, brightest); break;
+        case 1: result = MaterialColor(ColorTable1, IndexMap1, DiffuseMap1, mask, mapped, uv, dx, dy, brightest); break;
+        case 2: result = MaterialColor(ColorTable2, IndexMap2, DiffuseMap2, mask, mapped, uv, dx, dy, brightest); break;
+        default: result = MaterialColor(ColorTable3, IndexMap3, DiffuseMap3, mask, mapped, uv, dx, dy, brightest); break;
     }
     return result;
 }
@@ -275,13 +280,14 @@ VsOut VSMain(uint vid : SV_VertexID, uint instance : SV_InstanceID)
     // Not the instance: the visible list's order changes every frame, and the strand's jitter and dither hash this.
     o.strand = strand * ChildCount + child;
     o.surface = float4(f16tof32(sm.color.x), f16tof32(sm.color.x >> 16), f16tof32(sm.color.y), f16tof32(sm.color.y >> 16));
+    o.brightest = asfloat(sm.color.z);
     // Once per vertex instead of per fragment, as they are the same for the whole copy. The light comes from the game's item
     // around the root; PSMain takes the surface's light at its own pixel when the root is off-screen or anything hides it,
     // the item's own silhouette included.
     bool rootSeen = all(root.xy >= 4) && all(root.xy < ViewportSize - 4) && root.z > 0
         && !(UseSceneDepth != 0 && LinearDepth(SceneDepth.Load(int3(root.xy * DepthUvScale, 0))) < root.z - OwnSurface);
     o.shade = float3(1.0 + (Hash(uint3(o.strand, 17u, 3u)) - 0.5) * 2.0 * HueJitter,
-                     rootSeen ? SceneLit(1.0, root.xy, root.z, o.surface.a).x : 0, rootSeen ? 1 : 0);
+                     rootSeen ? SceneLit(1.0, root.xy, root.z, o.surface.a, o.brightest).x : 0, rootSeen ? 1 : 0);
     return o;
 }
 
@@ -350,8 +356,9 @@ void CSStrandMatrices(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex
     StrandMatrix o;
     o.r0 = m[0].xyz; o.r1 = m[1].xyz; o.r2 = m[2].xyz; o.r3 = m[3].xyz;
     uint2 surface = StrandSurfaces[id.x];
-    float4 c = SurfaceColor(surface.x, UnpackUv(surface.y), 0, 0);
-    o.color = uint2(f32tof16(c.r) | f32tof16(c.g) << 16, f32tof16(c.b) | f32tof16(c.a) << 16);
+    float brightest;
+    float4 c = SurfaceColor(surface.x, UnpackUv(surface.y), 0, 0, brightest);
+    o.color = uint3(f32tof16(c.r) | f32tof16(c.g) << 16, f32tof16(c.b) | f32tof16(c.a) << 16, asuint(brightest));
     StrandMatricesOut[id.x] = o;
     // One atomic on the draw arguments per group, not per strand.
     bool visible = id.x < DrawnStrands && StrandVisible(id.x, m);
@@ -416,13 +423,22 @@ bool BehindScene(float4 pos)
     return UseSceneDepth != 0 && LinearDepth(pos.z) > LinearDepth(SceneDepth.Load(int3(pos.xy * DepthUvScale, 0))) + DepthBiasMeters;
 }
 
+// Whether back-buffer pixel p shows a surface brighter in colour than the item (SurfaceColor's 'brightest') can be: GBuffer 2
+// holds, squared, colour table row x diffuse map squared on the items' pixels (measured), so the item never exceeds its row.
+// Such a surface can lie within OwnSurface of the coat, like a tail or horns resting on it or the chin over a collar, and with a
+// dark dye the gain made its brightness up to 16x too bright: white fur. Always false without GBuffer 2 (reads 0).
+bool BrighterThanItem(int2 p, float brightest)
+{
+    float3 g = SceneAlbedo.Load(int3(float2(p) * DepthUvScale, 0)).rgb;
+    return dot(g * g, Luminance) > brightest * 1.5;
+}
+
 // Scales by how brightly the game lit its coat at pixel 'at', so the fur follows the scene's sun, lamps and shadows. Only
 // brightness is taken (not the coat texture's colour), averaged over a few taps so texture detail doesn't streak along strands.
-// Taps more than OwnSurface from 'depth' (the surface's view distance there) show something else: background past a
-// silhouette, or a tail or horns in front of the coat, which a dark dye's gain made up to 16x too bright (white fur).
-// 'depth' 0: no point of the surface is known there (a strand's own pixel lies behind the strand), so only SurfaceLight.
-// 'gain' is SurfaceColor's light gain.
-float3 SceneLit(float3 color, float2 at, float depth, float gain)
+// Taps more than OwnSurface from 'depth' (the surface's view distance there) or BrighterThanItem show something else:
+// background past a silhouette, or another part of the character. 'depth' 0: no point of the surface is known there (a
+// strand's own pixel lies behind the strand), so only SurfaceLight. 'gain' and 'brightest' are SurfaceColor's.
+float3 SceneLit(float3 color, float2 at, float depth, float gain, float brightest)
 {
     if (HasSceneColor == 0 || SceneLighting <= 0)
         return color;
@@ -430,9 +446,10 @@ float3 SceneLit(float3 color, float2 at, float depth, float gain)
     float luma = 0, count = 0;
     [unroll] for (int k = 0; k < 5; k++)
     {
-        float2 s = SceneLuma.Load(int3(int2(at) + taps[k], 0));
+        int2 p = int2(at) + taps[k];
+        float2 s = SceneLuma.Load(int3(p, 0));
         // s.y is 0 only off-screen (out-of-bounds read), where there is no scene to take light from.
-        if (UseSceneDepth != 0 && (s.y == 0 || abs(s.y - depth) > OwnSurface))
+        if (UseSceneDepth != 0 && (s.y == 0 || abs(s.y - depth) > OwnSurface) || BrighterThanItem(p, brightest))
             continue;
         luma += s.x;
         count++;
@@ -521,17 +538,21 @@ float4 PSUnder(UnderOut i) : SV_Target
     float diffuse = saturate(dot(n, normalize(LightDir)) * 0.5 + 0.5);
     // Lit like a strand root: light reaches the surface through the fur (absorption as in PSMain at the root).
     float facing = dot(n, normalize(CameraPos - i.world));
-    float4 surface = SurfaceColor(i.material, i.uv, ddx(i.uv), ddy(i.uv));
+    float brightest;
+    float4 surface = SurfaceColor(i.material, i.uv, ddx(i.uv), ddy(i.uv), brightest);
     float3 albedo = surface.rgb * UndercoatDarken * pow(max(surface.rgb, 1e-3), Absorption * (1.0 + FacingDepth * LookingIn(facing)));
     albedo = lerp(albedo, surface.rgb, EndOn(facing)); // the gaps between end-on strands, shaded like their tips
-    return Output(SceneLit(albedo * (AmbientColor + diffuse * LightIntensity), i.pos.xy, LinearDepth(i.pos.z), surface.a));
+    return Output(SceneLit(albedo * (AmbientColor + diffuse * LightIntensity), i.pos.xy, LinearDepth(i.pos.z), surface.a, brightest));
 }
 
 // Into SurfaceLight, with VSUnder: what the game lit where its surface is the one this mesh draws (not what is in front of it).
 float2 PSSurfaceLight(UnderOut i) : SV_Target
 {
-    float2 s = SceneLuma.Load(int3(i.pos.xy * 8, 0));
-    if (abs(s.y - LinearDepth(i.pos.z)) > OwnSurface)
+    int2 p = int2(i.pos.xy * 8);
+    float2 s = SceneLuma.Load(int3(p, 0));
+    float brightest;
+    SurfaceColor(i.material, i.uv, ddx(i.uv), ddy(i.uv), brightest);
+    if (abs(s.y - LinearDepth(i.pos.z)) > OwnSurface || BrighterThanItem(p, brightest))
         discard;
     return float2(s.x, 1);
 }
@@ -590,7 +611,7 @@ float4 PSMain(VsOut i, uint geometry : SV_Coverage, out uint coverage : SV_Cover
     float shadow = lerp(RootDarken, 1.0, 1.0 - buried);
     float3 color = (albedo * (AmbientColor + diffuse * LightIntensity) + spec * LightIntensity) * shadow;
 
-    return Output(i.shade.z > 0 ? color * i.shade.y : SceneLit(color, i.pos.xy, 0, i.surface.a));
+    return Output(i.shade.z > 0 ? color * i.shade.y : SceneLit(color, i.pos.xy, 0, i.surface.a, i.brightest));
 }
 
 float4 VSComposite(uint vid : SV_VertexID) : SV_Position

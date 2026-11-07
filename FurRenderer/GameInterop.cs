@@ -105,6 +105,21 @@ internal sealed unsafe class GameInterop : IDisposable
     }
 
     /// <summary>
+    /// The game's view of GBuffer 2 (not AddRef'd; valid for this frame): rgb is the square root of the diffuse colour each
+    /// pixel was lit with (measured on the fur items: squared it matches colour table row x diffuse map squared). Null if absent.
+    /// </summary>
+    public ID3D11ShaderResourceView* GetSceneAlbedo()
+    {
+        var rtm = RenderTargetManager.Instance();
+        if (rtm == null || rtm->GBuffers[2].Value == null) return null;
+        var view = (ID3D11ShaderResourceView*)rtm->GBuffers[2].Value->D3D11ShaderResourceView;
+        if (view == null) return null;
+        D3D11_SHADER_RESOURCE_VIEW_DESC desc;
+        view->GetDesc(&desc);
+        return desc.ViewDimension == D3D_SRV_DIMENSION.D3D_SRV_DIMENSION_TEXTURE2D ? view : null;
+    }
+
+    /// <summary>
     /// Scene depth as a shader resource view (not AddRef'd; valid for this frame) and its texture size.
     /// Readable as a float in .r: over a typeless resource, a typed SRV is created here and cached by resource pointer.
     /// </summary>

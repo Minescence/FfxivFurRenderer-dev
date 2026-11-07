@@ -609,7 +609,9 @@ public sealed unsafe class Plugin : IDalamudPlugin
             uint dw = 0, dh = 0;
             if (config.UseSceneDepth) interop.TryGetSceneDepth(out depth, out dw, out dh);
             Diag("depth", config.UseSceneDepth ? interop.DepthInfo : "disabled in settings");
-            renderer.Draw(context, backBuffer, depth, new Vector2(dw, dh), draws, view, proj, gpose ? config.GposeChildCount : config.ChildCount, config);
+            var albedo = interop.GetSceneAlbedo();
+            Diag("albedo", albedo != null ? "GBuffer 2" : "no GBuffer 2: scene light also taken from surfaces over the items");
+            renderer.Draw(context, backBuffer, depth, albedo, new Vector2(dw, dh), draws, view, proj, gpose ? config.GposeChildCount : config.ChildCount, config);
             furDraws++;
             lastFurTarget = (nint)backBuffer;
             ID3D11Resource* depthTexture = null;

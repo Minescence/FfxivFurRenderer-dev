@@ -394,7 +394,7 @@ internal sealed unsafe class Renderer : IDisposable
                 CreateStructured(p, asset.Skins.Length, sizeof(StrandSkin), dynamic: false, ref b.Skins, ref b.SkinsSrv);
             fixed (StrandSurface* p = asset.StrandSurfaces)
                 CreateStructured(p, asset.StrandSurfaces.Length, sizeof(StrandSurface), dynamic: false, ref b.StrandSurfaces, ref b.StrandSurfacesSrv);
-            const int matrixStride = 4 * 12 + 8; // StrandMatrix: 4 x float3, uint2 colour
+            const int matrixStride = 4 * 12 + 12; // StrandMatrix: 4 x float3, uint3 colour
             var matricesDesc = new D3D11_BUFFER_DESC
             {
                 ByteWidth = checked((uint)(asset.StrandCount * matrixStride)),
@@ -500,8 +500,9 @@ internal sealed unsafe class Renderer : IDisposable
     public string LastDrawInfo { get; private set; } = "";
 
     /// <summary>Draws each item's <see cref="FurDraw.Density"/> of its strands.</summary>
-    public void Draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* backBuffer, ID3D11ShaderResourceView* sceneDepth, Vector2 depthSize,
-        List<FurDraw> draws, Matrix4x4 view, Matrix4x4 proj, int childCount, Configuration cfg)
+    /// <param name="sceneAlbedo">GBuffer 2, see <see cref="GameInterop.GetSceneAlbedo"/>; without it SceneLit can't tell other surfaces from the item.</param>
+    public void Draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* backBuffer, ID3D11ShaderResourceView* sceneDepth, ID3D11ShaderResourceView* sceneAlbedo,
+        Vector2 depthSize, List<FurDraw> draws, Matrix4x4 view, Matrix4x4 proj, int childCount, Configuration cfg)
     {
         if (draws.Count == 0) return;
         D3D11_TEXTURE2D_DESC bbDesc;
@@ -581,8 +582,13 @@ internal sealed unsafe class Renderer : IDisposable
         ctx->VSSetConstantBuffers(0, 1, &cb);
         ctx->PSSetConstantBuffers(0, 1, &cb);
         ctx->CSSetConstantBuffers(0, 1, &cb);
+        var wrap = linearWrap; // SurfaceColor
+        ctx->CSSetSamplers(1, 1, &wrap);
+        ctx->PSSetSamplers(1, 1, &wrap);
         if (fc.HasSceneColor != 0)
         {
+            ctx->PSSetShaderResources(29, 1, &sceneAlbedo); // SceneLit and PSSurfaceLight
+            ctx->VSSetShaderResources(29, 1, &sceneAlbedo); // VSMain's SceneLit at strand roots
             // Before the fur pass binds the result for reading.
             var lumaRtv = sceneLumaRtv;
             ctx->OMSetRenderTargets(1, &lumaRtv, null);
@@ -613,6 +619,8 @@ internal sealed unsafe class Renderer : IDisposable
                 {
                     var item = draw.Buffers;
                     if (item.MeshIndices == null) continue;
+                    BindMaterials(ctx, draw, ref fc); // PSSurfaceLight leaves out other surfaces by the item's colour
+                    Upload(ctx, (ID3D11Resource*)constants, &fc, sizeof(FrameConstants));
                     fixed (Matrix4x4* m = draw.Skin)
                         Upload(ctx, (ID3D11Resource*)bones, m, Math.Min(draw.Skin.Length, MaxBones) * sizeof(Matrix4x4));
                     meshSrvs[0] = item.MeshVerticesSrv;
@@ -653,11 +661,6 @@ internal sealed unsafe class Renderer : IDisposable
         var csSrvs = stackalloc ID3D11ShaderResourceView*[3];
         var csUavs = stackalloc ID3D11UnorderedAccessView*[3];
         var vsSrvs = stackalloc ID3D11ShaderResourceView*[7];
-        var colorSrvs = stackalloc ID3D11ShaderResourceView*[1 + MaxMaterials]; // t12: strand surfaces, t13..: colour tables
-        var mapSrvs = stackalloc ID3D11ShaderResourceView*[2 * MaxMaterials];   // t21..: index maps, then diffuse maps
-        var wrap = linearWrap;
-        ctx->CSSetSamplers(1, 1, &wrap);
-        ctx->PSSetSamplers(1, 1, &wrap);
         for (var d = 0; d < draws.Count; d++)
         {
             var draw = draws[d];
@@ -666,19 +669,7 @@ internal sealed unsafe class Renderer : IDisposable
             if (drawn == 0) continue;
             (fc.DrawnStrands, fc.ArgsOffset) = (drawn, (uint)(d * 16));
             strandInstances += drawn * fc.ChildCount;
-            fc.TableMask = 0;
-            colorSrvs[0] = item.StrandSurfacesSrv;
-            for (var k = 0; k < MaterialTextures; k++)
-            {
-                var srv = (ID3D11ShaderResourceView*)draw.Textures[k];
-                if (k < MaxMaterials) colorSrvs[1 + k] = srv;
-                else mapSrvs[k - MaxMaterials] = srv;
-                if (srv != null) fc.TableMask |= 1u << k;
-            }
-            ctx->CSSetShaderResources(12, 1 + MaxMaterials, colorSrvs);
-            ctx->CSSetShaderResources(21, 2 * MaxMaterials, mapSrvs);
-            ctx->PSSetShaderResources(13, MaxMaterials, colorSrvs + 1); // the undercoat's colour
-            ctx->PSSetShaderResources(21, 2 * MaxMaterials, mapSrvs);
+            BindMaterials(ctx, draw, ref fc);
             // Assets hold 10% of the reference strand density (Interpolate amount 0.10); thicken coverage by the shortfall so
             // silhouettes stay as solid as the reference instead of showing the background between strands.
             fc.CoverageScale = Math.Max(1f, item.StrandCount / (AssetDensityFraction * drawn * fc.ChildCount));
@@ -949,6 +940,26 @@ internal sealed unsafe class Renderer : IDisposable
         ownDepthH = bbDesc.Height;
     }
 
+    // An item's fur material textures for SurfaceColor (CS and PS), and which of them are bound (TableMask; constants not uploaded).
+    private static void BindMaterials(ID3D11DeviceContext* ctx, FurDraw draw, ref FrameConstants fc)
+    {
+        var colorSrvs = stackalloc ID3D11ShaderResourceView*[1 + MaxMaterials]; // t12: strand surfaces, t13..: colour tables
+        var mapSrvs = stackalloc ID3D11ShaderResourceView*[2 * MaxMaterials];   // t21..: index maps, then diffuse maps
+        fc.TableMask = 0;
+        colorSrvs[0] = draw.Buffers.StrandSurfacesSrv;
+        for (var k = 0; k < MaterialTextures; k++)
+        {
+            var srv = (ID3D11ShaderResourceView*)draw.Textures[k];
+            if (k < MaxMaterials) colorSrvs[1 + k] = srv;
+            else mapSrvs[k - MaxMaterials] = srv;
+            if (srv != null) fc.TableMask |= 1u << k;
+        }
+        ctx->CSSetShaderResources(12, 1 + MaxMaterials, colorSrvs);
+        ctx->CSSetShaderResources(21, 2 * MaxMaterials, mapSrvs);
+        ctx->PSSetShaderResources(13, MaxMaterials, colorSrvs + 1);
+        ctx->PSSetShaderResources(21, 2 * MaxMaterials, mapSrvs);
+    }
+
     private void CreateStructured(void* data, int count, int stride, bool dynamic, ref ID3D11Buffer* buffer, ref ID3D11ShaderResourceView* srv)
     {
         var desc = new D3D11_BUFFER_DESC
@@ -1062,8 +1073,8 @@ internal sealed unsafe class Renderer : IDisposable
         private readonly ID3D11VertexShader* vs;
         private readonly ID3D11PixelShader* ps;
         private readonly ID3D11Buffer* vsCb, psCb, csCb;
-        private readonly ID3D11ShaderResourceView*[] vsSrvs = new ID3D11ShaderResourceView*[21]; // t0..t20
-        private readonly ID3D11ShaderResourceView*[] psSrvs = new ID3D11ShaderResourceView*[26]; // t3..t28
+        private readonly ID3D11ShaderResourceView*[] vsSrvs = new ID3D11ShaderResourceView*[30]; // t0..t29
+        private readonly ID3D11ShaderResourceView*[] psSrvs = new ID3D11ShaderResourceView*[27]; // t3..t29
         private readonly ID3D11SamplerState*[] psSamplers = new ID3D11SamplerState*[2]; // s0..s1
         private readonly ID3D11SamplerState* csSampler; // s1
         private readonly ID3D11SamplerState* vsSampler; // s0
