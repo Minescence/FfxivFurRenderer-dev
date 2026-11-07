@@ -23,6 +23,8 @@ internal sealed class FurAsset
     public required int StrandCount { get; init; }
     public required StrandPoint[] Points { get; init; }
     public required StrandSkin[] Skins { get; init; }
+    /// <summary>Per strand, which of the item's fur materials colours it (rank among their bits); baked assets use the first.</summary>
+    public required uint[] StrandMaterials { get; init; }
     public required MeshVertex[] MeshVertices { get; init; }
     public required StrandSkin[] MeshSkins { get; init; }
     public required uint[] MeshIndices { get; init; }
@@ -68,7 +70,7 @@ internal sealed class FurAsset
         if (indices.Any(i => i >= meshVertices)) throw new InvalidDataException($"{path}: mesh index out of range");
         return new FurAsset
         {
-            BoneNames = names, StrandCount = strands, Points = points, Skins = skins,
+            BoneNames = names, StrandCount = strands, Points = points, Skins = skins, StrandMaterials = new uint[strands],
             MeshVertices = vertices, MeshSkins = meshSkins, MeshIndices = indices,
         };
     }

@@ -29,14 +29,12 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private readonly Dictionary<string, FurItem> items = []; // by model, enabled submeshes and wearer race; main thread
     private readonly List<FurItem> retiring = [];
     private readonly ConcurrentQueue<FurItem> retiredItems = new();
-    private readonly ConcurrentQueue<(FurItem Item, nint Table)> colorReads = new(); // tables AddRef'd for the render thread
+    private readonly List<nint> replacedTables = [];
+    private readonly ConcurrentQueue<nint> releasedTables = new(); // colour tables the render thread releases, like retiredItems
     private bool reloadItems;
     private int frame;
 
     private const int RetireAfterFrames = 300;
-    // Row 0 of Hikari's materials, undyed. Such items take the configured fur colour so an outfit matches the coat; dyes and
-    // other colours (the white boots, the red boa) show as they are.
-    private static readonly Vector3 UndyedFur = new(0.984f, 0.615f, 0.603f);
 
     /// <summary>A fur-bearing model: growing, or ready to draw.</summary>
     private sealed class FurItem
@@ -48,21 +46,15 @@ public sealed unsafe class Plugin : IDalamudPlugin
         public int StrandCount;
         public readonly BoneLookup Lookup = new();
         public int LastUsed;
-        public nint ColorTable;
+        // The fur materials' live colour tables (SRVs), AddRef'd so a replaced table's address can't be reused while it is
+        // held: a pointer change is always a new table. Main thread; the render thread releases them.
+        public readonly nint[] Tables = new nint[Renderer.MaxMaterials];
+        public readonly nint[] LoggedTables = new nint[Renderer.MaxMaterials]; // render thread
         public volatile FurAsset? Upload; // held for the render thread, then dropped: the strands stay on the GPU only
         public Renderer.FurBuffers? Buffers; // render thread
-        public Vector3? Color; // render thread; null = the configured colour
     }
 
-    private readonly record struct ItemDraw(FurItem Item, Matrix4x4[] Skin);
-
-    // The scene's light is read off the game's own lit item, dye included: without this a dark dye darkens the fur twice, as its
-    // colour and again as less light. Capped because a near-black item's pixels are mostly sheen, which no dye darkens.
-    private static float LightGain(Vector3 dye)
-    {
-        var luminance = new Vector3(0.2126f, 0.7152f, 0.0722f);
-        return Math.Min(Vector3.Dot(UndyedFur, luminance) / Math.Max(Vector3.Dot(dye, luminance), 1e-3f), 16f);
-    }
+    private readonly record struct ItemDraw(FurItem Item, Matrix4x4[] Skin, nint[] Tables);
 
     /// <summary>Main-thread state for one frame, consumed by the render thread.</summary>
     private sealed class FrameSnapshot
@@ -228,6 +220,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
         // Only now: the render thread frees these before it reads the snapshot, so it can't still be drawing them.
         foreach (var item in retiring) retiredItems.Enqueue(item);
         retiring.Clear();
+        foreach (var table in replacedTables) releasedTables.Enqueue(table);
+        replacedTables.Clear();
         if (testCases != null) StepSelfTest();
         var debugResult = debugCapture.Tick(
             () => interop.TryGetDevice(out _, out var c) && interop.TryGetBackBuffer(out var b) ? ((nint)c, (nint)b) : null,
@@ -411,8 +405,9 @@ public sealed unsafe class Plugin : IDalamudPlugin
             if (items.TryGetValue(key, out var coat) || File.Exists(path))
             {
                 coat ??= items[key] = StartItem(character, (ushort)(male ? 101 : 201), race, name, () => FurAsset.Load(path));
-                if (AddDraw(snap, character, coat) && interop.FindFurModels(character, coatSlots: true) is [var worn, ..])
-                    QueueColorRead(coat, interop.GetColorTable(character, worn.Slot, worn.FirstFurMaterial));
+                // Baked strands are all coloured by the worn coat's first fur material.
+                var worn = interop.FindFurModels(character, coatSlots: true) is [var w, ..] ? w : default;
+                AddDraw(snap, character, coat, worn.Slot, worn.FurMaterials);
             }
             else AddFurModels(snap, character, race, coatSlots: true);
         }
@@ -437,9 +432,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 var modelRace = race != 0 && named.Success ? ushort.Parse(named.Groups[1].Value) : race;
                 items[key] = item = StartItem(character, modelRace, race, name, () => FurGrower.Grow(ReadModel(fur.Path), fur.FurMaterials, fur.EnabledAttributes, coatSlots ? FurGrower.MaxCoatStrands : FurGrower.MaxStrands));
             }
-            // shortcut: one colour per model, its first fur material's; only one boots option has two. Upgrade: per-mesh colour.
-            if (AddDraw(snap, character, item))
-                QueueColorRead(item, interop.GetColorTable(character, fur.Slot, fur.FirstFurMaterial));
+            AddDraw(snap, character, item, fur.Slot, fur.FurMaterials);
         }
     }
 
@@ -482,20 +475,20 @@ public sealed unsafe class Plugin : IDalamudPlugin
         return item;
     }
 
-    // False while the item is growing or has nothing to draw.
-    private bool AddDraw(FrameSnapshot snap, nint character, FurItem item)
+    // Nothing while the item is growing or has nothing to draw. furMaterials: the item's fur materials in the slot's model.
+    private void AddDraw(FrameSnapshot snap, nint character, FurItem item, int slot, uint furMaterials)
     {
         item.LastUsed = frame;
         if (item.Growth is { } growth)
         {
-            if (!growth.IsCompleted) { snap.Growing++; return false; }
+            if (!growth.IsCompleted) { snap.Growing++; return; }
             item.Growth = null;
             if (growth.Result is { } asset) (item.BoneNames, item.StrandCount, item.Upload) = (asset.BoneNames, asset.StrandCount, asset);
         }
         var bones = item.BoneNames.Length;
-        if (bones == 0) return false;
+        if (bones == 0) return;
         var skin = new Matrix4x4[bones];
-        if (!interop.TryGetSkinMatrices(character, item.Lookup, item.BoneNames, skin, found.AsSpan(0, bones))) return false;
+        if (!interop.TryGetSkinMatrices(character, item.Lookup, item.BoneNames, skin, found.AsSpan(0, bones))) return;
         if (item.Deform is { } d)
             for (var i = 0; i < bones; i++) skin[i] = d[i] * skin[i];
         var missing = 0;
@@ -503,23 +496,38 @@ public sealed unsafe class Plugin : IDalamudPlugin
         if (missing > 0) Diag("bones " + item.Name, $"missing {missing}/{bones}");
         snap.Bones += bones;
         snap.MissingBones += missing;
-        snap.Items.Add(new ItemDraw(item, skin));
-        return true;
+        // The k-th table belongs to the k-th set bit of furMaterials: the rank FurGrower gives each strand.
+        var material = -1;
+        for (var k = 0; k < Renderer.MaxMaterials; k++)
+        {
+            do material++; while (material < 32 && (furMaterials >> material & 1) == 0);
+            var table = material < 32 ? (nint)interop.GetColorTable(character, slot, material) : 0;
+            if (table == item.Tables[k]) continue;
+            if (table != 0) ((ID3D11ShaderResourceView*)table)->AddRef();
+            if (item.Tables[k] != 0) replacedTables.Add(item.Tables[k]);
+            item.Tables[k] = table;
+        }
+        snap.Items.Add(new ItemDraw(item, skin, (nint[])item.Tables.Clone()));
     }
 
-    private void QueueColorRead(FurItem item, ID3D11Texture2D* table)
+    private static void ReleaseTables(FurItem item)
     {
-        if ((nint)table == item.ColorTable) return;
-        item.ColorTable = (nint)table;
-        if (table == null) return;
-        table->AddRef();
-        colorReads.Enqueue((item, (nint)table));
+        for (var k = 0; k < item.Tables.Length; k++)
+        {
+            if (item.Tables[k] != 0) ((ID3D11ShaderResourceView*)item.Tables[k])->Release();
+            item.Tables[k] = 0;
+        }
     }
 
     private void RenderFur(ID3D11Texture2D* boundTarget)
     {
         // Before reading the snapshot: see OnDraw.
-        while (retiredItems.TryDequeue(out var retired)) retired.Buffers?.Dispose();
+        while (retiredItems.TryDequeue(out var retired))
+        {
+            retired.Buffers?.Dispose();
+            ReleaseTables(retired);
+        }
+        while (releasedTables.TryDequeue(out var table)) ((ID3D11ShaderResourceView*)table)->Release();
         if (!config.Enabled) { status = "disabled"; return; }
         var gpose = FFXIVClientStructs.FFXIV.Client.Game.GameMain.IsInGPose();
         if (config.OnlyInGpose && !gpose) { status = "waiting for GPose"; return; }
@@ -536,17 +544,17 @@ public sealed unsafe class Plugin : IDalamudPlugin
         var snap = snapshot;
         if (snap == null) { status = "waiting for first frame"; return; }
         if (snap.Skip != null) { status = snap.Skip; return; }
-        while (colorReads.TryDequeue(out var read))
-        {
-            var diffuse = renderer.ReadTableDiffuse(context, (ID3D11Texture2D*)read.Table);
-            ((ID3D11Texture2D*)read.Table)->Release();
-            read.Item.Color = diffuse is { } c && Vector3.Distance(c, UndyedFur) > 0.02f ? c : null;
-            Diag("colour " + read.Item.Name, $"table row 0 {diffuse?.ToString() ?? "unreadable"}");
-        }
         var draws = new List<FurDraw>(snap.Items.Count);
         var strands = 0;
-        foreach (var (item, skin) in snap.Items)
+        foreach (var (item, skin, tables) in snap.Items)
         {
+            for (var k = 0; k < tables.Length; k++)
+            {
+                if (tables[k] == item.LoggedTables[k]) continue;
+                item.LoggedTables[k] = tables[k];
+                Diag($"colour {item.Name} {k}", tables[k] == 0 ? "no table: fur colour"
+                    : $"table row 0 {renderer.ReadTableDiffuse(context, (ID3D11ShaderResourceView*)tables[k])?.ToString() ?? "unreadable"}");
+            }
             if (item.Upload is { } asset)
             {
                 item.Upload = null;
@@ -554,7 +562,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 catch (InvalidOperationException ex) { Diag("item " + item.Name, "failed: " + ex.Message); }
             }
             if (item.Buffers is not { } buffers) continue;
-            draws.Add(new FurDraw(buffers, skin, item.Color ?? config.BaseColor, item.Color is { } dye ? LightGain(dye) : 1f));
+            draws.Add(new FurDraw(buffers, skin, tables));
             strands += item.StrandCount;
         }
         if (draws.Count == 0) { status = snap.Growing > 0 ? "growing fur" : "waiting for fur"; return; }
@@ -720,9 +728,10 @@ public sealed unsafe class Plugin : IDalamudPlugin
         while (Volatile.Read(ref detoursRunning) > 0 && waited.ElapsedMilliseconds < 10000) Thread.Sleep(1); // the first draw compiles the shaders
         setTargetHook?.Dispose();
         commandManager.RemoveHandler(CommandName);
-        foreach (var item in items.Values) item.Buffers?.Dispose();
-        while (retiredItems.TryDequeue(out var retired)) retired.Buffers?.Dispose();
-        while (colorReads.TryDequeue(out var read)) ((ID3D11Texture2D*)read.Table)->Release();
+        foreach (var item in items.Values.Concat(retiring)) { item.Buffers?.Dispose(); ReleaseTables(item); }
+        while (retiredItems.TryDequeue(out var retired)) { retired.Buffers?.Dispose(); ReleaseTables(retired); }
+        foreach (var table in replacedTables) releasedTables.Enqueue(table);
+        while (releasedTables.TryDequeue(out var table)) ((ID3D11ShaderResourceView*)table)->Release();
         renderer?.Dispose();
         (interop as IDisposable)?.Dispose();
     }

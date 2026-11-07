@@ -35,11 +35,11 @@ internal struct FrameConstants
     public float SurfaceLighting, SceneLighting, SceneGain; public uint HasSceneColor;
     public float Exposure, AgxToneMap; public uint ChildCount; public float ChildSpread;
     public float Absorption, FacingDepth, CoverageScale; public uint SampleCount;
-    public Vector3 UndercoatColor; public float Padding;
+    public float UndercoatDarken; public uint TableMask; public Vector2 Padding;
 }
 
-/// <summary>One item's fur for a frame: its skin palette and tip colour.</summary>
-internal readonly record struct FurDraw(Renderer.FurBuffers Buffers, Matrix4x4[] Skin, Vector3 Color, float LightGain);
+/// <summary>One item's fur for a frame: its skin palette and its fur materials' live colour tables (SRVs, 0 = none).</summary>
+internal readonly record struct FurDraw(Renderer.FurBuffers Buffers, Matrix4x4[] Skin, nint[] Tables);
 
 /// <summary>
 /// Draws fur assets (undercoat, then strands) into one multisampled fur layer and blends the resolved layer over the swap-chain
@@ -98,6 +98,7 @@ internal sealed unsafe class Renderer : IDisposable
     private ID3D11ShaderResourceView* surfaceLightSrv;
 
     public const int MaxBones = 256;
+    public const int MaxMaterials = 4; // colour tables per item: ColorTable0..3 in Fur.hlsl
     private const float AssetDensityFraction = 0.10f; // tools/grow_coat_fur.py AMOUNT used for the baked assets, and FurGrower's density
 
     public Renderer(ID3D11Device* device, string shaderPath, byte[] source)
@@ -178,8 +179,8 @@ internal sealed unsafe class Renderer : IDisposable
     /// <summary>The GPU side of one fur asset. Render thread only.</summary>
     internal sealed class FurBuffers : IDisposable
     {
-        public ID3D11Buffer* Points, Skins, MeshVertices, MeshSkins, MeshIndices, StrandMatrices;
-        public ID3D11ShaderResourceView* PointsSrv, SkinsSrv, MeshVerticesSrv, MeshSkinsSrv, StrandMatricesSrv;
+        public ID3D11Buffer* Points, Skins, StrandMaterials, MeshVertices, MeshSkins, MeshIndices, StrandMatrices;
+        public ID3D11ShaderResourceView* PointsSrv, SkinsSrv, StrandMaterialsSrv, MeshVerticesSrv, MeshSkinsSrv, StrandMatricesSrv;
         public ID3D11UnorderedAccessView* StrandMatricesUav;
         public int StrandCount;
         public uint MeshIndexCount;
@@ -188,6 +189,7 @@ internal sealed unsafe class Renderer : IDisposable
         {
             Release(ref PointsSrv); Release(ref Points);
             Release(ref SkinsSrv); Release(ref Skins);
+            Release(ref StrandMaterialsSrv); Release(ref StrandMaterials);
             Release(ref MeshVerticesSrv); Release(ref MeshVertices);
             Release(ref MeshSkinsSrv); Release(ref MeshSkins);
             Release(ref MeshIndices);
@@ -204,13 +206,16 @@ internal sealed unsafe class Renderer : IDisposable
                 CreateStructured(p, asset.Points.Length, sizeof(StrandPoint), dynamic: false, ref b.Points, ref b.PointsSrv);
             fixed (StrandSkin* p = asset.Skins)
                 CreateStructured(p, asset.Skins.Length, sizeof(StrandSkin), dynamic: false, ref b.Skins, ref b.SkinsSrv);
+            fixed (uint* p = asset.StrandMaterials)
+                CreateStructured(p, asset.StrandMaterials.Length, sizeof(uint), dynamic: false, ref b.StrandMaterials, ref b.StrandMaterialsSrv);
+            const int matrixStride = 4 * 12 + 8; // StrandMatrix: 4 x float3, uint2 colour
             var matricesDesc = new D3D11_BUFFER_DESC
             {
-                ByteWidth = checked((uint)(asset.StrandCount * 4 * sizeof(Vector3))), // StrandMatrix: 4 x float3
+                ByteWidth = checked((uint)(asset.StrandCount * matrixStride)),
                 Usage = D3D11_USAGE_DEFAULT,
                 BindFlags = (uint)(D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS),
                 MiscFlags = (uint)D3D11_RESOURCE_MISC_BUFFER_STRUCTURED,
-                StructureByteStride = (uint)(4 * sizeof(Vector3)),
+                StructureByteStride = matrixStride,
             };
             fixed (ID3D11Buffer** out_ = &b.StrandMatrices) Check(device->CreateBuffer(&matricesDesc, null, out_), "CreateBuffer(strand matrices)");
             fixed (ID3D11ShaderResourceView** out_ = &b.StrandMatricesSrv)
@@ -245,10 +250,18 @@ internal sealed unsafe class Renderer : IDisposable
     }
 
     /// <summary>
-    /// Row 0 diffuse of a material's live colour table (dye applied): the first texel, on the row Hikari's fur_id selects. Null if
-    /// it can't be read. Waits for the GPU, so call it only when the table changes.
+    /// Row 0 diffuse of a material's live colour table (dye applied), for the log: the shaders read it themselves. Null if it
+    /// can't be read. Waits for the GPU, so call it only when the table changes.
     /// </summary>
-    public Vector3? ReadTableDiffuse(ID3D11DeviceContext* ctx, ID3D11Texture2D* table)
+    public Vector3? ReadTableDiffuse(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* view)
+    {
+        ID3D11Resource* resource;
+        view->GetResource(&resource);
+        try { return ReadTableDiffuse(ctx, (ID3D11Texture2D*)resource); }
+        finally { resource->Release(); }
+    }
+
+    private Vector3? ReadTableDiffuse(ID3D11DeviceContext* ctx, ID3D11Texture2D* table)
     {
         D3D11_TEXTURE2D_DESC desc;
         table->GetDesc(&desc);
@@ -306,7 +319,9 @@ internal sealed unsafe class Renderer : IDisposable
             DepthUvScale = cfg.DepthUvScaleOverride > 0 ? new Vector2(cfg.DepthUvScaleOverride) : autoUv,
             LightDir = light,
             LightIntensity = cfg.LightIntensity,
+            BaseColor = cfg.BaseColor,
             RootDarken = cfg.RootDarken,
+            UndercoatDarken = cfg.UndercoatDarken,
             AmbientColor = cfg.AmbientColor,
             Opacity = cfg.Opacity,
             LengthScale = cfg.LengthScale,
@@ -352,6 +367,7 @@ internal sealed unsafe class Renderer : IDisposable
         var cb = constants;
         ctx->VSSetConstantBuffers(0, 1, &cb);
         ctx->PSSetConstantBuffers(0, 1, &cb);
+        ctx->CSSetConstantBuffers(0, 1, &cb);
         if (fc.HasSceneColor != 0)
         {
             // Before the fur pass binds the result for reading.
@@ -407,14 +423,21 @@ internal sealed unsafe class Renderer : IDisposable
         ctx->CSSetShader(csStrandMatrices, null, 0);
         var csSrvs = stackalloc ID3D11ShaderResourceView*[2];
         var vsSrvs = stackalloc ID3D11ShaderResourceView*[7];
+        var colorSrvs = stackalloc ID3D11ShaderResourceView*[1 + MaxMaterials]; // t12: strand materials, t13..: colour tables
         foreach (var draw in draws)
         {
             var item = draw.Buffers;
             var drawn = (uint)(item.StrandCount * density);
             if (drawn == 0) continue;
-            fc.BaseColor = draw.Color;
-            fc.SceneGain = cfg.SceneGain * draw.LightGain;
-            fc.UndercoatColor = draw.Color * cfg.UndercoatDarken;
+            fc.TableMask = 0;
+            colorSrvs[0] = item.StrandMaterialsSrv;
+            for (var k = 0; k < MaxMaterials; k++)
+            {
+                colorSrvs[1 + k] = (ID3D11ShaderResourceView*)draw.Tables[k];
+                if (draw.Tables[k] != 0) fc.TableMask |= 1u << k;
+            }
+            ctx->CSSetShaderResources(12, 1 + MaxMaterials, colorSrvs);
+            ctx->PSSetShaderResources(13, MaxMaterials, colorSrvs + 1); // the undercoat's colour
             // Assets hold 10% of the reference strand density (Interpolate amount 0.10); thicken coverage by the shortfall so
             // silhouettes stay as solid as the reference instead of showing the background between strands.
             fc.CoverageScale = Math.Max(1f, item.StrandCount / (AssetDensityFraction * drawn * fc.ChildCount));
@@ -785,12 +808,12 @@ internal sealed unsafe class Renderer : IDisposable
         private readonly D3D_PRIMITIVE_TOPOLOGY topology;
         private readonly ID3D11VertexShader* vs;
         private readonly ID3D11PixelShader* ps;
-        private readonly ID3D11Buffer* vsCb, psCb;
+        private readonly ID3D11Buffer* vsCb, psCb, csCb;
         private readonly ID3D11ShaderResourceView*[] vsSrvs = new ID3D11ShaderResourceView*[10]; // t0..t9
-        private readonly ID3D11ShaderResourceView*[] psSrvs = new ID3D11ShaderResourceView*[9]; // t3..t11
+        private readonly ID3D11ShaderResourceView*[] psSrvs = new ID3D11ShaderResourceView*[14]; // t3..t16
         private readonly ID3D11SamplerState* psSampler;
         private readonly ID3D11ComputeShader* cs;
-        private readonly ID3D11ShaderResourceView*[] csSrvs = new ID3D11ShaderResourceView*[2]; // t1..t2
+        private readonly ID3D11ShaderResourceView*[] csSrvs = new ID3D11ShaderResourceView*[16]; // t1..t16
         private readonly ID3D11UnorderedAccessView* csUav;
         private readonly ID3D11Buffer* indexBuffer;
         private readonly DXGI_FORMAT indexFormat;
@@ -812,6 +835,7 @@ internal sealed unsafe class Renderer : IDisposable
             ID3D11PixelShader* p; ctx->PSGetShader(&p, null, null); ps = p;
             ID3D11Buffer* c0; ctx->VSGetConstantBuffers(0, 1, &c0); vsCb = c0;
             ID3D11Buffer* c1; ctx->PSGetConstantBuffers(0, 1, &c1); psCb = c1;
+            ID3D11Buffer* c2; ctx->CSGetConstantBuffers(0, 1, &c2); csCb = c2;
             fixed (ID3D11ShaderResourceView** vsOut = vsSrvs) ctx->VSGetShaderResources(0, (uint)vsSrvs.Length, vsOut);
             fixed (ID3D11ShaderResourceView** psOut = psSrvs) ctx->PSGetShaderResources(3, (uint)psSrvs.Length, psOut);
             ID3D11SamplerState* ss; ctx->PSGetSamplers(0, 1, &ss); psSampler = ss;
@@ -836,6 +860,7 @@ internal sealed unsafe class Renderer : IDisposable
             ctx->PSSetShader(ps, null, 0);
             var c0 = vsCb; ctx->VSSetConstantBuffers(0, 1, &c0);
             var c1 = psCb; ctx->PSSetConstantBuffers(0, 1, &c1);
+            var c2 = csCb; ctx->CSSetConstantBuffers(0, 1, &c2);
             fixed (ID3D11ShaderResourceView** v = vsSrvs) ctx->VSSetShaderResources(0, (uint)vsSrvs.Length, v);
             fixed (ID3D11ShaderResourceView** p = psSrvs) ctx->PSSetShaderResources(3, (uint)psSrvs.Length, p);
             var ss = psSampler; ctx->PSSetSamplers(0, 1, &ss);
@@ -851,7 +876,7 @@ internal sealed unsafe class Renderer : IDisposable
         private void ReleaseAll()
         {
             Rel(rtv); Rel(dsv); Rel(raster); Rel(blend); Rel(depth); Rel(layout); Rel(vs); Rel(ps);
-            Rel(vsCb); Rel(psCb); Rel(indexBuffer);
+            Rel(vsCb); Rel(psCb); Rel(csCb); Rel(indexBuffer);
             for (var i = 0; i < vsSrvs.Length; i++) Rel(vsSrvs[i]);
             for (var i = 0; i < psSrvs.Length; i++) Rel(psSrvs[i]);
             Rel(cs); Rel(csUav); Rel(psSampler);

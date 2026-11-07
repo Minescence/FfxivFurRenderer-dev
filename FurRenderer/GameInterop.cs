@@ -369,21 +369,18 @@ internal sealed unsafe class GameInterop : IDisposable
                 continue;
 
             var fur = 0u;
-            var first = -1;
             for (var m = 0; m < Math.Min(model->MaterialCount, 32); m++)
             {
                 var material = model->Materials[m];
                 if (material == null || material->MaterialResourceHandle == null || !UsesFurTexture(material->MaterialResourceHandle))
                     continue;
                 fur |= 1u << m;
-                if (first < 0)
-                    first = m;
             }
 
             if (fur == 0)
                 continue;
             var path = model->ModelResourceHandle->FileName.ToString();
-            models.Add(new FurModel(path[(path.LastIndexOf('|') + 1)..], fur, model->EnabledAttributeIndexMask, slot, first));
+            models.Add(new FurModel(path[(path.LastIndexOf('|') + 1)..], fur, model->EnabledAttributeIndexMask, slot));
         }
 
         return models;
@@ -433,14 +430,22 @@ internal sealed unsafe class GameInterop : IDisposable
             props.Add((nint)character);
     }
 
-    /// <summary>The live colour table (dye applied) of a slot's material, not AddRef'd; null while there is none.</summary>
-    public ID3D11Texture2D* GetColorTable(nint characterBase, int slot, int material)
+    /// <summary>
+    /// The live colour table (dye applied) of a slot's material as the game's shader view, not AddRef'd; null while there is
+    /// none or it isn't the float table the fur shaders read. Dyes and Glamourer/Penumbra edits replace the texture.
+    /// </summary>
+    public ID3D11ShaderResourceView* GetColorTable(nint characterBase, int slot, int material)
     {
         var character = AsCharacter(characterBase);
         if (character == null || character->ColorTableTextures == null || material >= CharacterBase.MaterialsPerSlot)
             return null;
         var table = character->ColorTableTextures[slot * CharacterBase.MaterialsPerSlot + material];
-        return table == null ? null : (ID3D11Texture2D*)table->D3D11Texture2D;
+        if (table == null || table->D3D11ShaderResourceView == null)
+            return null;
+        var view = (ID3D11ShaderResourceView*)table->D3D11ShaderResourceView;
+        D3D11_SHADER_RESOURCE_VIEW_DESC desc;
+        view->GetDesc(&desc);
+        return desc.Format == DXGI_FORMAT.DXGI_FORMAT_R16G16B16A16_FLOAT && desc.ViewDimension == D3D_SRV_DIMENSION.D3D_SRV_DIMENSION_TEXTURE2D ? view : null;
     }
 
     /// <summary>True if the target's body model is male (c0101-family asset), false for female (c0201-family).</summary>
@@ -585,8 +590,8 @@ internal sealed unsafe class GameInterop : IDisposable
     }
 }
 
-/// <summary>A model drawn with Hikari's fur textures: its file, which of its materials use them, and where its colour table lives.</summary>
-internal readonly record struct FurModel(string Path, uint FurMaterials, uint EnabledAttributes, int Slot, int FirstFurMaterial);
+/// <summary>A model drawn with Hikari's fur textures: its file, which of its materials use them, and its slot (for the colour tables).</summary>
+internal readonly record struct FurModel(string Path, uint FurMaterials, uint EnabledAttributes, int Slot);
 
 /// <summary>A bone list resolved against one character's skeletons; rebuilt when either changes.</summary>
 internal sealed class BoneLookup

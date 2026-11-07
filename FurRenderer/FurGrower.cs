@@ -53,6 +53,7 @@ internal static class FurGrower
         var rng = new Random(246);
         var points = new StrandPoint[strands * FurAsset.PointsPerStrand];
         var skins = new StrandSkin[strands];
+        var materials = new uint[strands];
         var mergedBones = new byte[24];
         var mergedWeights = new float[24];
         // Picked at random over the whole surface, so strand order is already shuffled: any prefix is a uniform subsample.
@@ -83,6 +84,7 @@ internal static class FurGrower
                 points[i * FurAsset.PointsPerStrand + k] = new StrandPoint { X = p.X, Y = p.Y, Z = p.Z, Radius = Radii[k] };
             }
             skins[i] = surface.RootSkin(i0, i1, i2, w, u, v, mergedBones, mergedWeights);
+            materials[i] = surface.Materials[i0];
         }
 
         // Undercoat: the fur surface itself.
@@ -103,7 +105,7 @@ internal static class FurGrower
         }
         return new FurAsset
         {
-            BoneNames = surface.BoneNames.ToArray(), StrandCount = strands, Points = points, Skins = skins,
+            BoneNames = surface.BoneNames.ToArray(), StrandCount = strands, Points = points, Skins = skins, StrandMaterials = materials,
             MeshVertices = meshVertices.ToArray(), MeshSkins = meshSkins.ToArray(), MeshIndices = meshIndices,
         };
     }
@@ -175,6 +177,7 @@ internal static class FurGrower
         public readonly List<Vector3> Normals = [];
         public readonly List<byte> Bones = [];    // 8 per vertex
         public readonly List<float> Weights = []; // 8 per vertex
+        public readonly List<uint> Materials = []; // per vertex: rank of its mesh's material among the fur materials
         public readonly List<int> Triangles = [];
         public readonly List<string> BoneNames = [];
         public float[] AboveFace = [], BelowFace = []; // skin weight on those bones, per vertex
@@ -276,6 +279,7 @@ internal static class FurGrower
                 int At((byte Stream, byte Offset, byte Type) e, int vertex) => (int)(vertexStart + mesh.Offsets[e.Stream]) + vertex * mesh.Strides[e.Stream] + e.Offset;
                 var first = surface.Positions.Count;
                 if (first + mesh.Vertices > MaxVertices) throw new InvalidDataException($"fur meshes have more than {MaxVertices:N0} vertices");
+                var materialRank = (uint)BitOperations.PopCount(furMaterials & ((1u << mesh.Material) - 1));
                 for (var v = 0; v < mesh.Vertices; v++)
                 {
                     var vertexPosition = ReadVector3(file, At(position, v));
@@ -284,6 +288,7 @@ internal static class FurGrower
                     if (!(vertexPosition.LengthSquared() < 1e6f && vertexNormal.LengthSquared() < 1e6f)) throw new InvalidDataException($"vertex {v} is out of range");
                     surface.Positions.Add(vertexPosition);
                     surface.Normals.Add(vertexNormal);
+                    surface.Materials.Add(materialRank);
                     for (var k = 0; k < 8; k++)
                     {
                         var weight = k < influences ? file[At(weights, v) + k] : (byte)0;

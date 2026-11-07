@@ -1,6 +1,6 @@
 // Strand fur: each instance is one strand of 4 points (3 segments) expanded into an 8-vertex camera-facing ribbon.
 // Passes: PSSceneLuma reduces the frame to what SceneLit reads, PSSurfaceLight keeps the fur surface's share of it, and
-// CSStrandMatrices skins each strand; then, all into a multisampled fur layer, VSUnder/PSUnder draw the fur surface
+// CSStrandMatrices skins and colours each strand; then, all into a multisampled fur layer, VSUnder/PSUnder draw the fur surface
 // (undercoat), VSMain/PSMain the strands with per-sample stochastic coverage; the resolved layer (premultiplied) is blended
 // over the frame by VSComposite/PSComposite.
 // Matrices are row-major and used as mul(v, M) to match System.Numerics.
@@ -29,12 +29,19 @@ Texture2DMS<float> FurDepth : register(t8);           // the fur layer's own dep
 struct StrandMatrix
 {
     float3 r0, r1, r2, r3;  // SkinMatrix rows without w (only mul(float4(p, 1), m).xyz is taken)
+    uint2 color;            // SurfaceColor as halves: r | g << 16, b | light gain << 16
 };
 StructuredBuffer<StrandMatrix> StrandMatrices : register(t9);
 RWStructuredBuffer<StrandMatrix> StrandMatricesOut : register(u0);
 Texture2D<float2> SurfaceLight : register(t11);       // 1/8 size with mips: the fur surface's luminance x coverage, coverage
 SamplerState LinearClamp : register(s0);
 Texture2D<float4> SceneColor : register(t10);         // copy of the lit frame (display-encoded) taken just before drawing
+StructuredBuffer<uint> StrandMaterials : register(t12); // per strand: which of the item's fur materials colours it
+// The live colour tables of the item's fur materials (dye applied): R16G16B16A16_FLOAT, row r's diffuse at texel (0, r).
+Texture2D<float4> ColorTable0 : register(t13);
+Texture2D<float4> ColorTable1 : register(t14);
+Texture2D<float4> ColorTable2 : register(t15);
+Texture2D<float4> ColorTable3 : register(t16);
 
 cbuffer Frame : register(b0)
 {
@@ -43,7 +50,7 @@ cbuffer Frame : register(b0)
     float3 CameraPos;      float MinPixelWidth;     // ribbons never get thinner than this many pixels
     float2 ViewportSize;   float2 DepthUvScale;    // SV_Position.xy * DepthUvScale -> scene depth texel
     float3 LightDir;       float LightIntensity;   // LightDir points from surface towards light
-    float3 BaseColor;      float RootDarken;       // colour at root = BaseColor * RootDarken
+    float3 BaseColor;      float RootDarken;       // fur colour of undyed items; colour at root = colour * RootDarken
     float3 AmbientColor;   float Opacity;
     float LengthScale;     float WidthScale;  float DepthBiasMeters; float Specular;
     float FadeStart;       float OutputGamma; float HueJitter;       uint FrameIndex;
@@ -51,7 +58,7 @@ cbuffer Frame : register(b0)
     float SurfaceLighting; float SceneLighting; float SceneGain; uint HasSceneColor;
     float Exposure;        float AgxToneMap;   uint ChildCount;   float ChildSpread;   // ChildCount strands drawn per baked strand
     float Absorption;      float FacingDepth;  float CoverageScale; uint SampleCount;          // AgxToneMap: 0 = gamma only, 1 = AgX like the reference render   // SceneLighting: 0 = synthetic only, 1 = colour/light from the game's lit coat             // 0 = pure Kajiya-Kay, 1 = soft lighting from the growth direction
-    float3 UndercoatColor; float Padding;
+    float UndercoatDarken; uint TableMask;     float2 Padding;   // TableMask: bit k = ColorTable<k> is bound
 };
 
 struct VsOut
@@ -64,6 +71,7 @@ struct VsOut
     float t : INTERCEPT;
     float coverage : COVERAGE;
     nointerpolation uint strand : STRAND;
+    nointerpolation float4 surface : SURFACE;   // SurfaceColor of the strand's material
 };
 
 float4x4 Bone(uint b)
@@ -80,14 +88,46 @@ float4x4 SkinMatrix(SkinData s)
     return m;
 }
 
-// SkinMatrix per baked strand, once per frame instead of in each of its children's 8 vertices. Threads of the last group past
-// the buffer's end read zeros and their writes are dropped (out-of-bounds UAV writes are discarded).
+// Row 0 of Hikari's materials, undyed. Such items take the configured fur colour so an outfit matches the coat; dyes and
+// other colours (the white boots, the red boa) show as they are.
+static const float3 UndyedFur = float3(0.984, 0.615, 0.603);
+static const float3 Luminance = float3(0.2126, 0.7152, 0.0722);
+
+// Fur colour of one of the item's materials (rgb), read live so dyes and colour-table edits show the next frame, and its
+// scene light gain (a). SceneLit reads the light off the game's own lit item, dye included: without the gain a dark dye
+// darkens the fur twice, as its colour and again as less light. Capped because a near-black item's pixels are mostly
+// sheen, which no dye darkens.
+float4 SurfaceColor(uint material)
+{
+    material = min(material, 3u); // an item's fifth fur material and up share the fourth's table
+    float4 result = float4(BaseColor, 1);
+    [branch] if ((TableMask >> material) & 1)
+    {
+        // Every installed fur material's fur_id selects row 0 on all texels.
+        float3 row = 0;
+        switch (material)
+        {
+            case 0: row = ColorTable0.Load(int3(0, 0, 0)).rgb; break;
+            case 1: row = ColorTable1.Load(int3(0, 0, 0)).rgb; break;
+            case 2: row = ColorTable2.Load(int3(0, 0, 0)).rgb; break;
+            default: row = ColorTable3.Load(int3(0, 0, 0)).rgb; break;
+        }
+        if (distance(row, UndyedFur) > 0.02)
+            result = float4(row, min(dot(UndyedFur, Luminance) / max(dot(row, Luminance), 1e-3), 16.0));
+    }
+    return result;
+}
+
+// SkinMatrix and colour per baked strand, once per frame instead of in each of its children's 8 vertices. Threads of the last
+// group past the buffer's end read zeros and their writes are dropped (out-of-bounds UAV writes are discarded).
 [numthreads(64, 1, 1)]
 void CSStrandMatrices(uint3 id : SV_DispatchThreadID)
 {
     float4x4 m = SkinMatrix(Skins[id.x]);
     StrandMatrix o;
     o.r0 = m[0].xyz; o.r1 = m[1].xyz; o.r2 = m[2].xyz; o.r3 = m[3].xyz;
+    float4 c = SurfaceColor(StrandMaterials[id.x]);
+    o.color = uint2(f32tof16(c.r) | f32tof16(c.g) << 16, f32tof16(c.b) | f32tof16(c.a) << 16);
     StrandMatricesOut[id.x] = o;
 }
 
@@ -170,6 +210,7 @@ VsOut VSMain(uint vid : SV_VertexID, uint instance : SV_InstanceID)
     o.t = t;
     o.coverage = saturate(cover);
     o.strand = instance;
+    o.surface = float4(f16tof32(sm.color.x), f16tof32(sm.color.x >> 16), f16tof32(sm.color.y), f16tof32(sm.color.y >> 16));
     return o;
 }
 
@@ -204,7 +245,8 @@ bool BehindScene(float4 pos)
 // Scales by how brightly the game lit its coat at pixel 'at', so the fur follows the scene's sun, lamps and shadows. Only
 // brightness is taken (not the coat texture's colour), averaged over a few taps so texture detail doesn't streak along strands.
 // Taps more than 30 cm from 'depth' (view distance) are background seen past a silhouette and would shade the fringe with it.
-float3 SceneLit(float3 color, float2 at, float depth)
+// 'gain' is SurfaceColor's light gain.
+float3 SceneLit(float3 color, float2 at, float depth, float gain)
 {
     if (HasSceneColor == 0 || SceneLighting <= 0)
         return color;
@@ -232,7 +274,7 @@ float3 SceneLit(float3 color, float2 at, float depth)
             count += (1 - count) * s.y;
         }
     }
-    return count > 0 ? color * lerp(1.0, luma / count * SceneGain, SceneLighting) : color;
+    return count > 0 ? color * lerp(1.0, luma / count * SceneGain * gain, SceneLighting) : color;
 }
 
 // What SceneLit reads, once per pixel instead of per tap and fragment.
@@ -298,9 +340,11 @@ float4 PSUnder(UnderOut i) : SV_Target
     float diffuse = saturate(dot(n, normalize(LightDir)) * 0.5 + 0.5);
     // Lit like a strand root: light reaches the surface through the fur (absorption as in PSMain at the root).
     float facing = dot(n, normalize(CameraPos - i.world));
-    float3 albedo = UndercoatColor * pow(max(BaseColor, 1e-3), Absorption * (1.0 + FacingDepth * LookingIn(facing)));
-    albedo = lerp(albedo, BaseColor, EndOn(facing)); // the gaps between end-on strands, shaded like their tips
-    return Output(SceneLit(albedo * (AmbientColor + diffuse * LightIntensity), i.pos.xy, LinearDepth(i.pos.z)));
+    // shortcut: the undercoat takes the first fur material's colour; per-vertex materials come with the mesh UVs (k4s.10).
+    float4 surface = SurfaceColor(0);
+    float3 albedo = surface.rgb * UndercoatDarken * pow(max(surface.rgb, 1e-3), Absorption * (1.0 + FacingDepth * LookingIn(facing)));
+    albedo = lerp(albedo, surface.rgb, EndOn(facing)); // the gaps between end-on strands, shaded like their tips
+    return Output(SceneLit(albedo * (AmbientColor + diffuse * LightIntensity), i.pos.xy, LinearDepth(i.pos.z), surface.a));
 }
 
 // Into SurfaceLight, with VSUnder: what the game lit where its surface is the one this mesh draws (not what is in front of it).
@@ -356,12 +400,12 @@ float4 PSMain(VsOut i, uint geometry : SV_Coverage, out uint coverage : SV_Cover
     float spec = pow(sqrt(saturate(1.0 - th * th)), 3.0) * Specular;
 
     float jitter = 1.0 + (Hash(uint3(i.strand, 17u, 3u)) - 0.5) * 2.0 * HueJitter;
-    float3 albedo = BaseColor * jitter;
+    float3 albedo = i.surface.rgb * jitter;
     // Light reaching deep into the fur has passed through many strands (Beer-Lambert: colour^path), which makes roots and
     // fur seen end-on (looking down into it) darker and more saturated, like the reference's magenta partings.
     float cosView = dot(normalize(i.growth), v);
     float buried = (1.0 - i.t) * (1.0 - EndOn(cosView));
-    albedo *= pow(max(BaseColor, 1e-3), Absorption * buried * (1.0 + FacingDepth * LookingIn(cosView)));
+    albedo *= pow(max(i.surface.rgb, 1e-3), Absorption * buried * (1.0 + FacingDepth * LookingIn(cosView)));
     // Light reaching this depth of the fur (reference: colour x intercept, black at the root). It shades the sheen too, or
     // roots go grey wherever they are seen side-on (silhouettes, partings).
     float shadow = lerp(RootDarken, 1.0, 1.0 - buried);
@@ -377,7 +421,7 @@ float4 PSMain(VsOut i, uint geometry : SV_Coverage, out uint coverage : SV_Cover
         at = i.pos.xy;
         depth = LinearDepth(i.pos.z);
     }
-    return Output(SceneLit(color, at, depth));
+    return Output(SceneLit(color, at, depth, i.surface.a));
 }
 
 float4 VSComposite(uint vid : SV_VertexID) : SV_Position
