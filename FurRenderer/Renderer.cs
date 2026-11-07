@@ -97,6 +97,18 @@ internal sealed unsafe class Renderer : IDisposable
     private ID3D11RenderTargetView* surfaceLightRtv;
     private ID3D11ShaderResourceView* surfaceLightSrv;
 
+    // GPU time and shader invocations of the fur pass, read back a few frames late so nothing waits for the GPU.
+    private const int QueryFrames = 4;
+    private readonly ID3D11Query*[] disjointQueries = new ID3D11Query*[QueryFrames];
+    private readonly ID3D11Query*[] startQueries = new ID3D11Query*[QueryFrames];
+    private readonly ID3D11Query*[] endQueries = new ID3D11Query*[QueryFrames];
+    private readonly ID3D11Query*[] statsQueries = new ID3D11Query*[QueryFrames];
+    private readonly bool[] queryIssued = new bool[QueryFrames];
+    private int queryFrame;
+
+    /// <summary>GPU time and shader invocations of a recent fur draw (for the settings window and debug results).</summary>
+    public string PerfInfo { get; private set; } = "";
+
     public const int MaxBones = 256;
     public const int MaxMaterials = 4; // colour tables per item: ColorTable0..3 in Fur.hlsl
     private const float AssetDensityFraction = 0.10f; // tools/grow_coat_fur.py AMOUNT used for the baked assets, and FurGrower's density
@@ -174,6 +186,34 @@ internal sealed unsafe class Renderer : IDisposable
             DepthClipEnable = true,
         };
         fixed (ID3D11RasterizerState** out_ = &raster) Check(device->CreateRasterizerState(&rasterDesc, out_), "CreateRasterizerState");
+
+        for (var i = 0; i < QueryFrames; i++)
+        {
+            var queryDesc = new D3D11_QUERY_DESC { Query = D3D11_QUERY.D3D11_QUERY_TIMESTAMP_DISJOINT };
+            fixed (ID3D11Query** out_ = &disjointQueries[i]) Check(device->CreateQuery(&queryDesc, out_), "CreateQuery(disjoint)");
+            queryDesc.Query = D3D11_QUERY.D3D11_QUERY_TIMESTAMP;
+            fixed (ID3D11Query** out_ = &startQueries[i]) Check(device->CreateQuery(&queryDesc, out_), "CreateQuery(start)");
+            fixed (ID3D11Query** out_ = &endQueries[i]) Check(device->CreateQuery(&queryDesc, out_), "CreateQuery(end)");
+            queryDesc.Query = D3D11_QUERY.D3D11_QUERY_PIPELINE_STATISTICS;
+            fixed (ID3D11Query** out_ = &statsQueries[i]) Check(device->CreateQuery(&queryDesc, out_), "CreateQuery(statistics)");
+        }
+    }
+
+    // Results of the queries issued QueryFrames draws ago, if the GPU has them; never waits.
+    private void ReadPerf(ID3D11DeviceContext* ctx, int slot)
+    {
+        if (!queryIssued[slot]) return;
+        const uint noFlush = (uint)D3D11_ASYNC_GETDATA_FLAG.D3D11_ASYNC_GETDATA_DONOTFLUSH;
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint;
+        D3D11_QUERY_DATA_PIPELINE_STATISTICS stats;
+        ulong start, end;
+        if (ctx->GetData((ID3D11Asynchronous*)disjointQueries[slot], &disjoint, (uint)sizeof(D3D11_QUERY_DATA_TIMESTAMP_DISJOINT), noFlush).Value != 0
+            || ctx->GetData((ID3D11Asynchronous*)startQueries[slot], &start, sizeof(ulong), noFlush).Value != 0
+            || ctx->GetData((ID3D11Asynchronous*)endQueries[slot], &end, sizeof(ulong), noFlush).Value != 0
+            || ctx->GetData((ID3D11Asynchronous*)statsQueries[slot], &stats, (uint)sizeof(D3D11_QUERY_DATA_PIPELINE_STATISTICS), noFlush).Value != 0
+            || disjoint.Disjoint)
+            return;
+        PerfInfo = $"GPU {(end - start) * 1000.0 / disjoint.Frequency:F2} ms; {stats.VSInvocations / 1e6:F1}M vertices, {stats.PSInvocations / 1e6:F1}M fragments";
     }
 
     /// <summary>The GPU side of one fur asset. Render thread only.</summary>
@@ -352,6 +392,11 @@ internal sealed unsafe class Renderer : IDisposable
         Upload(ctx, (ID3D11Resource*)constants, &fc, sizeof(FrameConstants));
 
         using var saved = new SavedState(ctx);
+        var querySlot = queryFrame++ % QueryFrames;
+        ReadPerf(ctx, querySlot);
+        ctx->Begin((ID3D11Asynchronous*)disjointQueries[querySlot]);
+        ctx->End((ID3D11Asynchronous*)startQueries[querySlot]);
+        ctx->Begin((ID3D11Asynchronous*)statsQueries[querySlot]);
         var transparent = stackalloc float[4];
         ctx->ClearRenderTargetView(furColorRtv, transparent);
         ctx->ClearDepthStencilView(ownDepthDsv, (uint)D3D11_CLEAR_FLAG.D3D11_CLEAR_DEPTH, reverse ? 0f : 1f, 0);
@@ -503,6 +548,10 @@ internal sealed unsafe class Renderer : IDisposable
             ctx->PSSetShaderResources(8, 1, &furDepth);
             ctx->Draw(3, 0);
         }
+        ctx->End((ID3D11Asynchronous*)statsQueries[querySlot]);
+        ctx->End((ID3D11Asynchronous*)endQueries[querySlot]);
+        ctx->End((ID3D11Asynchronous*)disjointQueries[querySlot]);
+        queryIssued[querySlot] = true;
         if (cfg.DebugSolid)
         {
             // Shader-independent marker: a magenta box at the top-left proves the back buffer we draw into is what gets presented.
@@ -782,6 +831,10 @@ internal sealed unsafe class Renderer : IDisposable
         Release(ref rtv); Release(ref rtvTarget); Release(ref rtvOther); Release(ref rtvOtherTarget);
         Release(ref readback);
         ReleaseSceneCopy();
+        for (var i = 0; i < QueryFrames; i++)
+        {
+            Release(ref disjointQueries[i]); Release(ref startQueries[i]); Release(ref endQueries[i]); Release(ref statsQueries[i]);
+        }
         device->Release();
     }
 

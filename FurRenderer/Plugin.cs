@@ -171,7 +171,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         Diag("binds", $"back buffer bound {backBufferBinds}x last frame; drawing at {(DrawAtPresent ? "Present" : config.BackBufferBind < 0 ? "auto" : $"bind {config.BackBufferBind}")}");
         drewThisFrame = false;
         lastFrameBinds = backBufferBinds;
-        lastFrameInfo = $"frame: binds {backBufferBinds}, fur draws {furDraws}, last fur target 0x{lastFurTarget:X}";
+        lastFrameInfo = $"frame: binds {backBufferBinds}, fur draws {furDraws}, last fur target 0x{lastFurTarget:X}; {renderer?.PerfInfo}";
         presentsWindow++; furDrawsWindow += furDraws; if (furDraws == 0) emptyPresentsWindow++;
         if (presentsWindow == 1) cadenceWatch.Restart();
         if (presentsWindow == 300)
@@ -627,6 +627,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         if (!ImGui.Begin("Fur Renderer", ref windowOpen)) { ImGui.End(); return; }
         var changed = false;
         ImGui.TextWrapped(status);
+        if (renderer is { PerfInfo: { Length: > 0 } perf }) ImGui.TextDisabled(perf);
         ImGui.Separator();
 
         changed |= Check("Enabled", () => config.Enabled, v => config.Enabled = v);
