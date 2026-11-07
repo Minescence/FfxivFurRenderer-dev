@@ -25,7 +25,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private Renderer? renderer;
     private string? rendererError;
     private readonly IDataManager dataManager;
-    private bool[] found = new bool[Renderer.MaxBones];
+    private readonly bool[] found = new bool[Renderer.MaxBones];
+    private readonly Dictionary<string, bool> bakedAssets = []; // asset file name -> exists; releases ship none, so not checked per frame
     private volatile FrameSnapshot? snapshot;
     private readonly Dictionary<string, FurItem> items = []; // by model, enabled submeshes and wearer race; main thread
     private readonly List<FurItem> retiring = [];
@@ -46,7 +47,6 @@ public sealed unsafe class Plugin : IDalamudPlugin
         public Task<FurAsset?>? Growth;
         public Matrix4x4[]? Deform; // race deformer per bone; set by the growth task
         public string[] BoneNames = [];
-        public int StrandCount;
         public readonly BoneLookup Lookup = new();
         public int LastUsed;
         // The fur materials' live colour tables, index and diffuse maps (SRVs, laid out as FurDraw.Textures), AddRef'd so a
@@ -97,34 +97,24 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private int testCase, testFrame;
     private (int Bind, bool Depth, bool Solid, bool Enabled) testSaved;
 
-    public Plugin(IDalamudPluginInterface pluginInterface, ICommandManager commandManager, IClientState clientState, IObjectTable objectTable, IGameInteropProvider hooks, IPluginLog log, IDataManager dataManager)
+    public Plugin(IDalamudPluginInterface pluginInterface, ICommandManager commandManager, IGameInteropProvider hooks, IPluginLog log, IDataManager dataManager)
     {
         this.pluginInterface = pluginInterface;
         this.commandManager = commandManager;
         this.log = log;
         this.dataManager = dataManager;
         config = pluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
+        // Each step resets what changed meaning or tuning in that version, leaving out what a later step resets again.
         if (config.Version < 2) { config.BackBufferBind = -1; config.Version = 2; } // v1 defaults drew over the UI
-        if (config.Version < 3) { config.SceneLighting = 1f; config.SceneGain = 4f; config.Version = 3; } // scene lighting now scales brightness only
-        if (config.Version < 4) // look matched to the reference render (colour, AgX, full density)
-        {
-            var fresh = new Configuration();
-            (config.BaseColor, config.RootDarken, config.Specular, config.Density) = (fresh.BaseColor, fresh.RootDarken, fresh.Specular, fresh.Density);
-            config.Version = 4;
-        }
+        if (config.Version < 4) { config.Density = Defaults.Density; config.Version = 4; } // look matched to the reference render (full density)
         if (config.Version < 5) // look-dev pass against the reference render (absorption, sheen, children)
         {
-            var fresh = new Configuration();
-            (config.BaseColor, config.RootDarken, config.HueJitter, config.Specular, config.SurfaceLighting, config.Exposure) =
-                (fresh.BaseColor, fresh.RootDarken, fresh.HueJitter, fresh.Specular, fresh.SurfaceLighting, fresh.Exposure);
+            (config.HueJitter, config.SurfaceLighting, config.Exposure) = (Defaults.HueJitter, Defaults.SurfaceLighting, Defaults.Exposure);
             config.Version = 5;
         }
-        if (config.Version < 6) { config.FacingDepth = 0f; config.Version = 6; } // view-dependent darkening changed the shade with camera angle
         if (config.Version < 7) // colour fit to the reference renders, with the undercoat under the fur
         {
-            var fresh = new Configuration();
-            (config.BaseColor, config.RootDarken, config.Specular, config.Absorption, config.FacingDepth, config.UndercoatDarken) =
-                (fresh.BaseColor, fresh.RootDarken, fresh.Specular, fresh.Absorption, fresh.FacingDepth, fresh.UndercoatDarken);
+            (config.BaseColor, config.RootDarken, config.Absorption, config.UndercoatDarken) = (Defaults.BaseColor, Defaults.RootDarken, Defaults.Absorption, Defaults.UndercoatDarken);
             config.Version = 7;
         }
         // Without the game's lighting the fur had no shadows; gain 4 clipped sunlit fur to white.
@@ -132,14 +122,13 @@ public sealed unsafe class Plugin : IDalamudPlugin
         if (config.Version < 9) { config.Specular = 0.05f; config.Version = 9; } // white sheen frosted the tips and greyed dark colours
         if (config.Version < 10) // strand defaults are now the user's in-game tuning against the reference
         {
-            var fresh = new Configuration();
             (config.ChildCount, config.ChildSpread, config.LengthScale, config.WidthScale, config.MinPixelWidth, config.Gravity) =
-                (fresh.ChildCount, fresh.ChildSpread, fresh.LengthScale, fresh.WidthScale, fresh.MinPixelWidth, fresh.Gravity);
+                (Defaults.ChildCount, Defaults.ChildSpread, Defaults.LengthScale, Defaults.WidthScale, Defaults.MinPixelWidth, Defaults.Gravity);
             config.Version = 10;
         }
         // 6 (the reference fit) turned every camera-facing stretch of fur into deep crimson bands and spots.
         if (config.Version < 11) { config.FacingDepth = 2f; config.Version = 11; }
-        interop = new GameInterop(clientState, objectTable, log);
+        interop = new GameInterop(log);
         debugCapture = new DebugCapture(pluginInterface.GetPluginConfigDirectory(), config, interop.SetCamera, () => traceRequested = true);
         try
         {
@@ -211,6 +200,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             items.Remove(key);
             retiring.Add(item);
         }
+        if (reloadItems) bakedAssets.Clear();
         reloadItems = false;
         // Dalamud stops calling a draw handler that throws, which would freeze the fur on its last pose.
         try { Fill(snap); }
@@ -224,7 +214,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         // Only now: the render thread frees these before it reads the snapshot, so it can't still be drawing them.
         foreach (var item in retiring) retiredItems.Enqueue(item);
         retiring.Clear();
-        foreach (var table in replacedTextures) releasedTextures.Enqueue(table);
+        foreach (var texture in replacedTextures) releasedTextures.Enqueue(texture);
         replacedTextures.Clear();
         if (testCases != null) StepSelfTest();
         var debugResult = debugCapture.Tick(
@@ -286,7 +276,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             var rt = command->RenderTargets[0].Value;
             var isBackBuffer = rtm != null && rt != null && rt == rtm->SwapChainBackBuffer;
             if (isBackBuffer) backBufferBinds++;
-            lock (diagLock) trace?.Add($"{trace.Count}: rt0 {Describe(rt, rtm)} depth {Describe(command->DepthBuffer, rtm)}{(isBackBuffer ? $"  <= back buffer bind {backBufferBinds}" : "")}");
+            if (trace != null) lock (diagLock) trace?.Add($"{trace.Count}: rt0 {Describe(rt, rtm)} depth {Describe(command->DepthBuffer, rtm)}{(isBackBuffer ? $"  <= back buffer bind {backBufferBinds}" : "")}");
             if (isBackBuffer && !DrawAtPresent && config.BackBufferBind > 0 && backBufferBinds == config.BackBufferBind && !drewThisFrame)
             {
                 drewThisFrame = true;
@@ -369,7 +359,6 @@ public sealed unsafe class Plugin : IDalamudPlugin
         }
     }
 
-    // Logs to dalamud.log only when a value changes, so per-frame state stays readable.
     private static byte[] ReadShader(string name)
     {
         using var stream = typeof(Plugin).Assembly.GetManifestResourceStream(name)
@@ -379,6 +368,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         return memory.ToArray();
     }
 
+    // Logs to dalamud.log only when a value changes, so per-frame state stays readable.
     private void Diag(string key, string message)
     {
         lock (diagLock)
@@ -404,11 +394,11 @@ public sealed unsafe class Plugin : IDalamudPlugin
             var male = interop.IsMale(character);
             var name = $"coat_{(slot == CoatSlot.Ring ? "ril" : "glv")}_{(male ? "m" : "f")}.furasset";
             var key = $"{name}@c{race:D4}";
-            var path = Path.Combine(AssetDirectory, name);
             // Baked assets hold the mod's mesh, so releases can't ship them: there the coat grows from the worn model like any other item.
-            if (items.TryGetValue(key, out var coat) || File.Exists(path))
+            if (!bakedAssets.TryGetValue(name, out var baked)) bakedAssets[name] = baked = File.Exists(Path.Combine(AssetDirectory, name));
+            if (items.TryGetValue(key, out var coat) || baked)
             {
-                coat ??= items[key] = StartItem(character, (ushort)(male ? 101 : 201), race, name, () => FurAsset.Load(path));
+                coat ??= items[key] = StartItem(character, (ushort)(male ? 101 : 201), race, name, () => FurAsset.Load(Path.Combine(AssetDirectory, name)));
                 // Baked strands are all coloured by the worn coat's first fur material.
                 var worn = interop.FindFurModels(character, coatSlots: true) is [var w, ..] ? w : default;
                 AddDraw(snap, character, coat, worn.Slot, worn.FurMaterials);
@@ -434,7 +424,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 // race deformer. Upgrade: ask Penumbra.GetGameObjectResourcePaths.V5 for the game path.
                 var named = System.Text.RegularExpressions.Regex.Match(name, @"^c([0-9]{4})");
                 var modelRace = race != 0 && named.Success ? ushort.Parse(named.Groups[1].Value) : race;
-                items[key] = item = StartItem(character, modelRace, race, name, () => FurGrower.Grow(ReadModel(fur.Path), fur.FurMaterials, fur.EnabledAttributes, coatSlots ? FurGrower.MaxCoatStrands : FurGrower.MaxStrands));
+                var maxStrands = coatSlots ? FurGrower.MaxCoatStrands : FurGrower.MaxStrands;
+                items[key] = item = StartItem(character, modelRace, race, name, () => FurGrower.Grow(ReadModel(fur.Path), fur.FurMaterials, fur.EnabledAttributes, maxStrands), maxStrands);
             }
             AddDraw(snap, character, item, fur.Slot, fur.FurMaterials);
         }
@@ -445,7 +436,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
             : dataManager.GetFile(path)?.Data ?? throw new FileNotFoundException("model not in the game data", path);
 
     // Growth runs off the game's threads (under a second); its deformer inputs are game state, so they are read here.
-    private FurItem StartItem(nint character, ushort modelRace, ushort race, string name, Func<FurAsset?> build)
+    // maxStrands: the limit 'build' returns null at, for the log.
+    private FurItem StartItem(nint character, ushort modelRace, ushort race, string name, Func<FurAsset?> build, int maxStrands = FurGrower.MaxStrands)
     {
         var parents = modelRace != race ? interop.GetBoneParents(character) : null;
         byte[]? pbd = null;
@@ -459,7 +451,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 var asset = build();
                 if (asset == null)
                 {
-                    Diag("item " + name, $"skipped: no fur surface, or {FurGrower.MaxStrands:N0} strands or more");
+                    Diag("item " + name, $"skipped: no fur surface, or {maxStrands:N0} strands or more");
                     return null;
                 }
                 if (asset.BoneNames.Length > Renderer.MaxBones) throw new InvalidDataException($"{asset.BoneNames.Length} bones; max {Renderer.MaxBones}");
@@ -487,7 +479,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         {
             if (!growth.IsCompleted) { snap.Growing++; return; }
             item.Growth = null;
-            if (growth.Result is { } asset) (item.BoneNames, item.StrandCount, item.Upload) = (asset.BoneNames, asset.StrandCount, asset);
+            if (growth.Result is { } asset) (item.BoneNames, item.Upload) = (asset.BoneNames, asset);
         }
         var bones = item.BoneNames.Length;
         if (bones == 0) return;
@@ -532,15 +524,20 @@ public sealed unsafe class Plugin : IDalamudPlugin
         }
     }
 
-    private void RenderFur(ID3D11Texture2D* boundTarget)
+    // Render thread, or Dispose once it has stopped: what the main thread handed over for release.
+    private void ReleaseRetired()
     {
-        // Before reading the snapshot: see OnDraw.
         while (retiredItems.TryDequeue(out var retired))
         {
             retired.Buffers?.Dispose();
             ReleaseTextures(retired);
         }
-        while (releasedTextures.TryDequeue(out var table)) ((ID3D11ShaderResourceView*)table)->Release();
+        while (releasedTextures.TryDequeue(out var texture)) ((ID3D11ShaderResourceView*)texture)->Release();
+    }
+
+    private void RenderFur(ID3D11Texture2D* boundTarget)
+    {
+        ReleaseRetired(); // before reading the snapshot: see OnDraw
         if (!config.Enabled) { status = "disabled"; return; }
         var gpose = FFXIVClientStructs.FFXIV.Client.Game.GameMain.IsInGPose();
         if (config.OnlyInGpose && !gpose) { status = "waiting for GPose"; return; }
@@ -592,8 +589,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 if (distance > config.LodDistance) itemDensity *= Math.Max(config.LodMinDensity, config.LodDistance / distance);
             }
             draws.Add(new FurDraw(buffers, skin, textures, itemDensity));
-            strands += item.StrandCount;
-            drawnStrands += (int)(item.StrandCount * itemDensity);
+            strands += buffers.StrandCount;
+            drawnStrands += (int)(buffers.StrandCount * itemDensity);
         }
         if (draws.Count == 0) { status = snap.Growing > 0 ? "growing fur" : "waiting for fur"; return; }
         var (view, proj) = (snap.View, snap.Proj);
@@ -768,8 +765,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
     private void CopyDefaults()
     {
-        var d = new Configuration();
-        foreach (var p in typeof(Configuration).GetProperties()) if (p.CanWrite) p.SetValue(config, p.GetValue(d));
+        foreach (var p in typeof(Configuration).GetProperties()) if (p.CanWrite) p.SetValue(config, p.GetValue(Defaults));
     }
 
     private static readonly Configuration Defaults = new();
@@ -848,11 +844,10 @@ public sealed unsafe class Plugin : IDalamudPlugin
         while (Volatile.Read(ref detoursRunning) > 0 && waited.ElapsedMilliseconds < 10000) Thread.Sleep(1); // the first draw compiles the shaders
         setTargetHook?.Dispose();
         commandManager.RemoveHandler(CommandName);
-        foreach (var item in items.Values.Concat(retiring)) { item.Buffers?.Dispose(); ReleaseTextures(item); }
-        while (retiredItems.TryDequeue(out var retired)) { retired.Buffers?.Dispose(); ReleaseTextures(retired); }
-        foreach (var table in replacedTextures) releasedTextures.Enqueue(table);
-        while (releasedTextures.TryDequeue(out var table)) ((ID3D11ShaderResourceView*)table)->Release();
+        foreach (var item in items.Values.Concat(retiring)) retiredItems.Enqueue(item);
+        foreach (var texture in replacedTextures) releasedTextures.Enqueue(texture);
+        ReleaseRetired();
         renderer?.Dispose();
-        (interop as IDisposable)?.Dispose();
+        interop.Dispose();
     }
 }

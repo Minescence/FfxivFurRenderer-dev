@@ -69,13 +69,13 @@ internal sealed unsafe class DebugCapture
             armed = true;
             return null;
         }
+        if (armed && ++armedFrames < 60) return null; // the render thread hasn't drawn fur yet
         waitFrames = -1;
         var result = $"applied: {string.Join(", ", applied)}; {frameInfo()}";
         if (captureName != null)
         {
             var path = Path.Combine(directory, "captures", captureName + ".png");
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            if (armed && ++armedFrames < 60) return null;
             if (armed || atPresent)
             {
                 // Fur never drew (disabled, wrong draw point...): fall back to the presented frame.

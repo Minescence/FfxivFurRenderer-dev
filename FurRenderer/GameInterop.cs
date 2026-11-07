@@ -24,8 +24,6 @@ internal sealed unsafe class GameInterop : IDisposable
     private const ushort RingModelSetId = 122;
     private const int CutsceneObjectEnd = 440; // actors spawned in GPose (Brio, Anamnesis) sit in the cutscene range
 
-    private readonly IObjectTable objects;
-    private readonly IClientState clientState;
     private readonly IPluginLog log;
 
     // Typed depth SRV created over a typeless resource, keyed by resource pointer.
@@ -40,10 +38,8 @@ internal sealed unsafe class GameInterop : IDisposable
     /// <summary>Why the last scene-depth lookup succeeded or failed (for the debug log).</summary>
     public string DepthInfo { get; private set; } = "not queried";
 
-    public GameInterop(IClientState clientState, IObjectTable objects, IPluginLog log)
+    public GameInterop(IPluginLog log)
     {
-        this.objects = objects;
-        this.clientState = clientState;
         this.log = log;
     }
 
@@ -110,7 +106,7 @@ internal sealed unsafe class GameInterop : IDisposable
 
     /// <summary>
     /// Scene depth as a shader resource view (not AddRef'd; valid for this frame) and its texture size.
-    /// The SRV must be readable as a float in .r (create a typed SRV over a typeless resource if needed; caller may cache by resource pointer).
+    /// Readable as a float in .r: over a typeless resource, a typed SRV is created here and cached by resource pointer.
     /// </summary>
     public bool TryGetSceneDepth(out ID3D11ShaderResourceView* depth, out uint width, out uint height)
     {
@@ -241,7 +237,6 @@ internal sealed unsafe class GameInterop : IDisposable
 
     private static FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject* GetTargetObject()
     {
-        // Game memory only (no Dalamud services): this also runs on the render thread from the pre-UI hook.
         var manager = FFXIVClientStructs.FFXIV.Client.Game.Object.GameObjectManager.Instance();
         if (manager == null)
             return null;
@@ -402,7 +397,7 @@ internal sealed unsafe class GameInterop : IDisposable
         _ => false,
     };
 
-    /// <summary>Visible monster-type actors that can be fur props: the player's minion, or every other actor in GPose.</summary>
+    /// <summary>Visible monster-type actors that can be fur props: the player's minion, or in GPose the actors after the GPose player up to the end of the cutscene range.</summary>
     public List<nint> GetProps()
     {
         var props = new List<nint>();

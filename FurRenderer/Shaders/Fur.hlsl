@@ -77,9 +77,9 @@ cbuffer Frame : register(b0)
     float LengthScale;     float WidthScale;  float DepthBiasMeters; float Specular;
     float FadeStart;       float OutputGamma; float HueJitter;       uint FrameIndex;
     uint UseSceneDepth;    uint TemporalDither; uint DebugSolid; float Gravity;   // Gravity: droop towards world -Y
-    float SurfaceLighting; float SceneLighting; float SceneGain; uint HasSceneColor;
-    float Exposure;        float AgxToneMap;   uint ChildCount;   float ChildSpread;   // ChildCount strands drawn per baked strand
-    float Absorption;      float FacingDepth;  float CoverageScale; uint SampleCount;          // AgxToneMap: 0 = gamma only, 1 = AgX like the reference render   // SceneLighting: 0 = synthetic only, 1 = colour/light from the game's lit coat             // 0 = pure Kajiya-Kay, 1 = soft lighting from the growth direction
+    float SurfaceLighting; float SceneLighting; float SceneGain; uint HasSceneColor;   // SurfaceLighting: 0 = pure Kajiya-Kay, 1 = soft lighting from the growth direction; SceneLighting: 0 = synthetic only, 1 = brightness from the game's lit item
+    float Exposure;        float AgxToneMap;   uint ChildCount;   float ChildSpread;   // AgxToneMap: 0 = gamma only, 1 = AgX like the reference render; ChildCount strands drawn per baked strand
+    float Absorption;      float FacingDepth;  float CoverageScale; uint SampleCount;
     float UndercoatDarken; uint TableMask;     uint DrawnStrands; uint CullFlags;   // TableMask: bit k / 4 + k / 8 + k = ColorTable<k> / IndexMap<k> / DiffuseMap<k> is bound
     uint2 HiZSize;         uint HiZLevels;     uint ArgsOffset;   // CullFlags: 1 = outside the view, 2 = behind the scene (Hi-Z)
     uint RecolorUndyed;    float3 Padding;     // items in Hikari's undyed colour take BaseColor
@@ -91,12 +91,16 @@ struct VsOut
     float3 world : WORLDPOS;
     float3 tangent : TANGENT;
     nointerpolation float3 growth : GROWTH;
-    nointerpolation float3 root : ROOTPX;   // root position in pixels (xy) and view distance (z)
     float t : INTERCEPT;
     float coverage : COVERAGE;
     nointerpolation uint strand : STRAND;
     nointerpolation float4 surface : SURFACE;   // SurfaceColor of the strand's material
+    // Per strand copy: brightness jitter, the scene light at the root (SceneLit's scale) and whether the root is usable for it.
+    nointerpolation float3 shade : SHADE;
 };
+
+float LinearDepth(float d);
+float3 SceneLit(float3 color, float2 at, float depth, float gain);
 
 float4x4 Bone(uint b)
 {
@@ -262,12 +266,19 @@ VsOut VSMain(uint vid : SV_VertexID, uint instance : SV_InstanceID)
     o.tangent = tangent;
     o.growth = length(tip) > 1e-6 ? normalize(tip) : tangent;
     float4 rootClip = mul(float4(rootWorld, 1), ViewProj);
-    o.root = float3((rootClip.xy / rootClip.w * float2(0.5, -0.5) + 0.5) * ViewportSize, rootClip.w);
+    float3 root = float3((rootClip.xy / rootClip.w * float2(0.5, -0.5) + 0.5) * ViewportSize, rootClip.w); // pixels, view distance
     o.t = t;
     o.coverage = saturate(cover);
     // Not the instance: the visible list's order changes every frame, and the strand's jitter and dither hash this.
     o.strand = strand * ChildCount + child;
     o.surface = float4(f16tof32(sm.color.x), f16tof32(sm.color.x >> 16), f16tof32(sm.color.y), f16tof32(sm.color.y >> 16));
+    // Once per vertex instead of per fragment, as they are the same for the whole copy. The light comes from the game's item
+    // around the root; PSMain takes its own pixel's when the root is off-screen or hidden by something other than the
+    // character (a root just behind the item's own silhouette keeps the item in front of it).
+    bool rootSeen = all(root.xy >= 4) && all(root.xy < ViewportSize - 4) && root.z > 0
+        && !(UseSceneDepth != 0 && LinearDepth(SceneDepth.Load(int3(root.xy * DepthUvScale, 0))) < root.z - 0.3);
+    o.shade = float3(1.0 + (Hash(uint3(o.strand, 17u, 3u)) - 0.5) * 2.0 * HueJitter,
+                     rootSeen ? SceneLit(1.0, root.xy, root.z, o.surface.a).x : 0, rootSeen ? 1 : 0);
     return o;
 }
 
@@ -346,10 +357,14 @@ void CSStrandMatrices(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex
         InterlockedAdd(groupVisible, 1, slot);
     GroupMemoryBarrierWithGroupSync();
     if (index == 0)
-        DrawArgs.InterlockedAdd(ArgsOffset + 4, groupVisible * ChildCount, groupFirst);
+    {
+        uint first;
+        DrawArgs.InterlockedAdd(ArgsOffset + 4, groupVisible * ChildCount, first);
+        groupFirst = first / ChildCount; // instances to strands: a multiple of ChildCount
+    }
     GroupMemoryBarrierWithGroupSync();
     if (visible)
-        VisibleStrandsOut[groupFirst / ChildCount + slot] = id.x;
+        VisibleStrandsOut[groupFirst + slot] = id.x;
 }
 
 // Hi-Z mip 0 from the scene depth (sky and texels past its edge are infinitely far), then each mip from the one below.
@@ -437,7 +452,7 @@ float3 SceneLit(float3 color, float2 at, float depth, float gain)
 float2 PSSceneLuma(float4 pos : SV_Position) : SV_Target
 {
     int2 p = int2(pos.xy);
-    return float2(dot(pow(saturate(SceneColor.Load(int3(p, 0)).rgb), OutputGamma), float3(0.2126, 0.7152, 0.0722)),
+    return float2(dot(pow(saturate(SceneColor.Load(int3(p, 0)).rgb), OutputGamma), Luminance),
                   LinearDepth(SceneDepth.Load(int3(float2(p) * DepthUvScale, 0))));
 }
 
@@ -530,11 +545,11 @@ float4 PSMain(VsOut i, uint geometry : SV_Coverage, out uint coverage : SV_Cover
     // Independent per-sample coin flips gave a pixel at alpha 0.2 anywhere from 0 to 4 of 8 samples (speckled tips).
     uint bits = HashU(uint3(i.pos.xy, (TemporalDither != 0 ? FrameIndex : 0u) + i.strand * 7919u));
     uint kept = (uint)(alpha * countbits(geometry) + (bits & 0xFFFF) / 65536.0);
-    uint turn = (bits >> 16) % SampleCount;
+    uint turn = (bits >> 16) & (SampleCount - 1); // SampleCount is 4 or 8
     coverage = 0;
     [unroll] for (uint k = 0; k < 8; k++)
     {
-        uint s = (k + turn) % SampleCount;
+        uint s = (k + turn) & (SampleCount - 1);
         if (k < SampleCount && kept > 0 && ((geometry >> s) & 1))
         {
             coverage |= 1u << s;
@@ -559,8 +574,7 @@ float4 PSMain(VsOut i, uint geometry : SV_Coverage, out uint coverage : SV_Cover
     // Reference hair roughness is 1: the white reflection lobe is very broad (a sheen), not a sharp highlight.
     float spec = pow(sqrt(saturate(1.0 - th * th)), 3.0) * Specular;
 
-    float jitter = 1.0 + (Hash(uint3(i.strand, 17u, 3u)) - 0.5) * 2.0 * HueJitter;
-    float3 albedo = i.surface.rgb * jitter;
+    float3 albedo = i.surface.rgb * i.shade.x;
     // Light reaching deep into the fur has passed through many strands (Beer-Lambert: colour^path), which makes roots and
     // fur seen end-on (looking down into it) darker and more saturated, like the reference's magenta partings.
     float cosView = dot(normalize(i.growth), v);
@@ -571,17 +585,7 @@ float4 PSMain(VsOut i, uint geometry : SV_Coverage, out uint coverage : SV_Cover
     float shadow = lerp(RootDarken, 1.0, 1.0 - buried);
     float3 color = (albedo * (AmbientColor + diffuse * LightIntensity) + spec * LightIntensity) * shadow;
 
-    // Light from the game's coat around the strand root; the strand's own pixel when the root is off-screen or hidden by
-    // something other than the character (a root just behind the coat's own silhouette keeps the coat in front of it).
-    float2 at = i.root.xy;
-    float depth = i.root.z;
-    bool onScreen = all(at >= 4) && all(at < ViewportSize - 4) && i.root.z > 0;
-    if (!onScreen || (UseSceneDepth != 0 && LinearDepth(SceneDepth.Load(int3(at * DepthUvScale, 0))) < i.root.z - 0.3))
-    {
-        at = i.pos.xy;
-        depth = LinearDepth(i.pos.z);
-    }
-    return Output(SceneLit(color, at, depth, i.surface.a));
+    return Output(i.shade.z > 0 ? color * i.shade.y : SceneLit(color, i.pos.xy, LinearDepth(i.pos.z), i.surface.a));
 }
 
 float4 VSComposite(uint vid : SV_VertexID) : SV_Position

@@ -1,4 +1,5 @@
 using System.Numerics;
+using System.Runtime.InteropServices;
 using System.Text;
 
 namespace FurRenderer;
@@ -89,7 +90,8 @@ internal static class FurGrower
         }
 
         // Undercoat: the fur surface itself.
-        var remap = new Dictionary<int, uint>();
+        var remap = new uint[surface.Positions.Count];
+        Array.Fill(remap, uint.MaxValue);
         var meshVertices = new List<MeshVertex>();
         var meshSkins = new List<StrandSkin>();
         var meshSurfaces = new List<StrandSurface>();
@@ -97,7 +99,8 @@ internal static class FurGrower
         for (var i = 0; i < triangles.Count; i++)
         {
             var vertex = triangles[i];
-            if (!remap.TryGetValue(vertex, out var index))
+            var index = remap[vertex];
+            if (index == uint.MaxValue)
             {
                 remap[vertex] = index = (uint)meshVertices.Count;
                 meshVertices.Add(new MeshVertex { Position = surface.Positions[vertex], Normal = surface.Normals[vertex] });
@@ -121,8 +124,14 @@ internal static class FurGrower
 
     private static (float X, float Y) ClumpDirection(Vector3 root)
     {
-        var seed = HashCode.Combine((int)MathF.Floor(root.X / ClumpCell), (int)MathF.Floor(root.Y / ClumpCell), (int)MathF.Floor(root.Z / ClumpCell));
-        var bits = (uint)seed * 2654435761u;
+        // A fixed hash (lowbias32 finaliser): HashCode is seeded per process, so the clumps changed with every game start.
+        var bits = unchecked((uint)(int)MathF.Floor(root.X / ClumpCell) * 73856093u ^ (uint)(int)MathF.Floor(root.Y / ClumpCell) * 19349663u
+                             ^ (uint)(int)MathF.Floor(root.Z / ClumpCell) * 83492791u);
+        bits ^= bits >> 16;
+        bits *= 0x7FEB352Du;
+        bits ^= bits >> 15;
+        bits *= 0x846CA68Bu;
+        bits ^= bits >> 16;
         return ((bits & 0xFFFF) / 32767.5f - 1f, (bits >> 16) / 32767.5f - 1f);
     }
 
@@ -296,13 +305,14 @@ internal static class FurGrower
                     surface.Normals.Add(vertexNormal);
                     surface.Materials.Add(materialRank);
                     surface.Uvs.Add(hasUv ? ReadUv(file, At(uv, v), uv.Type) : null);
+                    int weightsAt = At(weights, v), jointsAt = At(joints, v);
                     for (var k = 0; k < 8; k++)
                     {
-                        var weight = k < influences ? file[At(weights, v) + k] : (byte)0;
+                        var weight = k < influences ? file[weightsAt + k] : (byte)0;
                         byte bone = 0;
                         if (weight > 0)
                         {
-                            int global = table[Math.Min(file[At(joints, v) + k], table.Length - 1)];
+                            int global = table[Math.Min(file[jointsAt + k], table.Length - 1)];
                             if (!usedBones.TryGetValue(global, out bone))
                             {
                                 if (usedBones.Count == Renderer.MaxBones) throw new InvalidDataException($"fur meshes use more than {Renderer.MaxBones} bones");
@@ -335,10 +345,11 @@ internal static class FurGrower
 
         private float[] WeightOn(HashSet<string> bones)
         {
+            var on = BoneNames.Select(bones.Contains).ToArray();
             var weights = new float[Positions.Count];
             for (var v = 0; v < weights.Length; v++)
             for (var k = 0; k < 8; k++)
-                if (Weights[v * 8 + k] > 0 && bones.Contains(BoneNames[Bones[v * 8 + k]]))
+                if (Weights[v * 8 + k] > 0 && on[Bones[v * 8 + k]])
                     weights[v] += Weights[v * 8 + k];
             return weights;
         }
@@ -404,7 +415,7 @@ internal static class FurGrower
             {
                 int a = weld[Triangles[t + e]], b = weld[Triangles[t + (e + 1) % 3]];
                 var key = a < b ? (a, b) : (b, a);
-                uses[key] = uses.GetValueOrDefault(key) + 1;
+                CollectionsMarshal.GetValueRefOrAddDefault(uses, key, out _)++;
             }
             var grid = new PointGrid(OverhangDistance);
             foreach (var ((a, b), count) in uses)

@@ -89,7 +89,7 @@ internal sealed unsafe class Renderer : IDisposable
     private ID3D11DepthStencilState* depthWriteState;
     private bool depthStateReverse;
     // Fur layer: multisampled colour (premultiplied once resolved) and depth, and its single-sample resolve.
-    private readonly uint sampleCount;
+    private uint sampleCount;
     private ID3D11Texture2D* furColor;
     private ID3D11RenderTargetView* furColorRtv;
     private ID3D11Texture2D* ownDepth;
@@ -101,11 +101,7 @@ internal sealed unsafe class Renderer : IDisposable
     private ID3D11Texture2D* furResolved;
     private ID3D11ShaderResourceView* furResolvedSrv;
     private uint ownDepthW, ownDepthH;
-    private ID3D11Texture2D* rtvTarget;
-    // Second slot: the game alternates between drawing frames into the back buffer and into ToneAdjustSource.
-    private ID3D11RenderTargetView* rtvOther;
-    private ID3D11Texture2D* rtvOtherTarget;
-    private ID3D11RenderTargetView* rtv;
+    private ID3D11RenderTargetView* rtv; // the frame's target (back buffer or ToneAdjustSource), during Draw only
     private uint frameIndex;
     private ID3D11Texture2D* sceneCopy;
     private ID3D11ShaderResourceView* sceneCopySrv;
@@ -138,6 +134,17 @@ internal sealed unsafe class Renderer : IDisposable
     {
         this.device = device;
         device->AddRef();
+        // A shader that fails to compile would otherwise leak the device and everything created before it.
+        try { Create(shaderPath, source); }
+        catch
+        {
+            Dispose();
+            throw;
+        }
+    }
+
+    private void Create(string shaderPath, byte[] source)
+    {
         using (var vsBlob = Compile(source, shaderPath, "VSMain", "vs_5_0"))
             fixed (ID3D11VertexShader** out_ = &vs) Check(device->CreateVertexShader(vsBlob.Pointer, vsBlob.Size, null, out_), "CreateVertexShader");
         using (var psBlob = Compile(source, shaderPath, "PSMain", "ps_5_0"))
@@ -337,6 +344,7 @@ internal sealed unsafe class Renderer : IDisposable
         ID3D11ShaderResourceView* noSrv = null;
         ctx->CSSetUnorderedAccessViews(3, 1, &noUav, null);
         ctx->CSSetShaderResources(19, 1, &noSrv);
+        ctx->CSSetShaderResources(3, 1, &noSrv); // the scene depth becomes a depth target later in the frame
         var all = hiZSrv;
         ctx->CSSetShaderResources(18, 1, &all);
         return true;
@@ -620,8 +628,10 @@ internal sealed unsafe class Renderer : IDisposable
                 ctx->GenerateMips(surfaceLightSrv);
                 var lightSrv = surfaceLightSrv;
                 ctx->PSSetShaderResources(11, 1, &lightSrv);
+                ctx->VSSetShaderResources(11, 1, &lightSrv); // VSMain reads the light at strand roots
                 var sampler = linearClamp;
                 ctx->PSSetSamplers(0, 1, &sampler);
+                ctx->VSSetSamplers(0, 1, &sampler);
             }
             else ctx->OMSetRenderTargets(1, &furRtv, ownDepthDsv);
         }
@@ -689,10 +699,10 @@ internal sealed unsafe class Renderer : IDisposable
             ctx->CSSetUnorderedAccessViews(0, 3, csUavs, null); // or the VS can't read them and the draw can't take its arguments
 
             vsSrvs[0] = item.PointsSrv;
-            vsSrvs[1] = item.SkinsSrv;
+            vsSrvs[1] = null;
             vsSrvs[2] = bonesSrv;
-            vsSrvs[3] = null;
-            vsSrvs[4] = null;
+            vsSrvs[3] = sceneDepth;   // VSMain: the light at strand roots
+            vsSrvs[4] = sceneLumaSrv;
             vsSrvs[5] = item.MeshVerticesSrv;
             vsSrvs[6] = item.MeshSkinsSrv;
             ctx->VSSetShaderResources(0, 7, vsSrvs);
@@ -736,6 +746,7 @@ internal sealed unsafe class Renderer : IDisposable
         {
             ID3D11ShaderResourceView* none = null;
             ctx->PSSetShaderResources(3, 1, &none); // the scene depth can't be read while it is the target
+            ctx->VSSetShaderResources(3, 1, &none);
             ctx->OMSetRenderTargets(0, null, sceneDepthDsv);
             ctx->OMSetDepthStencilState(depthWriteState, 0);
             ctx->PSSetShader(psDepth, null, 0);
@@ -759,6 +770,8 @@ internal sealed unsafe class Renderer : IDisposable
                 ctx1->Release();
             }
         }
+        // A view of the swap chain's buffer held past the frame would make the game's ResizeBuffers fail.
+        Release(ref rtv);
     }
 
     private static bool IsReverseZ(Matrix4x4 proj)
@@ -902,19 +915,8 @@ internal sealed unsafe class Renderer : IDisposable
 
     private void EnsureTargets(ID3D11Texture2D* backBuffer, D3D11_TEXTURE2D_DESC bbDesc)
     {
-        if (rtvTarget != backBuffer)
-        {
-            var view = rtv; rtv = rtvOther; rtvOther = view;
-            var target = rtvTarget; rtvTarget = rtvOtherTarget; rtvOtherTarget = target;
-        }
-        if (rtvTarget != backBuffer)
-        {
-            Release(ref rtv);
-            Release(ref rtvTarget);
-            fixed (ID3D11RenderTargetView** out_ = &rtv) Check(device->CreateRenderTargetView((ID3D11Resource*)backBuffer, null, out_), "CreateRenderTargetView");
-            backBuffer->AddRef();
-            rtvTarget = backBuffer;
-        }
+        Release(ref rtv); // left over if the last draw threw
+        fixed (ID3D11RenderTargetView** out_ = &rtv) Check(device->CreateRenderTargetView((ID3D11Resource*)backBuffer, null, out_), "CreateRenderTargetView");
         if (ownDepth != null && ownDepthW == bbDesc.Width && ownDepthH == bbDesc.Height) return;
         Release(ref ownDepthSrv); Release(ref ownDepthDsv); Release(ref ownDepth);
         Release(ref furColorRtv); Release(ref furColor);
@@ -1026,7 +1028,7 @@ internal sealed unsafe class Renderer : IDisposable
         Release(ref ownDepthSrv); Release(ref ownDepthDsv); Release(ref ownDepth); Release(ref sceneDepthDsv);
         Release(ref furColorRtv); Release(ref furColor);
         Release(ref furResolvedSrv); Release(ref furResolved);
-        Release(ref rtv); Release(ref rtvTarget); Release(ref rtvOther); Release(ref rtvOtherTarget);
+        Release(ref rtv);
         Release(ref readback);
         ReleaseSceneCopy();
         for (var i = 0; i < QueryFrames; i++)
@@ -1064,6 +1066,7 @@ internal sealed unsafe class Renderer : IDisposable
         private readonly ID3D11ShaderResourceView*[] psSrvs = new ID3D11ShaderResourceView*[26]; // t3..t28
         private readonly ID3D11SamplerState*[] psSamplers = new ID3D11SamplerState*[2]; // s0..s1
         private readonly ID3D11SamplerState* csSampler; // s1
+        private readonly ID3D11SamplerState* vsSampler; // s0
         private readonly ID3D11ComputeShader* cs;
         private readonly ID3D11ShaderResourceView*[] csSrvs = new ID3D11ShaderResourceView*[29]; // t0..t28
         private readonly ID3D11UnorderedAccessView*[] csUavs = new ID3D11UnorderedAccessView*[4]; // u0..u3
@@ -1092,6 +1095,7 @@ internal sealed unsafe class Renderer : IDisposable
             fixed (ID3D11ShaderResourceView** psOut = psSrvs) ctx->PSGetShaderResources(3, (uint)psSrvs.Length, psOut);
             fixed (ID3D11SamplerState** ss = psSamplers) ctx->PSGetSamplers(0, (uint)psSamplers.Length, ss);
             ID3D11SamplerState* css; ctx->CSGetSamplers(1, 1, &css); csSampler = css;
+            ID3D11SamplerState* vss; ctx->VSGetSamplers(0, 1, &vss); vsSampler = vss;
             ID3D11ComputeShader* c; ctx->CSGetShader(&c, null, null); cs = c;
             fixed (ID3D11ShaderResourceView** csOut = csSrvs) ctx->CSGetShaderResources(0, (uint)csSrvs.Length, csOut);
             fixed (ID3D11UnorderedAccessView** uOut = csUavs) ctx->CSGetUnorderedAccessViews(0, (uint)csUavs.Length, uOut);
@@ -1118,6 +1122,7 @@ internal sealed unsafe class Renderer : IDisposable
             fixed (ID3D11ShaderResourceView** p = psSrvs) ctx->PSSetShaderResources(3, (uint)psSrvs.Length, p);
             fixed (ID3D11SamplerState** ss = psSamplers) ctx->PSSetSamplers(0, (uint)psSamplers.Length, ss);
             var css = csSampler; ctx->CSSetSamplers(1, 1, &css);
+            var vss = vsSampler; ctx->VSSetSamplers(0, 1, &vss);
             ctx->CSSetShader(cs, null, 0);
             fixed (ID3D11ShaderResourceView** c = csSrvs) ctx->CSSetShaderResources(0, (uint)csSrvs.Length, c);
             var keepCounts = stackalloc uint[4] { uint.MaxValue, uint.MaxValue, uint.MaxValue, uint.MaxValue }; // leave append/counter UAVs' hidden counts as they were
@@ -1132,7 +1137,7 @@ internal sealed unsafe class Renderer : IDisposable
             Rel(vsCb); Rel(psCb); Rel(csCb); Rel(indexBuffer);
             for (var i = 0; i < vsSrvs.Length; i++) Rel(vsSrvs[i]);
             for (var i = 0; i < psSrvs.Length; i++) Rel(psSrvs[i]);
-            Rel(cs); Rel(csSampler);
+            Rel(cs); Rel(csSampler); Rel(vsSampler);
             for (var i = 0; i < psSamplers.Length; i++) Rel(psSamplers[i]);
             for (var i = 0; i < csSrvs.Length; i++) Rel(csSrvs[i]);
             for (var i = 0; i < csUavs.Length; i++) Rel(csUavs[i]);

@@ -60,7 +60,7 @@ public sealed class Configuration : IPluginConfiguration
     /// </summary>
     public float Absorption { get; set; } = 0.4f;
     public float FacingDepth { get; set; } = 2f;
-    /// <summary>0 = synthetic lighting only; 1 = colour and lighting sampled from the game's lit coat under each strand root.</summary>
+    /// <summary>0 = synthetic lighting only; 1 = brightness taken from the game's lit item around each strand root.</summary>
     public float SceneLighting { get; set; } = 1f;
     /// <summary>1 / the lit coat's brightness in full sun (about 0.66 linear here), so sunlit fur keeps its colour and shadows darken it.</summary>
     public float SceneGain { get; set; } = 1.5f;
@@ -73,8 +73,9 @@ public sealed class Configuration : IPluginConfiguration
     /// <summary>Skip strands outside the view or hidden behind the scene (the character's own body included) before drawing.</summary>
     public bool CullHiddenStrands { get; set; } = true;
     /// <summary>
-    /// Where to draw in the game's render commands: -1 = auto (first back-buffer bind that uses scene depth: after the scene is
-    /// composited, before nameplates/UI), N = right after the Nth back-buffer bind, 0 = at Present (over the UI).
+    /// Where to draw in the game's render commands: -1 = auto (just before the first back-buffer bind without depth that follows
+    /// the scene-depth binds: after the scene is composited, before nameplates/UI), N = right after the Nth back-buffer bind,
+    /// 0 = at Present (over the UI).
     /// </summary>
     public int BackBufferBind { get; set; } = -1;
     public float DepthBiasMeters { get; set; } = 0.01f;

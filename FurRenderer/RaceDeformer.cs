@@ -40,11 +40,11 @@ internal static class RaceDeformer
         var bones = BitConverter.ToInt32(pbd, start);
         var matrices = start + 4 + bones * 2 + bones * 2 % 4;
         var result = new Dictionary<string, Matrix4x4>(bones);
+        var m = new float[12];
         for (var i = 0; i < bones; i++)
         {
             var nameAt = start + BitConverter.ToInt16(pbd, start + 4 + i * 2);
             var name = Encoding.UTF8.GetString(pbd, nameAt, Array.IndexOf(pbd, (byte)0, nameAt) - nameAt);
-            var m = new float[12];
             for (var k = 0; k < 12; k++) m[k] = BitConverter.ToSingle(pbd, matrices + (i * 12 + k) * 4);
             // Stored row-major for column vectors (x' = m0 x + m1 y + m2 z + m3); System.Numerics uses row vectors.
             result[name] = new Matrix4x4(m[0], m[4], m[8], 0, m[1], m[5], m[9], 0, m[2], m[6], m[10], 0, m[3], m[7], m[11], 1);
