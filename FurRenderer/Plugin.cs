@@ -700,6 +700,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 "Bends strands towards the ground, keeping their length: at 0.5 a horizontal strand's tip points 45° down, at 1.5 about 70°.");
             changed |= Slider("Taper starts at", () => config.FadeStart, v => config.FadeStart = v, d.FadeStart, 0f, 0.95f,
                 "Share of the length at full width; from there the strand narrows to nothing at the tip.", 0, "%", 100f);
+            changed |= Slider("Temporal smoothing", () => config.TemporalSmoothing, v => config.TemporalSmoothing = v, d.TemporalSmoothing, 0f, 0.9f,
+                "Blends each frame with the last ones, following the fur as it moves, so thin strands and tips don't twinkle. Higher is steadier but softer; 0 = off.", 0, "%", 100f);
         }
         if (ImGui.CollapsingHeader("Shading", ImGuiTreeNodeFlags.DefaultOpen))
         {

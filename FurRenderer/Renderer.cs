@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -37,7 +38,8 @@ internal struct FrameConstants
     public float Absorption, FacingDepth, CoverageScale; public uint SampleCount;
     public float UndercoatDarken; public uint TableMask, DrawnStrands, CullFlags;
     public uint HiZWidth, HiZHeight, HiZLevels, ArgsOffset;
-    public uint RecolorUndyed; public Vector3 Padding;
+    public uint RecolorUndyed; public float TemporalBlend; public Vector2 Padding;
+    public Matrix4x4 LastViewProj;
 }
 
 /// <summary>
@@ -59,6 +61,7 @@ internal sealed unsafe class Renderer : IDisposable
     private ID3D11PixelShader* psUnder;
     private ID3D11VertexShader* vsComposite;
     private ID3D11PixelShader* psComposite;
+    private ID3D11PixelShader* psTemporal;
     private ID3D11PixelShader* psDepth;
     private ID3D11PixelShader* psSceneLuma;
     private ID3D11PixelShader* psSurfaceLight;
@@ -100,6 +103,17 @@ internal sealed unsafe class Renderer : IDisposable
     private nint sceneDepthDsvResource;
     private ID3D11Texture2D* furResolved;
     private ID3D11ShaderResourceView* furResolvedSrv;
+    // PSTemporal's results, alternating: each frame reads the last one and writes the other. historyTime 0 = none yet.
+    private ID3D11Texture2D* history0, history1;
+    private ID3D11RenderTargetView* historyRtv0, historyRtv1;
+    private ID3D11ShaderResourceView* historySrv0, historySrv1;
+    private bool historyFlip;
+    private long historyTime;
+    private Matrix4x4 lastViewProj;
+    // Per fur layer sample, where it was on screen last frame (PSTemporal follows it there).
+    private ID3D11Texture2D* motion;
+    private ID3D11RenderTargetView* motionRtv;
+    private ID3D11ShaderResourceView* motionSrv;
     private uint ownDepthW, ownDepthH;
     private ID3D11RenderTargetView* rtv; // the frame's target (back buffer or ToneAdjustSource), during Draw only
     private uint frameIndex;
@@ -157,6 +171,8 @@ internal sealed unsafe class Renderer : IDisposable
             fixed (ID3D11VertexShader** out_ = &vsComposite) Check(device->CreateVertexShader(blob.Pointer, blob.Size, null, out_), "CreateVertexShader(composite)");
         using (var blob = Compile(source, shaderPath, "PSComposite", "ps_5_0"))
             fixed (ID3D11PixelShader** out_ = &psComposite) Check(device->CreatePixelShader(blob.Pointer, blob.Size, null, out_), "CreatePixelShader(composite)");
+        using (var blob = Compile(source, shaderPath, "PSTemporal", "ps_5_0"))
+            fixed (ID3D11PixelShader** out_ = &psTemporal) Check(device->CreatePixelShader(blob.Pointer, blob.Size, null, out_), "CreatePixelShader(temporal)");
         using (var blob = Compile(source, shaderPath, "PSDepth", "ps_5_0"))
             fixed (ID3D11PixelShader** out_ = &psDepth) Check(device->CreatePixelShader(blob.Pointer, blob.Size, null, out_), "CreatePixelShader(depth)");
         using (var blob = Compile(source, shaderPath, "PSSceneLuma", "ps_5_0"))
@@ -191,7 +207,7 @@ internal sealed unsafe class Renderer : IDisposable
             CPUAccessFlags = (uint)D3D11_CPU_ACCESS_WRITE,
         };
         fixed (ID3D11Buffer** out_ = &constants) Check(device->CreateBuffer(&cbDesc, null, out_), "CreateBuffer(constants)");
-        CreateStructured(null, MaxBones * 4, sizeof(Vector4), dynamic: true, ref bones, ref bonesSrv);
+        CreateStructured(null, 2 * MaxBones * 4, sizeof(Vector4), dynamic: true, ref bones, ref bonesSrv); // this frame's, last frame's
 
         // Stochastic transparency writes opaque samples into the fur layer (alpha = 1 marks covered samples), so blending is off.
         var blendDesc = new D3D11_BLEND_DESC();
@@ -366,6 +382,7 @@ internal sealed unsafe class Renderer : IDisposable
         public ID3D11Buffer* Points, Skins, StrandSurfaces, MeshVertices, MeshSurfaces, MeshSkins, MeshIndices, StrandMatrices, VisibleStrands;
         public ID3D11ShaderResourceView* PointsSrv, SkinsSrv, StrandSurfacesSrv, MeshVerticesSrv, MeshSurfacesSrv, MeshSkinsSrv, StrandMatricesSrv, VisibleStrandsSrv;
         public ID3D11UnorderedAccessView* StrandMatricesUav, VisibleStrandsUav;
+        public Matrix4x4[]? LastSkin; // the skin palette drawn last frame
         public int StrandCount;
         public uint MeshIndexCount;
 
@@ -394,7 +411,7 @@ internal sealed unsafe class Renderer : IDisposable
                 CreateStructured(p, asset.Skins.Length, sizeof(StrandSkin), dynamic: false, ref b.Skins, ref b.SkinsSrv);
             fixed (StrandSurface* p = asset.StrandSurfaces)
                 CreateStructured(p, asset.StrandSurfaces.Length, sizeof(StrandSurface), dynamic: false, ref b.StrandSurfaces, ref b.StrandSurfacesSrv);
-            const int matrixStride = 4 * 12 + 12; // StrandMatrix: 4 x float3, uint3 colour
+            const int matrixStride = 8 * 12 + 12; // StrandMatrix: 4 x float3, uint3 colour, 4 x float3 (last frame's)
             var matricesDesc = new D3D11_BUFFER_DESC
             {
                 ByteWidth = checked((uint)(asset.StrandCount * matrixStride)),
@@ -520,6 +537,7 @@ internal sealed unsafe class Renderer : IDisposable
         var fc = new FrameConstants
         {
             ViewProj = view * proj,
+            LastViewProj = historyTime != 0 ? lastViewProj : view * proj,
             Proj = proj,
             CameraPos = invView.Translation,
             MinPixelWidth = cfg.MinPixelWidth,
@@ -529,6 +547,8 @@ internal sealed unsafe class Renderer : IDisposable
             LightIntensity = cfg.LightIntensity,
             BaseColor = cfg.BaseColor,
             RecolorUndyed = cfg.RecolorUndyed ? 1u : 0u,
+            // Without a recent result (none yet, resized, or the fur not drawn for a while), start from this frame.
+            TemporalBlend = historyTime != 0 && Stopwatch.GetElapsedTime(historyTime).TotalSeconds < 0.5 ? 1f - Math.Clamp(cfg.TemporalSmoothing, 0f, 0.9f) : 1f,
             RootDarken = cfg.RootDarken,
             UndercoatDarken = cfg.UndercoatDarken,
             AmbientColor = cfg.AmbientColor,
@@ -568,9 +588,10 @@ internal sealed unsafe class Renderer : IDisposable
         ctx->Begin((ID3D11Asynchronous*)statsQueries[querySlot]);
         var transparent = stackalloc float[4];
         ctx->ClearRenderTargetView(furColorRtv, transparent);
+        ctx->ClearRenderTargetView(motionRtv, transparent);
         ctx->ClearDepthStencilView(ownDepthDsv, (uint)D3D11_CLEAR_FLAG.D3D11_CLEAR_DEPTH, reverse ? 0f : 1f, 0);
-        var furRtv = furColorRtv;
-        ctx->OMSetRenderTargets(1, &furRtv, ownDepthDsv);
+        var furRtvs = stackalloc ID3D11RenderTargetView*[2] { furColorRtv, motionRtv };
+        ctx->OMSetRenderTargets(2, furRtvs, ownDepthDsv);
         var viewport = new D3D11_VIEWPORT { Width = bbDesc.Width, Height = bbDesc.Height, MaxDepth = 1 };
         ctx->RSSetViewports(1, &viewport);
         ctx->RSSetState(raster);
@@ -621,8 +642,7 @@ internal sealed unsafe class Renderer : IDisposable
                     if (item.MeshIndices == null) continue;
                     BindMaterials(ctx, draw, ref fc); // PSSurfaceLight leaves out other surfaces by the item's colour
                     Upload(ctx, (ID3D11Resource*)constants, &fc, sizeof(FrameConstants));
-                    fixed (Matrix4x4* m = draw.Skin)
-                        Upload(ctx, (ID3D11Resource*)bones, m, Math.Min(draw.Skin.Length, MaxBones) * sizeof(Matrix4x4));
+                    UploadBones(ctx, draw);
                     meshSrvs[0] = item.MeshVerticesSrv;
                     meshSrvs[1] = item.MeshSkinsSrv;
                     ctx->VSSetShaderResources(5, 2, meshSrvs);
@@ -632,7 +652,7 @@ internal sealed unsafe class Renderer : IDisposable
                     ctx->DrawIndexed(item.MeshIndexCount, 0, 0);
                 }
                 ctx->RSSetViewports(1, &viewport);
-                ctx->OMSetRenderTargets(1, &furRtv, ownDepthDsv); // or the map can't be read: D3D nulls a view of a bound target
+                ctx->OMSetRenderTargets(2, furRtvs, ownDepthDsv); // or the map can't be read: D3D nulls a view of a bound target
                 ctx->GenerateMips(surfaceLightSrv);
                 var lightSrv = surfaceLightSrv;
                 ctx->PSSetShaderResources(11, 1, &lightSrv);
@@ -641,7 +661,7 @@ internal sealed unsafe class Renderer : IDisposable
                 ctx->PSSetSamplers(0, 1, &sampler);
                 ctx->VSSetSamplers(0, 1, &sampler);
             }
-            else ctx->OMSetRenderTargets(1, &furRtv, ownDepthDsv);
+            else ctx->OMSetRenderTargets(2, furRtvs, ownDepthDsv);
         }
         var psSrvs = stackalloc ID3D11ShaderResourceView*[2] { sceneDepth, sceneLumaSrv };
         ctx->PSSetShaderResources(3, 2, psSrvs);
@@ -674,8 +694,7 @@ internal sealed unsafe class Renderer : IDisposable
             // silhouettes stay as solid as the reference instead of showing the background between strands.
             fc.CoverageScale = Math.Max(1f, item.StrandCount / (AssetDensityFraction * drawn * fc.ChildCount));
             Upload(ctx, (ID3D11Resource*)constants, &fc, sizeof(FrameConstants));
-            fixed (Matrix4x4* m = draw.Skin)
-                Upload(ctx, (ID3D11Resource*)bones, m, Math.Min(draw.Skin.Length, MaxBones) * sizeof(Matrix4x4));
+            UploadBones(ctx, draw);
 
             csSrvs[0] = item.PointsSrv;
             csSrvs[1] = item.SkinsSrv;
@@ -717,19 +736,38 @@ internal sealed unsafe class Renderer : IDisposable
             ctx->PSSetShader(ps, null, 0);
             ctx->DrawInstancedIndirect(drawArgs, (uint)(d * 16));
         }
+        foreach (var draw in draws) draw.Buffers.LastSkin = draw.Skin;
         ctx->CopyResource((ID3D11Resource*)argsStaging[querySlot], (ID3D11Resource*)drawArgs);
         (argsItems[querySlot], argsTotal[querySlot]) = (draws.Count, strandInstances);
 
-        // Resolve the fur layer and blend it over the frame.
-        var target = rtv;
-        ctx->OMSetRenderTargets(1, &target, null);
+        // Resolve the fur layer, blend it with the last frames' (PSTemporal) and that over the frame.
         ctx->ResolveSubresource((ID3D11Resource*)furResolved, 0, (ID3D11Resource*)furColor, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
-        ctx->OMSetBlendState(compositeBlend, blendFactor, 0xFFFFFFFF);
+        var historyRtv = historyFlip ? historyRtv1 : historyRtv0;
+        var historySrv = historyFlip ? historySrv1 : historySrv0;
+        var lastSrv = historyFlip ? historySrv0 : historySrv1;
+        historyFlip = !historyFlip;
+        historyTime = Stopwatch.GetTimestamp();
+        lastViewProj = fc.ViewProj;
+        ctx->OMSetRenderTargets(1, &historyRtv, null);
+        ctx->OMSetBlendState(blend, blendFactor, 0xFFFFFFFF);
         ctx->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx->VSSetShader(vsComposite, null, 0);
-        ctx->PSSetShader(psComposite, null, 0);
+        ctx->PSSetShader(psTemporal, null, 0);
         var layer = furResolvedSrv;
         ctx->PSSetShaderResources(7, 1, &layer);
+        ctx->PSSetShaderResources(30, 1, &lastSrv);
+        var ownDepthView = ownDepthSrv;
+        ctx->PSSetShaderResources(8, 1, &ownDepthView);
+        var motionView = motionSrv;
+        ctx->PSSetShaderResources(31, 1, &motionView);
+        var clampSampler = linearClamp;
+        ctx->PSSetSamplers(0, 1, &clampSampler);
+        ctx->Draw(3, 0);
+        var target = rtv;
+        ctx->OMSetRenderTargets(1, &target, null);
+        ctx->OMSetBlendState(compositeBlend, blendFactor, 0xFFFFFFFF);
+        ctx->PSSetShader(psComposite, null, 0);
+        ctx->PSSetShaderResources(7, 1, &historySrv); // PSDepth below reads it too
         ctx->Draw(3, 0);
 
         // Fur depth into the game's depth buffer, for depth-based post effects (ReShade). Only when it maps 1:1 to the frame.
@@ -912,6 +950,8 @@ internal sealed unsafe class Renderer : IDisposable
         Release(ref ownDepthSrv); Release(ref ownDepthDsv); Release(ref ownDepth);
         Release(ref furColorRtv); Release(ref furColor);
         Release(ref furResolvedSrv); Release(ref furResolved);
+        Release(ref motionSrv); Release(ref motionRtv); Release(ref motion);
+        ReleaseHistory();
         var desc = new D3D11_TEXTURE2D_DESC
         {
             Width = bbDesc.Width,
@@ -932,12 +972,33 @@ internal sealed unsafe class Renderer : IDisposable
         desc.BindFlags = (uint)D3D11_BIND_RENDER_TARGET;
         fixed (ID3D11Texture2D** out_ = &furColor) Check(device->CreateTexture2D(&desc, null, out_), "CreateTexture2D(fur layer)");
         fixed (ID3D11RenderTargetView** out_ = &furColorRtv) Check(device->CreateRenderTargetView((ID3D11Resource*)furColor, null, out_), "CreateRenderTargetView(fur layer)");
+        desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+        desc.BindFlags = (uint)(D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
+        fixed (ID3D11Texture2D** out_ = &motion) Check(device->CreateTexture2D(&desc, null, out_), "CreateTexture2D(motion)");
+        fixed (ID3D11RenderTargetView** out_ = &motionRtv) Check(device->CreateRenderTargetView((ID3D11Resource*)motion, null, out_), "CreateRenderTargetView(motion)");
+        fixed (ID3D11ShaderResourceView** out_ = &motionSrv) Check(device->CreateShaderResourceView((ID3D11Resource*)motion, null, out_), "CreateShaderResourceView(motion)");
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         desc.SampleDesc.Count = 1;
         desc.BindFlags = (uint)D3D11_BIND_SHADER_RESOURCE;
         fixed (ID3D11Texture2D** out_ = &furResolved) Check(device->CreateTexture2D(&desc, null, out_), "CreateTexture2D(fur resolve)");
         fixed (ID3D11ShaderResourceView** out_ = &furResolvedSrv) Check(device->CreateShaderResourceView((ID3D11Resource*)furResolved, null, out_), "CreateShaderResourceView(fur resolve)");
+        desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; // in 8 bits a 0.2 blend stops short of the frame: its steps round away within 2.5/255
+        desc.BindFlags = (uint)(D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
+        fixed (ID3D11Texture2D** out_ = &history0) Check(device->CreateTexture2D(&desc, null, out_), "CreateTexture2D(history)");
+        fixed (ID3D11Texture2D** out_ = &history1) Check(device->CreateTexture2D(&desc, null, out_), "CreateTexture2D(history)");
+        fixed (ID3D11RenderTargetView** out_ = &historyRtv0) Check(device->CreateRenderTargetView((ID3D11Resource*)history0, null, out_), "CreateRenderTargetView(history)");
+        fixed (ID3D11RenderTargetView** out_ = &historyRtv1) Check(device->CreateRenderTargetView((ID3D11Resource*)history1, null, out_), "CreateRenderTargetView(history)");
+        fixed (ID3D11ShaderResourceView** out_ = &historySrv0) Check(device->CreateShaderResourceView((ID3D11Resource*)history0, null, out_), "CreateShaderResourceView(history)");
+        fixed (ID3D11ShaderResourceView** out_ = &historySrv1) Check(device->CreateShaderResourceView((ID3D11Resource*)history1, null, out_), "CreateShaderResourceView(history)");
         ownDepthW = bbDesc.Width;
         ownDepthH = bbDesc.Height;
+    }
+
+    private void ReleaseHistory()
+    {
+        Release(ref historySrv0); Release(ref historySrv1); Release(ref historyRtv0); Release(ref historyRtv1);
+        Release(ref history0); Release(ref history1);
+        historyTime = 0;
     }
 
     // An item's fur material textures for SurfaceColor (CS and PS), and which of them are bound (TableMask; constants not uploaded).
@@ -981,6 +1042,18 @@ internal sealed unsafe class Renderer : IDisposable
         srvDesc.Buffer.FirstElement = 0;
         srvDesc.Buffer.NumElements = (uint)count;
         fixed (ID3D11ShaderResourceView** out_ = &srv) Check(device->CreateShaderResourceView((ID3D11Resource*)buffer, &srvDesc, out_), "CreateShaderResourceView");
+    }
+
+    // The item's skin palette, then from MaxBones on last frame's (its own again on its first frame), for the motion.
+    private void UploadBones(ID3D11DeviceContext* ctx, FurDraw draw)
+    {
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        if (ctx->Map((ID3D11Resource*)bones, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped).FAILED) return;
+        var last = draw.Buffers.LastSkin is { } l && l.Length == draw.Skin.Length ? l : draw.Skin;
+        var bytes = Math.Min(draw.Skin.Length, MaxBones) * sizeof(Matrix4x4);
+        fixed (Matrix4x4* m = draw.Skin) Buffer.MemoryCopy(m, mapped.pData, bytes, bytes);
+        fixed (Matrix4x4* m = last) Buffer.MemoryCopy(m, (byte*)mapped.pData + MaxBones * sizeof(Matrix4x4), bytes, bytes);
+        ctx->Unmap((ID3D11Resource*)bones, 0);
     }
 
     private static void Upload(ID3D11DeviceContext* ctx, ID3D11Resource* resource, void* data, int bytes)
@@ -1029,7 +1102,7 @@ internal sealed unsafe class Renderer : IDisposable
     public void Dispose()
     {
         Release(ref vs); Release(ref ps); Release(ref constants);
-        Release(ref vsUnder); Release(ref psUnder); Release(ref vsComposite); Release(ref psComposite); Release(ref psDepth);
+        Release(ref vsUnder); Release(ref psUnder); Release(ref vsComposite); Release(ref psComposite); Release(ref psTemporal); Release(ref psDepth);
         Release(ref psSceneLuma); Release(ref psSurfaceLight); Release(ref linearClamp); Release(ref linearWrap); Release(ref csStrandMatrices);
         Release(ref csHiZFirst); Release(ref csHiZDown);
         ReleaseHiZ();
@@ -1039,6 +1112,8 @@ internal sealed unsafe class Renderer : IDisposable
         Release(ref ownDepthSrv); Release(ref ownDepthDsv); Release(ref ownDepth); Release(ref sceneDepthDsv);
         Release(ref furColorRtv); Release(ref furColor);
         Release(ref furResolvedSrv); Release(ref furResolved);
+        Release(ref motionSrv); Release(ref motionRtv); Release(ref motion);
+        ReleaseHistory();
         Release(ref rtv);
         Release(ref readback);
         ReleaseSceneCopy();
@@ -1074,7 +1149,7 @@ internal sealed unsafe class Renderer : IDisposable
         private readonly ID3D11PixelShader* ps;
         private readonly ID3D11Buffer* vsCb, psCb, csCb;
         private readonly ID3D11ShaderResourceView*[] vsSrvs = new ID3D11ShaderResourceView*[30]; // t0..t29
-        private readonly ID3D11ShaderResourceView*[] psSrvs = new ID3D11ShaderResourceView*[27]; // t3..t29
+        private readonly ID3D11ShaderResourceView*[] psSrvs = new ID3D11ShaderResourceView*[29]; // t3..t31
         private readonly ID3D11SamplerState*[] psSamplers = new ID3D11SamplerState*[2]; // s0..s1
         private readonly ID3D11SamplerState* csSampler; // s1
         private readonly ID3D11SamplerState* vsSampler; // s0

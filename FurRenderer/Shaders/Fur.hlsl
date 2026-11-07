@@ -14,7 +14,7 @@ struct SkinData
 
 StructuredBuffer<float4> Points : register(t0);       // xyz model/bind space, w radius
 StructuredBuffer<SkinData> Skins : register(t1);
-StructuredBuffer<float4> Bones : register(t2);        // 4 rows per bone (explicit rows: no matrix-packing ambiguity)
+StructuredBuffer<float4> Bones : register(t2);        // 4 rows per bone (explicit rows: no matrix-packing ambiguity); from MaxBones on, last frame's
 Texture2D<float> SceneDepth : register(t3);
 Texture2D<float2> SceneLuma : register(t4);           // per pixel: the frame's linear luminance and the scene's view distance
 struct MeshVertex
@@ -30,12 +30,15 @@ struct StrandMatrix
 {
     float3 r0, r1, r2, r3;  // SkinMatrix rows without w (only mul(float4(p, 1), m).xyz is taken)
     uint3 color;            // SurfaceColor as halves: r | g << 16, b | light gain << 16; then its 'brightest' as a float
+    float3 l0, l1, l2, l3;  // the same rows with last frame's bones
 };
 StructuredBuffer<StrandMatrix> StrandMatrices : register(t9);
 RWStructuredBuffer<StrandMatrix> StrandMatricesOut : register(u0);
 Texture2D<float2> SurfaceLight : register(t11);       // 1/8 size with mips: the fur surface's luminance x coverage, coverage
 SamplerState LinearClamp : register(s0);
 Texture2D<float4> SceneColor : register(t10);         // copy of the lit frame (display-encoded) taken just before drawing
+Texture2D<float4> FurHistory : register(t30);         // PSTemporal's output last frame
+Texture2DMS<float2> Motion : register(t31);           // per fur layer sample: where it was on screen last frame, in pixels from now
 Texture2D<float4> SceneAlbedo : register(t29);        // the game's GBuffer 2: rgb = square root of the diffuse colour it lit each pixel with
 // Per strand root / undercoat vertex: x = rank of its fur material among the item's | 0x10000 when y holds its UV (u | v << 16,
 // halves). Baked assets have no UVs.
@@ -83,7 +86,8 @@ cbuffer Frame : register(b0)
     float Absorption;      float FacingDepth;  float CoverageScale; uint SampleCount;
     float UndercoatDarken; uint TableMask;     uint DrawnStrands; uint CullFlags;   // TableMask: bit k / 4 + k / 8 + k = ColorTable<k> / IndexMap<k> / DiffuseMap<k> is bound
     uint2 HiZSize;         uint HiZLevels;     uint ArgsOffset;   // CullFlags: 1 = outside the view, 2 = behind the scene (Hi-Z)
-    uint RecolorUndyed;    float3 Padding;     // items in Hikari's undyed colour take BaseColor
+    uint RecolorUndyed;    float TemporalBlend; float2 Padding;   // RecolorUndyed: items in Hikari's undyed colour take BaseColor; TemporalBlend: PSTemporal's weight of this frame (1 = no history)
+    row_major float4x4 LastViewProj;
 };
 
 struct VsOut
@@ -99,6 +103,7 @@ struct VsOut
     // Per strand copy: brightness jitter, the scene light at the root (SceneLit's scale) and whether the root is usable for it.
     nointerpolation float3 shade : SHADE;
     nointerpolation float brightest : BRIGHTEST; // SurfaceColor's
+    float4 lastClip : LASTCLIP; // clip position last frame
 };
 
 float LinearDepth(float d);
@@ -109,13 +114,22 @@ float4x4 Bone(uint b)
     return float4x4(Bones[b * 4], Bones[b * 4 + 1], Bones[b * 4 + 2], Bones[b * 4 + 3]);
 }
 
-float4x4 SkinMatrix(SkinData s)
+static const uint MaxBones = 256; // Renderer.MaxBones
+
+// palette: 0 = this frame's bones, MaxBones = last frame's.
+float4x4 SkinMatrix(SkinData s, uint palette)
 {
     float w[8] = { s.w0.x, s.w0.y, s.w0.z, s.w0.w, s.w1.x, s.w1.y, s.w1.z, s.w1.w };
     float4x4 m = 0;
     [unroll] for (uint k = 0; k < 8; k++)
-        m += Bone((s.bones[k / 4] >> (k % 4 * 8)) & 0xFF) * w[k];
+        m += Bone(palette + ((s.bones[k / 4] >> (k % 4 * 8)) & 0xFF)) * w[k];
     return m;
+}
+
+// Where a point was on screen last frame (last: its clip position then), in pixels from where it is now ('at').
+float2 MotionOf(float4 last, float2 at)
+{
+    return last.w > 0 ? (last.xy / last.w * float2(0.5, -0.5) + 0.5) * ViewportSize - at : 1e5; // behind the camera: no history
 }
 
 // Row 0 of Hikari's materials, undyed. Such items take the configured fur colour so an outfit matches the coat (unless
@@ -276,6 +290,9 @@ VsOut VSMain(uint vid : SV_VertexID, uint instance : SV_InstanceID)
     VsOut o;
     o.world = p + sideDir * side * halfWidth;
     o.pos = mul(float4(o.world, 1), ViewProj);
+    float4x4 last = float4x4(float4(sm.l0, 0), float4(sm.l1, 0), float4(sm.l2, 0), float4(sm.l3, 1));
+    float3 lastPoint = PointWorld(strand, i, last, rootModel, mul(float4(rootModel, 1), last).xyz, lengthFactor);
+    o.lastClip = mul(float4(lastPoint + o.world - p, 1), LastViewProj);
     o.tangent = tangent;
     o.growth = length(tip) > 1e-6 ? normalize(tip) : tangent;
     float4 rootClip = mul(float4(rootWorld, 1), ViewProj);
@@ -357,9 +374,10 @@ void CSStrandMatrices(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex
     if (index == 0)
         groupVisible = 0;
     GroupMemoryBarrierWithGroupSync();
-    float4x4 m = SkinMatrix(Skins[id.x]);
+    float4x4 m = SkinMatrix(Skins[id.x], 0), last = SkinMatrix(Skins[id.x], MaxBones);
     StrandMatrix o;
     o.r0 = m[0].xyz; o.r1 = m[1].xyz; o.r2 = m[2].xyz; o.r3 = m[3].xyz;
+    o.l0 = last[0].xyz; o.l1 = last[1].xyz; o.l2 = last[2].xyz; o.l3 = last[3].xyz;
     uint2 surface = StrandSurfaces[id.x];
     float brightest;
     float4 c = SurfaceColor(surface.x, UnpackUv(surface.y), 0, 0, brightest);
@@ -518,14 +536,16 @@ struct UnderOut
     float3 normal : NORMAL;
     nointerpolation uint material : MATERIAL; // as MeshSurfaces.x
     float2 uv : TEXCOORD;
+    float4 lastClip : LASTCLIP; // clip position last frame
 };
 
 UnderOut VSUnder(uint vid : SV_VertexID)
 {
     MeshVertex v = MeshVertices[vid];
-    float4x4 m = SkinMatrix(MeshSkins[vid]);
+    float4x4 m = SkinMatrix(MeshSkins[vid], 0);
     UnderOut o;
     o.world = mul(float4(v.position, 1), m).xyz;
+    o.lastClip = mul(float4(mul(float4(v.position, 1), SkinMatrix(MeshSkins[vid], MaxBones)).xyz, 1), LastViewProj);
     o.normal = mul(float4(v.normal, 0), m).xyz;
     o.pos = mul(float4(o.world, 1), ViewProj);
     uint2 surface = MeshSurfaces[vid];
@@ -534,8 +554,9 @@ UnderOut VSUnder(uint vid : SV_VertexID)
     return o;
 }
 
-float4 PSUnder(UnderOut i) : SV_Target
+float4 PSUnder(UnderOut i, out float2 motion : SV_Target1) : SV_Target
 {
+    motion = MotionOf(i.lastClip, i.pos.xy);
     if (BehindScene(i.pos))
         discard;
     float3 n = normalize(i.normal);
@@ -562,9 +583,10 @@ float2 PSSurfaceLight(UnderOut i) : SV_Target
     return float2(s.x, 1);
 }
 
-float4 PSMain(VsOut i, uint geometry : SV_Coverage, out uint coverage : SV_Coverage) : SV_Target
+float4 PSMain(VsOut i, uint geometry : SV_Coverage, out uint coverage : SV_Coverage, out float2 motion : SV_Target1) : SV_Target
 {
     coverage = 0xFF;
+    motion = MotionOf(i.lastClip, i.pos.xy);
     if (BehindScene(i.pos))
         discard;
     if (DebugSolid != 0)
@@ -627,6 +649,54 @@ float4 VSComposite(uint vid : SV_VertexID) : SV_Position
 float4 PSComposite(float4 pos : SV_Position) : SV_Target
 {
     return FurLayer.Load(int3(pos.xy, 0));
+}
+
+// FurHistory at 'at' (pixels) through a Catmull-Rom filter in 9 bilinear taps: bilinear alone, repeated every frame the fur
+// moves, blurs it within a few frames.
+float4 HistoryAt(float2 at)
+{
+    float2 texel1 = floor(at - 0.5) + 0.5, f = at - texel1;
+    float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f)), w3 = f * f * (-0.5 + 0.5 * f);
+    float2 w12 = w1 + w2;
+    float2 x[3] = { texel1 - 1, texel1 + w2 / w12, texel1 + 2 }, w[3] = { w0, w12, w3 };
+    float4 sum = 0;
+    [unroll] for (int k = 0; k < 9; k++)
+        sum += FurHistory.SampleLevel(LinearClamp, float2(x[k % 3].x, x[k / 3].y) / ViewportSize, 0) * w[k % 3].x * w[k / 3].y;
+    return sum;
+}
+
+// Strands are thinner than a pixel, so their samples change with any sub-pixel movement and the tips twinkle. The fur is drawn
+// after the game's own temporal AA (DLSS, TSCMAA), so the layer gets its own: blended with the last frame's result where the
+// nearest fur around the pixel was then (Motion), clipped to this frame's 3x3 neighbourhood (mean +- one deviation) so what
+// was hidden or uncovered leaves no trail.
+float4 PSTemporal(float4 pos : SV_Position) : SV_Target
+{
+    int2 p = int2(pos.xy);
+    float4 current = FurLayer.Load(int3(p, 0));
+    if (TemporalBlend >= 1)
+        return current;
+    float4 sum = 0, squares = 0, lo = 1e9, hi = -1e9;
+    float2 motion = 0;
+    float nearestDistance = 1e30;
+    [unroll] for (int k = 0; k < 9; k++)
+    {
+        int2 q = clamp(p + int2(k % 3 - 1, k / 3 - 1), 0, int2(ViewportSize) - 1);
+        float4 c = FurLayer.Load(int3(q, 0));
+        sum += c; squares += c * c; lo = min(lo, c); hi = max(hi, c);
+        float d = FurDepth.Load(q, 0);
+        if (c.a > 0 && LinearDepth(d) < nearestDistance)
+        {
+            nearestDistance = LinearDepth(d);
+            motion = Motion.Load(q, 0);
+        }
+    }
+    float2 at = pos.xy + motion;
+    if (any(at < 0) || any(at >= ViewportSize))
+        return current; // off-screen last frame
+    float4 mean = sum / 9, deviation = sqrt(max(squares / 9 - mean * mean, 0));
+    float4 history = clamp(HistoryAt(at), max(mean - deviation, lo), min(mean + deviation, hi));
+    return lerp(history, current, TemporalBlend);
 }
 
 // Writes the nearest fur depth into the game's depth buffer where the fur is at least half opaque. Without it ReShade's
