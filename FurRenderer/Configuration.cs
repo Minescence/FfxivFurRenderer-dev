@@ -59,6 +59,8 @@ public sealed class Configuration : IPluginConfiguration
     public float AgxToneMap { get; set; } = 1f;
 
     public bool UseSceneDepth { get; set; } = true;
+    /// <summary>Skip strands outside the view or hidden behind the scene (the character's own body included) before drawing.</summary>
+    public bool CullHiddenStrands { get; set; } = true;
     /// <summary>
     /// Where to draw in the game's render commands: -1 = auto (first back-buffer bind that uses scene depth: after the scene is
     /// composited, before nameplates/UI), N = right after the Nth back-buffer bind, 0 = at Present (over the UI).

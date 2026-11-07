@@ -677,6 +677,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             ImGui.SameLine();
             if (ImGui.Button("Run injection self-test") && testCases == null) StartSelfTest();
             changed |= Check("Occlude with scene depth", () => config.UseSceneDepth, v => config.UseSceneDepth = v);
+            changed |= Check("Skip hidden strands", () => config.CullHiddenStrands, v => config.CullHiddenStrands = v);
             changed |= Slider("Depth bias (m)", () => config.DepthBiasMeters, v => config.DepthBiasMeters = v, 0f, 0.1f);
             changed |= Slider("Depth UV scale (0 = auto)", () => config.DepthUvScaleOverride, v => config.DepthUvScaleOverride = v, 0f, 2f);
             changed |= Check("Debug: solid magenta", () => config.DebugSolid, v => config.DebugSolid = v);

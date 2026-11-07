@@ -42,6 +42,15 @@ Texture2D<float4> ColorTable0 : register(t13);
 Texture2D<float4> ColorTable1 : register(t14);
 Texture2D<float4> ColorTable2 : register(t15);
 Texture2D<float4> ColorTable3 : register(t16);
+// Culling: CSStrandMatrices lists the baked strands that can show, VSMain draws only those (DrawInstancedIndirect).
+StructuredBuffer<uint> VisibleStrands : register(t17);      // in no particular order
+RWStructuredBuffer<uint> VisibleStrandsOut : register(u2);
+RWByteAddressBuffer DrawArgs : register(u1);                // DrawInstancedIndirect arguments; this item's InstanceCount at ArgsOffset + 4
+// Hi-Z: mip L holds the farthest scene view distance over 2^(L+1) x 2^(L+1) scene depth texels; mip 0 is a power of two at
+// least half the depth size, and texels past the depth's edge hold open sky.
+Texture2D<float> HiZ : register(t18);
+Texture2D<float> HiZSource : register(t19);                 // the mip below the one being built
+RWTexture2D<float> HiZDest : register(u3);
 
 cbuffer Frame : register(b0)
 {
@@ -58,7 +67,8 @@ cbuffer Frame : register(b0)
     float SurfaceLighting; float SceneLighting; float SceneGain; uint HasSceneColor;
     float Exposure;        float AgxToneMap;   uint ChildCount;   float ChildSpread;   // ChildCount strands drawn per baked strand
     float Absorption;      float FacingDepth;  float CoverageScale; uint SampleCount;          // AgxToneMap: 0 = gamma only, 1 = AgX like the reference render   // SceneLighting: 0 = synthetic only, 1 = colour/light from the game's lit coat             // 0 = pure Kajiya-Kay, 1 = soft lighting from the growth direction
-    float UndercoatDarken; uint TableMask;     float2 Padding;   // TableMask: bit k = ColorTable<k> is bound
+    float UndercoatDarken; uint TableMask;     uint DrawnStrands; uint CullFlags;   // TableMask: bit k = ColorTable<k> is bound
+    uint2 HiZSize;         uint HiZLevels;     uint ArgsOffset;   // CullFlags: 1 = outside the view, 2 = behind the scene (Hi-Z)
 };
 
 struct VsOut
@@ -118,19 +128,6 @@ float4 SurfaceColor(uint material)
     return result;
 }
 
-// SkinMatrix and colour per baked strand, once per frame instead of in each of its children's 8 vertices. Threads of the last
-// group past the buffer's end read zeros and their writes are dropped (out-of-bounds UAV writes are discarded).
-[numthreads(64, 1, 1)]
-void CSStrandMatrices(uint3 id : SV_DispatchThreadID)
-{
-    float4x4 m = SkinMatrix(Skins[id.x]);
-    StrandMatrix o;
-    o.r0 = m[0].xyz; o.r1 = m[1].xyz; o.r2 = m[2].xyz; o.r3 = m[3].xyz;
-    float4 c = SurfaceColor(StrandMaterials[id.x]);
-    o.color = uint2(f32tof16(c.r) | f32tof16(c.g) << 16, f32tof16(c.b) | f32tof16(c.a) << 16);
-    StrandMatricesOut[id.x] = o;
-}
-
 uint HashU(uint3 v)
 {
     v = v * 1664525u + 1013904223u;
@@ -162,7 +159,7 @@ VsOut VSMain(uint vid : SV_VertexID, uint instance : SV_InstanceID)
     float side = (vid & 1) ? 1.0 : -1.0;
     // The asset is baked at a tenth of the reference's interpolated-child density; extra children copy their parent's shape
     // from a root moved randomly across the surface (perpendicular to the parent), with some length variation.
-    uint strand = instance / ChildCount, child = instance % ChildCount;
+    uint strand = VisibleStrands[instance / ChildCount], child = instance % ChildCount;
     float3 rootModel = Points[strand * 4].xyz;
     float lengthFactor = 1.0;
     if (child > 0)
@@ -209,7 +206,8 @@ VsOut VSMain(uint vid : SV_VertexID, uint instance : SV_InstanceID)
     o.root = float3((rootClip.xy / rootClip.w * float2(0.5, -0.5) + 0.5) * ViewportSize, rootClip.w);
     o.t = t;
     o.coverage = saturate(cover);
-    o.strand = instance;
+    // Not the instance: the visible list's order changes every frame, and the strand's jitter and dither hash this.
+    o.strand = strand * ChildCount + child;
     o.surface = float4(f16tof32(sm.color.x), f16tof32(sm.color.x >> 16), f16tof32(sm.color.y), f16tof32(sm.color.y >> 16));
     return o;
 }
@@ -218,6 +216,104 @@ VsOut VSMain(uint vid : SV_VertexID, uint instance : SV_InstanceID)
 float LinearDepth(float d)
 {
     return abs(Proj._43 / (d * Proj._34 - Proj._33));
+}
+
+// Whether any of a baked strand's drawn copies can show: inside the view, and not behind the farthest scene depth over the
+// screen rectangle that bounds them. Conservative; PSMain's BehindScene still decides each pixel.
+bool StrandVisible(uint strand, float4x4 m)
+{
+    if ((CullFlags & 1) == 0)
+        return true;
+    float3 rootModel = Points[strand * 4].xyz;
+    float3 grown = mul(float4(Points[strand * 4 + 3].xyz - rootModel, 0), m).xyz * LengthScale; // root to tip, world
+    float scale = max(length(m[0].xyz), max(length(m[1].xyz), length(m[2].xyz)));
+    // Copies are up to 1.1x as long and root up to ChildSpread away; ribbons widen up to 3x end-on or by CoverageScale
+    // (MinPixelWidth is added on screen below). Straight strands fit a sphere around their middle; droop bends a strand but
+    // keeps its length, so drooping ones need one around the root.
+    float reach = Gravity > 0 ? 1.1 : 0.55;
+    float radius = length(grown) * reach + (ChildSpread + Points[strand * 4].w * WidthScale * max(3.0, CoverageScale)) * scale;
+    float4 c = mul(float4(mul(float4(rootModel, 1), m).xyz + grown * (1.1 - reach), 1), ViewProj);
+    float nearest = c.w - radius;
+    if (nearest <= 0.2) // reaches the game's near plane (0.1 m) or behind the camera: projected bounds don't hold
+        return true;
+    // The sphere's exact screen bounds, from the tangents in view space (the game's projection is symmetric, no offset).
+    float2 v = c.xy / float2(Proj._11, Proj._22);
+    float denominator = c.w * c.w - radius * radius;
+    float2 t = sqrt(v * v + denominator);
+    float2 lo = (v * c.w - radius * t) / denominator * float2(Proj._11, Proj._22);
+    float2 hi = (v * c.w + radius * t) / denominator * float2(Proj._11, Proj._22);
+    float margin = 1.5 * MinPixelWidth + 1.0;
+    float2 pmin = float2(lo.x * 0.5 + 0.5, 0.5 - hi.y * 0.5) * ViewportSize - margin;
+    float2 pmax = float2(hi.x * 0.5 + 0.5, 0.5 - lo.y * 0.5) * ViewportSize + margin;
+    if (any(pmax < 0) || any(pmin >= ViewportSize))
+        return false;
+    if ((CullFlags & 2) == 0)
+        return true;
+    // In depth texels, then the level where the rectangle spans at most 4 x 4 texels (or the 1 x 1 top, which covers all).
+    // 2 x 2 at a level twice as coarse kept every strand within ~128 px of a silhouette at 3 m.
+    float2 dmin = max(pmin, 0) * DepthUvScale, dmax = min(pmax, ViewportSize - 1) * DepthUvScale;
+    float extent = max(max(dmax.x - dmin.x, dmax.y - dmin.y), 1.0);
+    uint level = min((uint)max(ceil(log2(extent / 3.0)) - 1.0, 0.0), HiZLevels - 1);
+    uint2 a = (uint2)dmin >> (level + 1), b = (uint2)dmax >> (level + 1), last = max(HiZSize >> level, 1u) - 1;
+    float farthest = 0;
+    [unroll] for (uint y = 0; y < 4; y++)
+        [unroll] for (uint x = 0; x < 4; x++)
+            farthest = max(farthest, HiZ.Load(int3(min(min(a + uint2(x, y), b), last), level)));
+    return nearest <= farthest + DepthBiasMeters;
+}
+
+groupshared uint groupVisible, groupFirst;
+
+// SkinMatrix and colour per baked strand, once per frame instead of in each of its children's 8 vertices, and the list of
+// strands to draw. Threads of the last group past the buffer's end read zeros and their writes are dropped (out-of-bounds UAV
+// writes are discarded).
+[numthreads(64, 1, 1)]
+void CSStrandMatrices(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
+{
+    if (index == 0)
+        groupVisible = 0;
+    GroupMemoryBarrierWithGroupSync();
+    float4x4 m = SkinMatrix(Skins[id.x]);
+    StrandMatrix o;
+    o.r0 = m[0].xyz; o.r1 = m[1].xyz; o.r2 = m[2].xyz; o.r3 = m[3].xyz;
+    float4 c = SurfaceColor(StrandMaterials[id.x]);
+    o.color = uint2(f32tof16(c.r) | f32tof16(c.g) << 16, f32tof16(c.b) | f32tof16(c.a) << 16);
+    StrandMatricesOut[id.x] = o;
+    // One atomic on the draw arguments per group, not per strand.
+    bool visible = id.x < DrawnStrands && StrandVisible(id.x, m);
+    uint slot = 0;
+    if (visible)
+        InterlockedAdd(groupVisible, 1, slot);
+    GroupMemoryBarrierWithGroupSync();
+    if (index == 0)
+        DrawArgs.InterlockedAdd(ArgsOffset + 4, groupVisible * ChildCount, groupFirst);
+    GroupMemoryBarrierWithGroupSync();
+    if (visible)
+        VisibleStrandsOut[groupFirst / ChildCount + slot] = id.x;
+}
+
+// Hi-Z mip 0 from the scene depth (sky and texels past its edge are infinitely far), then each mip from the one below.
+[numthreads(8, 8, 1)]
+void CSHiZFirst(uint3 id : SV_DispatchThreadID)
+{
+    uint w, h;
+    SceneDepth.GetDimensions(w, h);
+    float farthest = 0;
+    [unroll] for (uint k = 0; k < 4; k++)
+    {
+        uint2 p = id.xy * 2 + uint2(k & 1, k >> 1);
+        farthest = max(farthest, all(p < uint2(w, h)) ? LinearDepth(SceneDepth.Load(int3(p, 0))) : 1e30);
+    }
+    HiZDest[id.xy] = farthest;
+}
+
+[numthreads(8, 8, 1)]
+void CSHiZDown(uint3 id : SV_DispatchThreadID)
+{
+    float farthest = 0;
+    [unroll] for (uint k = 0; k < 4; k++)
+        farthest = max(farthest, HiZSource.Load(int3(id.xy * 2 + uint2(k & 1, k >> 1), 0)));
+    HiZDest[id.xy] = farthest;
 }
 
 // Blender's AgX view transform (the reference render's), minimal fit by bwrensch / iolite-engine.com. Linear Rec.709 in,
