@@ -30,13 +30,14 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private readonly Dictionary<string, FurItem> items = []; // by model, enabled submeshes and wearer race; main thread
     private readonly List<FurItem> retiring = [];
     private readonly ConcurrentQueue<FurItem> retiredItems = new();
-    private readonly List<nint> replacedTables = [];
-    private readonly ConcurrentQueue<nint> releasedTables = new(); // colour tables the render thread releases, like retiredItems
+    private readonly List<nint> replacedTextures = [];
+    private readonly ConcurrentQueue<nint> releasedTextures = new(); // material textures the render thread releases, like retiredItems
     private bool reloadItems;
     private int frame;
     private float lodFocal; // render thread: the projection's vertical focal length outside GPose
 
     private const int RetireAfterFrames = 300;
+    private const uint SamplerIndex = 0x565F8FD8, SamplerDiffuse = 0x115306BE; // CRC32 of the shader names g_SamplerIndex, g_SamplerDiffuse
 
     /// <summary>A fur-bearing model: growing, or ready to draw.</summary>
     private sealed class FurItem
@@ -48,15 +49,16 @@ public sealed unsafe class Plugin : IDalamudPlugin
         public int StrandCount;
         public readonly BoneLookup Lookup = new();
         public int LastUsed;
-        // The fur materials' live colour tables (SRVs), AddRef'd so a replaced table's address can't be reused while it is
-        // held: a pointer change is always a new table. Main thread; the render thread releases them.
-        public readonly nint[] Tables = new nint[Renderer.MaxMaterials];
-        public readonly nint[] LoggedTables = new nint[Renderer.MaxMaterials]; // render thread
+        // The fur materials' live colour tables, index and diffuse maps (SRVs, laid out as FurDraw.Textures), AddRef'd so a
+        // replaced one's address can't be reused while it is held: a pointer change is always a new texture. Main thread; the
+        // render thread releases them.
+        public readonly nint[] Textures = new nint[Renderer.MaterialTextures];
+        public readonly nint[] LoggedTextures = new nint[Renderer.MaterialTextures]; // render thread
         public volatile FurAsset? Upload; // held for the render thread, then dropped: the strands stay on the GPU only
         public Renderer.FurBuffers? Buffers; // render thread
     }
 
-    private readonly record struct ItemDraw(FurItem Item, Matrix4x4[] Skin, nint[] Tables, Vector3? Position);
+    private readonly record struct ItemDraw(FurItem Item, Matrix4x4[] Skin, nint[] Textures, Vector3? Position);
 
     /// <summary>Main-thread state for one frame, consumed by the render thread.</summary>
     private sealed class FrameSnapshot
@@ -222,8 +224,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
         // Only now: the render thread frees these before it reads the snapshot, so it can't still be drawing them.
         foreach (var item in retiring) retiredItems.Enqueue(item);
         retiring.Clear();
-        foreach (var table in replacedTables) releasedTables.Enqueue(table);
-        replacedTables.Clear();
+        foreach (var table in replacedTextures) releasedTextures.Enqueue(table);
+        replacedTextures.Clear();
         if (testCases != null) StepSelfTest();
         var debugResult = debugCapture.Tick(
             () => interop.TryGetDevice(out _, out var c) && interop.TryGetBackBuffer(out var b) ? ((nint)c, (nint)b) : null,
@@ -498,26 +500,35 @@ public sealed unsafe class Plugin : IDalamudPlugin
         if (missing > 0) Diag("bones " + item.Name, $"missing {missing}/{bones}");
         snap.Bones += bones;
         snap.MissingBones += missing;
-        // The k-th table belongs to the k-th set bit of furMaterials: the rank FurGrower gives each strand.
+        // The k-th textures belong to the k-th set bit of furMaterials: the rank FurGrower gives each strand.
         var material = -1;
         for (var k = 0; k < Renderer.MaxMaterials; k++)
         {
             do material++; while (material < 32 && (furMaterials >> material & 1) == 0);
-            var table = material < 32 ? (nint)interop.GetColorTable(character, slot, material) : 0;
-            if (table == item.Tables[k]) continue;
-            if (table != 0) ((ID3D11ShaderResourceView*)table)->AddRef();
-            if (item.Tables[k] != 0) replacedTables.Add(item.Tables[k]);
-            item.Tables[k] = table;
+            for (var kind = 0; kind < 3; kind++)
+            {
+                var texture = material >= 32 ? 0 : kind switch
+                {
+                    0 => (nint)interop.GetColorTable(character, slot, material),
+                    1 => (nint)interop.GetMaterialTexture(character, slot, material, SamplerIndex),
+                    _ => (nint)interop.GetMaterialTexture(character, slot, material, SamplerDiffuse),
+                };
+                var at = kind * Renderer.MaxMaterials + k;
+                if (texture == item.Textures[at]) continue;
+                if (texture != 0) ((ID3D11ShaderResourceView*)texture)->AddRef();
+                if (item.Textures[at] != 0) replacedTextures.Add(item.Textures[at]);
+                item.Textures[at] = texture;
+            }
         }
-        snap.Items.Add(new ItemDraw(item, skin, (nint[])item.Tables.Clone(), interop.GetRootPosition(character)));
+        snap.Items.Add(new ItemDraw(item, skin, (nint[])item.Textures.Clone(), interop.GetRootPosition(character)));
     }
 
-    private static void ReleaseTables(FurItem item)
+    private static void ReleaseTextures(FurItem item)
     {
-        for (var k = 0; k < item.Tables.Length; k++)
+        for (var k = 0; k < item.Textures.Length; k++)
         {
-            if (item.Tables[k] != 0) ((ID3D11ShaderResourceView*)item.Tables[k])->Release();
-            item.Tables[k] = 0;
+            if (item.Textures[k] != 0) ((ID3D11ShaderResourceView*)item.Textures[k])->Release();
+            item.Textures[k] = 0;
         }
     }
 
@@ -527,9 +538,9 @@ public sealed unsafe class Plugin : IDalamudPlugin
         while (retiredItems.TryDequeue(out var retired))
         {
             retired.Buffers?.Dispose();
-            ReleaseTables(retired);
+            ReleaseTextures(retired);
         }
-        while (releasedTables.TryDequeue(out var table)) ((ID3D11ShaderResourceView*)table)->Release();
+        while (releasedTextures.TryDequeue(out var table)) ((ID3D11ShaderResourceView*)table)->Release();
         if (!config.Enabled) { status = "disabled"; return; }
         var gpose = FFXIVClientStructs.FFXIV.Client.Game.GameMain.IsInGPose();
         if (config.OnlyInGpose && !gpose) { status = "waiting for GPose"; return; }
@@ -553,14 +564,19 @@ public sealed unsafe class Plugin : IDalamudPlugin
         // Distances as at the normal field of view: GPose zoom (a narrower one) makes items bigger on screen.
         if (!snap.Gpose) lodFocal = snap.Proj.M22;
         var zoom = snap.Gpose && lodFocal > 0 ? snap.Proj.M22 / lodFocal : 1f;
-        foreach (var (item, skin, tables, position) in snap.Items)
+        foreach (var (item, skin, textures, position) in snap.Items)
         {
-            for (var k = 0; k < tables.Length; k++)
+            for (var k = 0; k < textures.Length; k++)
             {
-                if (tables[k] == item.LoggedTables[k]) continue;
-                item.LoggedTables[k] = tables[k];
-                Diag($"colour {item.Name} {k}", tables[k] == 0 ? "no table: fur colour"
-                    : $"table row 0 {renderer.ReadTableDiffuse(context, (ID3D11ShaderResourceView*)tables[k])?.ToString() ?? "unreadable"}");
+                if (textures[k] == item.LoggedTextures[k]) continue;
+                item.LoggedTextures[k] = textures[k];
+                var (kind, rank) = Math.DivRem(k, Renderer.MaxMaterials);
+                Diag($"colour {item.Name} {rank} {kind}", kind switch
+                {
+                    _ when textures[k] == 0 => kind == 0 ? "no table: fur colour" : $"no {(kind == 1 ? "index" : "diffuse")} map",
+                    0 => $"table row 0 {renderer.ReadTableDiffuse(context, (ID3D11ShaderResourceView*)textures[k])?.ToString() ?? "unreadable"}",
+                    _ => $"{(kind == 1 ? "index" : "diffuse")} map {Renderer.Describe((ID3D11ShaderResourceView*)textures[k])}",
+                });
             }
             if (item.Upload is { } asset)
             {
@@ -575,7 +591,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 var distance = Vector3.Distance(invView.Translation, p) / zoom;
                 if (distance > config.LodDistance) itemDensity *= Math.Max(config.LodMinDensity, config.LodDistance / distance);
             }
-            draws.Add(new FurDraw(buffers, skin, tables, itemDensity));
+            draws.Add(new FurDraw(buffers, skin, textures, itemDensity));
             strands += item.StrandCount;
             drawnStrands += (int)(item.StrandCount * itemDensity);
         }
@@ -830,10 +846,10 @@ public sealed unsafe class Plugin : IDalamudPlugin
         while (Volatile.Read(ref detoursRunning) > 0 && waited.ElapsedMilliseconds < 10000) Thread.Sleep(1); // the first draw compiles the shaders
         setTargetHook?.Dispose();
         commandManager.RemoveHandler(CommandName);
-        foreach (var item in items.Values.Concat(retiring)) { item.Buffers?.Dispose(); ReleaseTables(item); }
-        while (retiredItems.TryDequeue(out var retired)) { retired.Buffers?.Dispose(); ReleaseTables(retired); }
-        foreach (var table in replacedTables) releasedTables.Enqueue(table);
-        while (releasedTables.TryDequeue(out var table)) ((ID3D11ShaderResourceView*)table)->Release();
+        foreach (var item in items.Values.Concat(retiring)) { item.Buffers?.Dispose(); ReleaseTextures(item); }
+        while (retiredItems.TryDequeue(out var retired)) { retired.Buffers?.Dispose(); ReleaseTextures(retired); }
+        foreach (var table in replacedTextures) releasedTextures.Enqueue(table);
+        while (releasedTextures.TryDequeue(out var table)) ((ID3D11ShaderResourceView*)table)->Release();
         renderer?.Dispose();
         (interop as IDisposable)?.Dispose();
     }

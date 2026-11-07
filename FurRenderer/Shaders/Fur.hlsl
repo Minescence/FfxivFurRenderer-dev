@@ -36,12 +36,25 @@ RWStructuredBuffer<StrandMatrix> StrandMatricesOut : register(u0);
 Texture2D<float2> SurfaceLight : register(t11);       // 1/8 size with mips: the fur surface's luminance x coverage, coverage
 SamplerState LinearClamp : register(s0);
 Texture2D<float4> SceneColor : register(t10);         // copy of the lit frame (display-encoded) taken just before drawing
-StructuredBuffer<uint> StrandMaterials : register(t12); // per strand: which of the item's fur materials colours it
+// Per strand root / undercoat vertex: x = rank of its fur material among the item's | 0x10000 when y holds its UV (u | v << 16,
+// halves). Baked assets have no UVs.
+StructuredBuffer<uint2> StrandSurfaces : register(t12);
+StructuredBuffer<uint2> MeshSurfaces : register(t20);
 // The live colour tables of the item's fur materials (dye applied): R16G16B16A16_FLOAT, row r's diffuse at texel (0, r).
 Texture2D<float4> ColorTable0 : register(t13);
 Texture2D<float4> ColorTable1 : register(t14);
 Texture2D<float4> ColorTable2 : register(t15);
 Texture2D<float4> ColorTable3 : register(t16);
+// Their index maps (which table rows colour each texel) and diffuse maps.
+Texture2D<float4> IndexMap0 : register(t21);
+Texture2D<float4> IndexMap1 : register(t22);
+Texture2D<float4> IndexMap2 : register(t23);
+Texture2D<float4> IndexMap3 : register(t24);
+Texture2D<float4> DiffuseMap0 : register(t25);
+Texture2D<float4> DiffuseMap1 : register(t26);
+Texture2D<float4> DiffuseMap2 : register(t27);
+Texture2D<float4> DiffuseMap3 : register(t28);
+SamplerState LinearWrap : register(s1);
 // Culling: CSStrandMatrices lists the baked strands that can show, VSMain draws only those (DrawInstancedIndirect).
 StructuredBuffer<uint> VisibleStrands : register(t17);      // in no particular order
 RWStructuredBuffer<uint> VisibleStrandsOut : register(u2);
@@ -67,7 +80,7 @@ cbuffer Frame : register(b0)
     float SurfaceLighting; float SceneLighting; float SceneGain; uint HasSceneColor;
     float Exposure;        float AgxToneMap;   uint ChildCount;   float ChildSpread;   // ChildCount strands drawn per baked strand
     float Absorption;      float FacingDepth;  float CoverageScale; uint SampleCount;          // AgxToneMap: 0 = gamma only, 1 = AgX like the reference render   // SceneLighting: 0 = synthetic only, 1 = colour/light from the game's lit coat             // 0 = pure Kajiya-Kay, 1 = soft lighting from the growth direction
-    float UndercoatDarken; uint TableMask;     uint DrawnStrands; uint CullFlags;   // TableMask: bit k = ColorTable<k> is bound
+    float UndercoatDarken; uint TableMask;     uint DrawnStrands; uint CullFlags;   // TableMask: bit k / 4 + k / 8 + k = ColorTable<k> / IndexMap<k> / DiffuseMap<k> is bound
     uint2 HiZSize;         uint HiZLevels;     uint ArgsOffset;   // CullFlags: 1 = outside the view, 2 = behind the scene (Hi-Z)
 };
 
@@ -103,29 +116,73 @@ float4x4 SkinMatrix(SkinData s)
 static const float3 UndyedFur = float3(0.984, 0.615, 0.603);
 static const float3 Luminance = float3(0.2126, 0.7152, 0.0722);
 
-// Fur colour of one of the item's materials (rgb), read live so dyes and colour-table edits show the next frame, and its
-// scene light gain (a). SceneLit reads the light off the game's own lit item, dye included: without the gain a dark dye
-// darkens the fur twice, as its colour and again as less light. Capped because a near-black item's pixels are mostly
-// sheen, which no dye darkens.
-float4 SurfaceColor(uint material)
+float3 TableRow(Texture2D<float4> table, uint row)
 {
-    material = min(material, 3u); // an item's fifth fur material and up share the fourth's table
-    float4 result = float4(BaseColor, 1);
-    [branch] if ((TableMask >> material) & 1)
+    uint w, h;
+    table.GetDimensions(w, h);
+    return table.Load(int3(0, min(row, h - 1), 0)).rgb; // Dawntrail tables have 32 rows, older ones 16
+}
+
+// See SurfaceColor. 'mask' bits: 1 = the table is bound, 16 = the index map, 256 = the diffuse map.
+float4 MaterialColor(Texture2D<float4> table, Texture2D<float4> index, Texture2D<float4> diffuse, uint mask, bool mapped, float2 uv, float2 dx, float2 dy)
+{
+    // As the game's character shaders: the index map's red picks a pair of table rows and its green blends them (row 0 without
+    // one; every installed fur material's fur_id selects row 0 on all texels), times the diffuse map squared.
+    float3 row = UndyedFur;
+    if (mask & 1)
     {
-        // Every installed fur material's fur_id selects row 0 on all texels.
-        float3 row = 0;
-        switch (material)
+        uint pair = 0;
+        float blend = 0;
+        if (mapped && (mask & 16))
         {
-            case 0: row = ColorTable0.Load(int3(0, 0, 0)).rgb; break;
-            case 1: row = ColorTable1.Load(int3(0, 0, 0)).rgb; break;
-            case 2: row = ColorTable2.Load(int3(0, 0, 0)).rgb; break;
-            default: row = ColorTable3.Load(int3(0, 0, 0)).rgb; break;
+            uint w, h;
+            index.GetDimensions(w, h);
+            float2 id = index.Load(int3(frac(uv) * float2(w, h), 0)).rg;
+            pair = (uint)round(id.r * 255.0 / 17.0);
+            blend = 1.0 - id.g;
         }
-        if (distance(row, UndyedFur) > 0.02)
-            result = float4(row, min(dot(UndyedFur, Luminance) / max(dot(row, Luminance), 1e-3), 16.0));
+        row = lerp(TableRow(table, pair * 2), TableRow(table, pair * 2 + 1), blend);
+    }
+    float3 tint = 1;
+    if (mapped && (mask & 256))
+    {
+        uint w, h, levels;
+        diffuse.GetDimensions(0, w, h, levels);
+        float3 d = diffuse.SampleGrad(LinearWrap, uv, dx, dy).rgb;
+        float3 mean = diffuse.SampleLevel(LinearWrap, float2(0.5, 0.5), levels - 1).rgb; // the smallest mip
+        // Over the map's mean, so it varies the colour without changing its average.
+        tint = d * d / max(dot(mean * mean, Luminance), 1e-3);
+    }
+    float3 game = row * tint; // what the game draws there
+    float3 color = (mask & 1) && distance(row, UndyedFur) > 0.02 ? row : BaseColor;
+    return float4(color * tint, min(dot(UndyedFur, Luminance) / max(dot(game, Luminance), 1e-3), 16.0));
+}
+
+// Fur colour (rgb) at a point of the item's surface: its fur material ('material', as StrandSurfaces.x) at 'uv', read live so
+// dyes and colour-table edits show the next frame. And its scene light gain (a): SceneLit reads the light off the game's own
+// lit item, dye and texture included, so without the gain a dark dye darkens the fur twice, as its colour and again as less
+// light. It also takes the texture's brightness back out: SceneLit's taps already hold it, averaged, and twice would square
+// its contrast. Capped because a near-black item's pixels are mostly sheen, which no dye darkens. dx, dy: uv's screen
+// derivatives (0 = the finest mip).
+float4 SurfaceColor(uint material, float2 uv, float2 dx, float2 dy)
+{
+    bool mapped = (material & 0x10000) != 0;
+    material = min(material & 0xFFFF, 3u); // an item's fifth fur material and up share the fourth's textures
+    uint mask = TableMask >> material;
+    float4 result = 0;
+    switch (material)
+    {
+        case 0: result = MaterialColor(ColorTable0, IndexMap0, DiffuseMap0, mask, mapped, uv, dx, dy); break;
+        case 1: result = MaterialColor(ColorTable1, IndexMap1, DiffuseMap1, mask, mapped, uv, dx, dy); break;
+        case 2: result = MaterialColor(ColorTable2, IndexMap2, DiffuseMap2, mask, mapped, uv, dx, dy); break;
+        default: result = MaterialColor(ColorTable3, IndexMap3, DiffuseMap3, mask, mapped, uv, dx, dy); break;
     }
     return result;
+}
+
+float2 UnpackUv(uint packed)
+{
+    return float2(f16tof32(packed), f16tof32(packed >> 16));
 }
 
 uint HashU(uint3 v)
@@ -276,7 +333,8 @@ void CSStrandMatrices(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex
     float4x4 m = SkinMatrix(Skins[id.x]);
     StrandMatrix o;
     o.r0 = m[0].xyz; o.r1 = m[1].xyz; o.r2 = m[2].xyz; o.r3 = m[3].xyz;
-    float4 c = SurfaceColor(StrandMaterials[id.x]);
+    uint2 surface = StrandSurfaces[id.x];
+    float4 c = SurfaceColor(surface.x, UnpackUv(surface.y), 0, 0);
     o.color = uint2(f32tof16(c.r) | f32tof16(c.g) << 16, f32tof16(c.b) | f32tof16(c.a) << 16);
     StrandMatricesOut[id.x] = o;
     // One atomic on the draw arguments per group, not per strand.
@@ -414,6 +472,8 @@ struct UnderOut
     float4 pos : SV_Position;
     float3 world : WORLDPOS;
     float3 normal : NORMAL;
+    nointerpolation uint material : MATERIAL; // as MeshSurfaces.x
+    float2 uv : TEXCOORD;
 };
 
 UnderOut VSUnder(uint vid : SV_VertexID)
@@ -424,6 +484,9 @@ UnderOut VSUnder(uint vid : SV_VertexID)
     o.world = mul(float4(v.position, 1), m).xyz;
     o.normal = mul(float4(v.normal, 0), m).xyz;
     o.pos = mul(float4(o.world, 1), ViewProj);
+    uint2 surface = MeshSurfaces[vid];
+    o.material = surface.x;
+    o.uv = UnpackUv(surface.y);
     return o;
 }
 
@@ -436,8 +499,7 @@ float4 PSUnder(UnderOut i) : SV_Target
     float diffuse = saturate(dot(n, normalize(LightDir)) * 0.5 + 0.5);
     // Lit like a strand root: light reaches the surface through the fur (absorption as in PSMain at the root).
     float facing = dot(n, normalize(CameraPos - i.world));
-    // shortcut: the undercoat takes the first fur material's colour; per-vertex materials come with the mesh UVs (k4s.10).
-    float4 surface = SurfaceColor(0);
+    float4 surface = SurfaceColor(i.material, i.uv, ddx(i.uv), ddy(i.uv));
     float3 albedo = surface.rgb * UndercoatDarken * pow(max(surface.rgb, 1e-3), Absorption * (1.0 + FacingDepth * LookingIn(facing)));
     albedo = lerp(albedo, surface.rgb, EndOn(facing)); // the gaps between end-on strands, shaded like their tips
     return Output(SceneLit(albedo * (AmbientColor + diffuse * LightIntensity), i.pos.xy, LinearDepth(i.pos.z), surface.a));

@@ -53,7 +53,7 @@ internal static class FurGrower
         var rng = new Random(246);
         var points = new StrandPoint[strands * FurAsset.PointsPerStrand];
         var skins = new StrandSkin[strands];
-        var materials = new uint[strands];
+        var surfaces = new StrandSurface[strands];
         var mergedBones = new byte[24];
         var mergedWeights = new float[24];
         // Picked at random over the whole surface, so strand order is already shuffled: any prefix is a uniform subsample.
@@ -84,13 +84,15 @@ internal static class FurGrower
                 points[i * FurAsset.PointsPerStrand + k] = new StrandPoint { X = p.X, Y = p.Y, Z = p.Z, Radius = Radii[k] };
             }
             skins[i] = surface.RootSkin(i0, i1, i2, w, u, v, mergedBones, mergedWeights);
-            materials[i] = surface.Materials[i0];
+            var uv = surface.Uvs[i0] is { } uv0 && surface.Uvs[i1] is { } uv1 && surface.Uvs[i2] is { } uv2 ? uv0 * w + uv1 * u + uv2 * v : (Vector2?)null;
+            surfaces[i] = new StrandSurface(surface.Materials[i0], uv);
         }
 
         // Undercoat: the fur surface itself.
         var remap = new Dictionary<int, uint>();
         var meshVertices = new List<MeshVertex>();
         var meshSkins = new List<StrandSkin>();
+        var meshSurfaces = new List<StrandSurface>();
         var meshIndices = new uint[triangles.Count];
         for (var i = 0; i < triangles.Count; i++)
         {
@@ -100,13 +102,14 @@ internal static class FurGrower
                 remap[vertex] = index = (uint)meshVertices.Count;
                 meshVertices.Add(new MeshVertex { Position = surface.Positions[vertex], Normal = surface.Normals[vertex] });
                 meshSkins.Add(surface.VertexSkin(vertex));
+                meshSurfaces.Add(new StrandSurface(surface.Materials[vertex], surface.Uvs[vertex]));
             }
             meshIndices[i] = index;
         }
         return new FurAsset
         {
-            BoneNames = surface.BoneNames.ToArray(), StrandCount = strands, Points = points, Skins = skins, StrandMaterials = materials,
-            MeshVertices = meshVertices.ToArray(), MeshSkins = meshSkins.ToArray(), MeshIndices = meshIndices,
+            BoneNames = surface.BoneNames.ToArray(), StrandCount = strands, Points = points, Skins = skins, StrandSurfaces = surfaces,
+            MeshVertices = meshVertices.ToArray(), MeshSurfaces = meshSurfaces.ToArray(), MeshSkins = meshSkins.ToArray(), MeshIndices = meshIndices,
         };
     }
 
@@ -178,6 +181,7 @@ internal static class FurGrower
         public readonly List<byte> Bones = [];    // 8 per vertex
         public readonly List<float> Weights = []; // 8 per vertex
         public readonly List<uint> Materials = []; // per vertex: rank of its mesh's material among the fur materials
+        public readonly List<Vector2?> Uvs = [];    // per vertex: UV0, if its mesh has one
         public readonly List<int> Triangles = [];
         public readonly List<string> BoneNames = [];
         public float[] AboveFace = [], BelowFace = []; // skin weight on those bones, per vertex
@@ -280,6 +284,8 @@ internal static class FurGrower
                 var first = surface.Positions.Count;
                 if (first + mesh.Vertices > MaxVertices) throw new InvalidDataException($"fur meshes have more than {MaxVertices:N0} vertices");
                 var materialRank = (uint)BitOperations.PopCount(furMaterials & ((1u << mesh.Material) - 1));
+                // All surveyed fur meshes have one (Single2 or Single4); without it the strands take the material's first colour.
+                var hasUv = declarations[m].TryGetValue(4, out var uv) && uv.Type is 1 or 3 or 13 or 14;
                 for (var v = 0; v < mesh.Vertices; v++)
                 {
                     var vertexPosition = ReadVector3(file, At(position, v));
@@ -289,6 +295,7 @@ internal static class FurGrower
                     surface.Positions.Add(vertexPosition);
                     surface.Normals.Add(vertexNormal);
                     surface.Materials.Add(materialRank);
+                    surface.Uvs.Add(hasUv ? ReadUv(file, At(uv, v), uv.Type) : null);
                     for (var k = 0; k < 8; k++)
                     {
                         var weight = k < influences ? file[At(weights, v) + k] : (byte)0;
@@ -349,6 +356,10 @@ internal static class FurGrower
             17 => 8,
             _ => throw new InvalidDataException($"unsupported skin element type {type}"),
         };
+
+        private static Vector2 ReadUv(byte[] file, int at, byte type) => type is 13 or 14
+            ? new((float)BitConverter.ToHalf(file, at), (float)BitConverter.ToHalf(file, at + 2))
+            : new(BitConverter.ToSingle(file, at), BitConverter.ToSingle(file, at + 4));
 
         private static Vector3 ReadVector3(byte[] file, int at)
             => new(BitConverter.ToSingle(file, at), BitConverter.ToSingle(file, at + 4), BitConverter.ToSingle(file, at + 8));

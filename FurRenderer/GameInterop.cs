@@ -448,6 +448,41 @@ internal sealed unsafe class GameInterop : IDisposable
         return desc.Format == DXGI_FORMAT.DXGI_FORMAT_R16G16B16A16_FLOAT && desc.ViewDimension == D3D_SRV_DIMENSION.D3D_SRV_DIMENSION_TEXTURE2D ? view : null;
     }
 
+    /// <summary>
+    /// The shader view of the texture a slot's material binds to the sampler named by <paramref name="samplerCrc"/> (the CRC32
+    /// of its name, e.g. g_SamplerIndex), not AddRef'd; null if it binds none.
+    /// </summary>
+    public ID3D11ShaderResourceView* GetMaterialTexture(nint characterBase, int slot, int material, uint samplerCrc)
+    {
+        var character = AsCharacter(characterBase);
+        if (character == null || character->Models == null || slot >= character->SlotCount) return null;
+        var model = character->Models[slot];
+        if (model == null || model->Materials == null || material >= model->MaterialCount) return null;
+        var mat = model->Materials[material];
+        if (mat == null || mat->Textures == null || mat->MaterialResourceHandle == null || mat->MaterialResourceHandle->ShaderPackageResourceHandle == null)
+            return null;
+        // Material textures are keyed by the shader package's id for the name, listed with its samplers (the fur materials'
+        // index map) or its textures (their diffuse map).
+        var shpk = mat->MaterialResourceHandle->ShaderPackageResourceHandle->ShaderPackage;
+        if (shpk == null) return null;
+        uint? samplerId = null;
+        for (var s = 0; s < shpk->SamplerCount && samplerId == null && shpk->Samplers != null; s++)
+            if (shpk->Samplers[s].CRC == samplerCrc) samplerId = shpk->Samplers[s].Id;
+        for (var s = 0; s < shpk->TextureCount && samplerId == null && shpk->Textures != null; s++)
+            if (shpk->Textures[s].CRC == samplerCrc) samplerId = shpk->Textures[s].Id;
+        for (var t = 0; t < mat->TextureCount && samplerId != null; t++)
+        {
+            if (mat->Textures[t].Id != samplerId) continue;
+            var handle = mat->Textures[t].Texture;
+            if (handle == null || handle->Texture == null || handle->Texture->D3D11ShaderResourceView == null) return null;
+            var view = (ID3D11ShaderResourceView*)handle->Texture->D3D11ShaderResourceView;
+            D3D11_SHADER_RESOURCE_VIEW_DESC desc;
+            view->GetDesc(&desc);
+            return desc.ViewDimension == D3D_SRV_DIMENSION.D3D_SRV_DIMENSION_TEXTURE2D ? view : null;
+        }
+        return null;
+    }
+
     /// <summary>World position of a character's skeleton root (its feet), or null.</summary>
     public Vector3? GetRootPosition(nint characterBase)
     {

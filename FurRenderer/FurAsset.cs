@@ -23,9 +23,10 @@ internal sealed class FurAsset
     public required int StrandCount { get; init; }
     public required StrandPoint[] Points { get; init; }
     public required StrandSkin[] Skins { get; init; }
-    /// <summary>Per strand, which of the item's fur materials colours it (rank among their bits); baked assets use the first.</summary>
-    public required uint[] StrandMaterials { get; init; }
+    /// <summary>Per strand, where on the item's surface it is rooted; baked assets hold no UVs and use the first fur material.</summary>
+    public required StrandSurface[] StrandSurfaces { get; init; }
     public required MeshVertex[] MeshVertices { get; init; }
+    public required StrandSurface[] MeshSurfaces { get; init; }
     public required StrandSkin[] MeshSkins { get; init; }
     public required uint[] MeshIndices { get; init; }
 
@@ -70,8 +71,8 @@ internal sealed class FurAsset
         if (indices.Any(i => i >= meshVertices)) throw new InvalidDataException($"{path}: mesh index out of range");
         return new FurAsset
         {
-            BoneNames = names, StrandCount = strands, Points = points, Skins = skins, StrandMaterials = new uint[strands],
-            MeshVertices = vertices, MeshSkins = meshSkins, MeshIndices = indices,
+            BoneNames = names, StrandCount = strands, Points = points, Skins = skins, StrandSurfaces = new StrandSurface[strands],
+            MeshVertices = vertices, MeshSurfaces = new StrandSurface[meshVertices], MeshSkins = meshSkins, MeshIndices = indices,
         };
     }
 }
@@ -86,6 +87,21 @@ internal struct StrandPoint
 internal struct MeshVertex
 {
     public Vector3 Position, Normal;
+}
+
+/// <summary>A point of an item's fur surface: which of its fur materials (rank among their bits) and, if known, its UV.</summary>
+[StructLayout(LayoutKind.Sequential, Pack = 4)]
+internal struct StrandSurface
+{
+    public const uint HasUv = 0x10000;
+    public uint Material; // rank | HasUv
+    public uint Uv;       // u | v << 16 as halves
+
+    public StrandSurface(uint material, Vector2? uv)
+    {
+        Material = material | (uv.HasValue ? HasUv : 0);
+        if (uv is { } v) Uv = BitConverter.HalfToUInt16Bits((Half)v.X) | (uint)BitConverter.HalfToUInt16Bits((Half)v.Y) << 16;
+    }
 }
 
 [StructLayout(LayoutKind.Sequential, Pack = 4)]
