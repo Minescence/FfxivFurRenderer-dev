@@ -33,6 +33,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private readonly ConcurrentQueue<nint> releasedTables = new(); // colour tables the render thread releases, like retiredItems
     private bool reloadItems;
     private int frame;
+    private float lodFocal; // render thread: the projection's vertical focal length outside GPose
 
     private const int RetireAfterFrames = 300;
 
@@ -54,7 +55,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         public Renderer.FurBuffers? Buffers; // render thread
     }
 
-    private readonly record struct ItemDraw(FurItem Item, Matrix4x4[] Skin, nint[] Tables);
+    private readonly record struct ItemDraw(FurItem Item, Matrix4x4[] Skin, nint[] Tables, Vector3? Position);
 
     /// <summary>Main-thread state for one frame, consumed by the render thread.</summary>
     private sealed class FrameSnapshot
@@ -507,7 +508,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             if (item.Tables[k] != 0) replacedTables.Add(item.Tables[k]);
             item.Tables[k] = table;
         }
-        snap.Items.Add(new ItemDraw(item, skin, (nint[])item.Tables.Clone()));
+        snap.Items.Add(new ItemDraw(item, skin, (nint[])item.Tables.Clone(), interop.GetRootPosition(character)));
     }
 
     private static void ReleaseTables(FurItem item)
@@ -545,8 +546,13 @@ public sealed unsafe class Plugin : IDalamudPlugin
         if (snap == null) { status = "waiting for first frame"; return; }
         if (snap.Skip != null) { status = snap.Skip; return; }
         var draws = new List<FurDraw>(snap.Items.Count);
-        var strands = 0;
-        foreach (var (item, skin, tables) in snap.Items)
+        int strands = 0, drawnStrands = 0;
+        var density = Math.Clamp(snap.Gpose ? config.GposeDensity : config.Density, 0f, 1f);
+        Matrix4x4.Invert(snap.View, out var invView);
+        // Distances as at the normal field of view: GPose zoom (a narrower one) makes items bigger on screen.
+        if (!snap.Gpose) lodFocal = snap.Proj.M22;
+        var zoom = snap.Gpose && lodFocal > 0 ? snap.Proj.M22 / lodFocal : 1f;
+        foreach (var (item, skin, tables, position) in snap.Items)
         {
             for (var k = 0; k < tables.Length; k++)
             {
@@ -562,8 +568,15 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 catch (InvalidOperationException ex) { Diag("item " + item.Name, "failed: " + ex.Message); }
             }
             if (item.Buffers is not { } buffers) continue;
-            draws.Add(new FurDraw(buffers, skin, tables));
+            var itemDensity = density;
+            if (config.DistanceLod && position is { } p)
+            {
+                var distance = Vector3.Distance(invView.Translation, p) / zoom;
+                if (distance > config.LodDistance) itemDensity *= Math.Max(config.LodMinDensity, config.LodDistance / distance);
+            }
+            draws.Add(new FurDraw(buffers, skin, tables, itemDensity));
             strands += item.StrandCount;
+            drawnStrands += (int)(item.StrandCount * itemDensity);
         }
         if (draws.Count == 0) { status = snap.Growing > 0 ? "growing fur" : "waiting for fur"; return; }
         var (view, proj) = (snap.View, snap.Proj);
@@ -582,8 +595,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             uint dw = 0, dh = 0;
             if (config.UseSceneDepth) interop.TryGetSceneDepth(out depth, out dw, out dh);
             Diag("depth", config.UseSceneDepth ? interop.DepthInfo : "disabled in settings");
-            var density = gpose ? config.GposeDensity : config.Density;
-            renderer.Draw(context, backBuffer, depth, new Vector2(dw, dh), draws, view, proj, density, gpose ? config.GposeChildCount : config.ChildCount, config);
+            renderer.Draw(context, backBuffer, depth, new Vector2(dw, dh), draws, view, proj, gpose ? config.GposeChildCount : config.ChildCount, config);
             furDraws++;
             lastFurTarget = (nint)backBuffer;
             ID3D11Resource* depthTexture = null;
@@ -591,7 +603,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             debugCapture.OnFurDrawn(context, backBuffer, (ID3D11Texture2D*)depthTexture);
             if (depthTexture != null) depthTexture->Release();
             Diag("draw", renderer.LastDrawInfo);
-            status = $"drawing {(int)(strands * Math.Clamp(density, 0f, 1f)):N0}/{strands:N0} strands in {draws.Count} item(s){(snap.Growing > 0 ? $", {snap.Growing} growing" : "")}; bones missing {snap.MissingBones}/{snap.Bones}; depth {(depth != null ? $"{dw}x{dh}" : "off")}";
+            status = $"drawing {drawnStrands:N0}/{strands:N0} strands in {draws.Count} item(s){(snap.Growing > 0 ? $", {snap.Growing} growing" : "")}; bones missing {snap.MissingBones}/{snap.Bones}; depth {(depth != null ? $"{dw}x{dh}" : "off")}";
         }
         finally
         {
@@ -642,6 +654,9 @@ public sealed unsafe class Plugin : IDalamudPlugin
             if (ImGui.SliderInt("Children per strand (GPose)", ref gposeChildren, 1, 16)) { config.GposeChildCount = gposeChildren; changed = true; }
             changed |= Slider("Child spread (m)", () => config.ChildSpread, v => config.ChildSpread = v, 0f, 0.01f);
             changed |= Slider("GPose density", () => config.GposeDensity, v => config.GposeDensity = v, 0f, 1f);
+            changed |= Check("Fewer strands far away", () => config.DistanceLod, v => config.DistanceLod = v);
+            changed |= Slider("Full density within (m)", () => config.LodDistance, v => config.LodDistance = v, 0.5f, 20f);
+            changed |= Slider("Least density far away", () => config.LodMinDensity, v => config.LodMinDensity = v, 0.05f, 1f);
             changed |= Slider("Length", () => config.LengthScale, v => config.LengthScale = v, 0.2f, 3f);
             changed |= Slider("Width", () => config.WidthScale, v => config.WidthScale = v, 0.2f, 5f);
             changed |= Slider("Min pixel width", () => config.MinPixelWidth, v => config.MinPixelWidth = v, 0.25f, 3f);

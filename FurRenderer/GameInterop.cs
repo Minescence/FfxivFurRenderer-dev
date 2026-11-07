@@ -448,6 +448,13 @@ internal sealed unsafe class GameInterop : IDisposable
         return desc.Format == DXGI_FORMAT.DXGI_FORMAT_R16G16B16A16_FLOAT && desc.ViewDimension == D3D_SRV_DIMENSION.D3D_SRV_DIMENSION_TEXTURE2D ? view : null;
     }
 
+    /// <summary>World position of a character's skeleton root (its feet), or null.</summary>
+    public Vector3? GetRootPosition(nint characterBase)
+    {
+        var character = AsCharacter(characterBase);
+        return character == null || character->Skeleton == null ? null : (Vector3)character->Skeleton->Transform.Position;
+    }
+
     /// <summary>True if the target's body model is male (c0101-family asset), false for female (c0201-family).</summary>
     public bool IsMale(nint characterBase)
     {

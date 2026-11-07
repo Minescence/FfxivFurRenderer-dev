@@ -19,6 +19,15 @@ public sealed class Configuration : IPluginConfiguration
     public int ChildCount { get; set; } = 3;
     public int GposeChildCount { get; set; } = 6;
     public float ChildSpread { get; set; } = 0.01f;
+    /// <summary>
+    /// Fewer strands on items far from the camera: full density within LodDistance (m from the item's feet, at the normal field
+    /// of view), then LodDistance / distance of it, down to LodMinDensity. Strands are drawn at least MinPixelWidth wide, so
+    /// each covers a share of the item's screen area that grows with distance; this keeps the share, and the look, as at
+    /// LodDistance. 1 / distance^2 (the item's area) left 4x fewer strands, which CoverageScale widened into coarse tufts.
+    /// </summary>
+    public bool DistanceLod { get; set; } = true;
+    public float LodDistance { get; set; } = 4f;
+    public float LodMinDensity { get; set; } = 0.25f;
 
     /// <summary>Strand look tuned in game against the reference renders (long, straight, no droop).</summary>
     public float LengthScale { get; set; } = 1.5f;

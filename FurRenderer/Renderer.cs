@@ -39,8 +39,8 @@ internal struct FrameConstants
     public uint HiZWidth, HiZHeight, HiZLevels, ArgsOffset;
 }
 
-/// <summary>One item's fur for a frame: its skin palette and its fur materials' live colour tables (SRVs, 0 = none).</summary>
-internal readonly record struct FurDraw(Renderer.FurBuffers Buffers, Matrix4x4[] Skin, nint[] Tables);
+/// <summary>One item's fur for a frame: its skin palette, its fur materials' live colour tables (SRVs, 0 = none) and the share of its strands to draw.</summary>
+internal readonly record struct FurDraw(Renderer.FurBuffers Buffers, Matrix4x4[] Skin, nint[] Tables, float Density);
 
 /// <summary>
 /// Draws fur assets (undercoat, then strands) into one multisampled fur layer and blends the resolved layer over the swap-chain
@@ -468,12 +468,11 @@ internal sealed unsafe class Renderer : IDisposable
     /// <summary>Back buffer, depth mode and camera of the last draw (for the debug log).</summary>
     public string LastDrawInfo { get; private set; } = "";
 
-    /// <summary>Draws <paramref name="density"/> of each item's strands. Returns false (and draws nothing) if that is none.</summary>
+    /// <summary>Draws each item's <see cref="FurDraw.Density"/> of its strands.</summary>
     public void Draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* backBuffer, ID3D11ShaderResourceView* sceneDepth, Vector2 depthSize,
-        List<FurDraw> draws, Matrix4x4 view, Matrix4x4 proj, float density, int childCount, Configuration cfg)
+        List<FurDraw> draws, Matrix4x4 view, Matrix4x4 proj, int childCount, Configuration cfg)
     {
-        density = Math.Clamp(density, 0f, 1f);
-        if (draws.Count == 0 || density <= 0) return;
+        if (draws.Count == 0) return;
         D3D11_TEXTURE2D_DESC bbDesc;
         backBuffer->GetDesc(&bbDesc);
         EnsureTargets(backBuffer, bbDesc);
@@ -623,7 +622,7 @@ internal sealed unsafe class Renderer : IDisposable
         {
             var draw = draws[d];
             var item = draw.Buffers;
-            var drawn = (uint)(item.StrandCount * density);
+            var drawn = (uint)(item.StrandCount * Math.Clamp(draw.Density, 0f, 1f));
             if (drawn == 0) continue;
             (fc.DrawnStrands, fc.ArgsOffset) = (drawn, (uint)(d * 16));
             strandInstances += drawn * fc.ChildCount;
