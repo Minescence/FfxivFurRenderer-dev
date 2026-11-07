@@ -389,7 +389,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         Diag("camera", $"StandardZ-derived reverseZ {interop.LastCameraReverseZ}; proj row3 {snap.Proj.M31:G4} {snap.Proj.M32:G4} {snap.Proj.M33:G4} {snap.Proj.M34:G4}; row4 {snap.Proj.M41:G4} {snap.Proj.M42:G4} {snap.Proj.M43:G4} {snap.Proj.M44:G4}");
         var race = interop.GetRaceSexId(character);
         var slot = interop.GetCoatSlot(character);
-        if (slot != CoatSlot.None || !config.RequireCoatEquipped)
+        if (slot != CoatSlot.None)
         {
             var male = interop.IsMale(character);
             var name = $"coat_{(slot == CoatSlot.Ring ? "ril" : "glv")}_{(male ? "m" : "f")}.furasset";
@@ -586,7 +586,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             if (config.DistanceLod && position is { } p)
             {
                 var distance = Vector3.Distance(invView.Translation, p) / zoom;
-                if (distance > config.LodDistance) itemDensity *= Math.Max(config.LodMinDensity, config.LodDistance / distance);
+                if (distance > config.LodDistance) itemDensity *= Math.Max(config.LodMinDensity, MathF.Pow(config.LodDistance / distance, config.LodBias));
             }
             draws.Add(new FurDraw(buffers, skin, textures, itemDensity));
             strands += buffers.StrandCount;
@@ -664,8 +664,6 @@ public sealed unsafe class Plugin : IDalamudPlugin
         var d = Defaults;
         changed |= Check("Enabled", () => config.Enabled, v => config.Enabled = v, d.Enabled, "Draw fur.");
         changed |= Check("Only in GPose", () => config.OnlyInGpose, v => config.OnlyInGpose = v, d.OnlyInGpose, "Draw fur only in GPose.");
-        changed |= Check("Require coat equipped", () => config.RequireCoatEquipped, v => config.RequireCoatEquipped = v, d.RequireCoatEquipped,
-            "Draw the coat's fur only while Hikari's coat is worn. Off: draw it anyway, for testing. Fur on other items always draws.");
         if (ImGui.CollapsingHeader("Strands", ImGuiTreeNodeFlags.DefaultOpen))
         {
             const string densityHelp = " 100% = every base strand: 15.3 per cm² of the item's surface (152,525 per m²), each drawn 'Strands per base strand' times.";
@@ -683,9 +681,11 @@ public sealed unsafe class Plugin : IDalamudPlugin
             changed |= Slider("Copy scatter radius", () => config.ChildSpread, v => config.ChildSpread = v, d.ChildSpread, 0f, 0.01f,
                 "Copies root anywhere within this distance of their base strand.", 1, " mm", 1000f);
             changed |= Check("Fewer strands far away", () => config.DistanceLod, v => config.DistanceLod = v, d.DistanceLod,
-                "Past the distance below, draw fewer strands (in proportion to 1 / distance) and widen the rest, so the fur looks about the same for less GPU time. Zooming in GPose counts as closer.");
+                "Past the distance below, draw fewer strands and widen the rest, so the fur looks about the same for less GPU time. Zooming in GPose counts as closer.");
             changed |= Slider("Full density within", () => config.LodDistance, v => config.LodDistance = v, d.LodDistance, 0.5f, 20f,
                 "Distance from the item's wearer (their feet) up to which every strand is drawn.", 1, " m");
+            changed |= Slider("LOD bias", () => config.LodBias, v => config.LodBias = v, d.LodBias, 0.25f, 3f,
+                "How fast strands thin out past that distance: the density falls with 1 / distance^this. 1 keeps the fur looking about the same; higher saves more GPU time but leaves coarser tufts, lower keeps more strands.");
             changed |= Slider("Least density far away", () => config.LodMinDensity, v => config.LodMinDensity = v, d.LodMinDensity, 0.05f, 1f,
                 "The fewest strands drawn however far away, as a share of the density above.", 0, "%", 100f);
             changed |= Slider("Length", () => config.LengthScale, v => config.LengthScale = v, d.LengthScale, 0.2f, 3f,

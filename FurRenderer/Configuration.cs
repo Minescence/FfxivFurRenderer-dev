@@ -10,7 +10,6 @@ public sealed class Configuration : IPluginConfiguration
 
     public bool Enabled { get; set; } = true;
     public bool OnlyInGpose { get; set; }
-    public bool RequireCoatEquipped { get; set; } = true;
 
     /// <summary>Fraction of the packed strands drawn in normal play / in GPose.</summary>
     public float Density { get; set; } = 1.0f;
@@ -21,12 +20,14 @@ public sealed class Configuration : IPluginConfiguration
     public float ChildSpread { get; set; } = 0.01f;
     /// <summary>
     /// Fewer strands on items far from the camera: full density within LodDistance (m from the item's feet, at the normal field
-    /// of view), then LodDistance / distance of it, down to LodMinDensity. Strands are drawn at least MinPixelWidth wide, so
-    /// each covers a share of the item's screen area that grows with distance; this keeps the share, and the look, as at
-    /// LodDistance. 1 / distance^2 (the item's area) left 4x fewer strands, which CoverageScale widened into coarse tufts.
+    /// of view), then (LodDistance / distance)^LodBias of it, down to LodMinDensity. Strands are drawn at least MinPixelWidth
+    /// wide, so each covers a share of the item's screen area that grows with distance; bias 1 keeps the share, and the look,
+    /// as at LodDistance. Bias 2 (1 / distance^2, the item's area) left 4x fewer strands, which CoverageScale widened into
+    /// coarse tufts.
     /// </summary>
     public bool DistanceLod { get; set; } = true;
     public float LodDistance { get; set; } = 4f;
+    public float LodBias { get; set; } = 1f;
     public float LodMinDensity { get; set; } = 0.25f;
 
     /// <summary>Strand look tuned in game against the reference renders (long, straight, no droop).</summary>
