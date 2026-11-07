@@ -37,6 +37,7 @@ internal struct FrameConstants
     public float Absorption, FacingDepth, CoverageScale; public uint SampleCount;
     public float UndercoatDarken; public uint TableMask, DrawnStrands, CullFlags;
     public uint HiZWidth, HiZHeight, HiZLevels, ArgsOffset;
+    public uint RecolorUndyed; public Vector3 Padding;
 }
 
 /// <summary>
@@ -518,6 +519,7 @@ internal sealed unsafe class Renderer : IDisposable
             LightDir = light,
             LightIntensity = cfg.LightIntensity,
             BaseColor = cfg.BaseColor,
+            RecolorUndyed = cfg.RecolorUndyed ? 1u : 0u,
             RootDarken = cfg.RootDarken,
             UndercoatDarken = cfg.UndercoatDarken,
             AmbientColor = cfg.AmbientColor,

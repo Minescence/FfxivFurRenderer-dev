@@ -704,8 +704,10 @@ public sealed unsafe class Plugin : IDalamudPlugin
         }
         if (ImGui.CollapsingHeader("Shading", ImGuiTreeNodeFlags.DefaultOpen))
         {
+            changed |= Check("Recolour undyed items", () => config.RecolorUndyed, v => config.RecolorUndyed = v, d.RecolorUndyed,
+                "Items in Hikari's undyed colour take the fur colour below, so an outfit matches. Off: they keep the game's colour. Dyed items and other colours always show as the game colours them.");
             changed |= Color("Fur colour", () => config.BaseColor, v => config.BaseColor = v, d.BaseColor,
-                "Linear RGB, for items in Hikari's undyed colour. Dyed items and other colours show as the game colours them.");
+                "Linear RGB, for items in Hikari's undyed colour while 'Recolour undyed items' is on.");
             changed |= Slider("Root brightness", () => config.RootDarken, v => config.RootDarken = v, d.RootDarken, 0f, 1f,
                 "Light reaching the roots compared with the tips (0% = black roots).", 0, "%", 100f);
             changed |= Slider("Undercoat", () => config.UndercoatDarken, v => config.UndercoatDarken = v, d.UndercoatDarken, 0f, 1f,

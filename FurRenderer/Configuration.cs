@@ -40,6 +40,8 @@ public sealed class Configuration : IPluginConfiguration
     // Reference material (Fur (Principled Hair BSDF)): tip colour linear (0.641, 0.205, 0.328) multiplied by the intercept, so
     // roots go black.
     public Vector3 BaseColor { get; set; } = new(0.641f, 0.205f, 0.328f);
+    /// <summary>Items in Hikari's undyed colour take BaseColor, so an outfit matches the coat; off, they keep the game's colour.</summary>
+    public bool RecolorUndyed { get; set; } = true;
     public float RootDarken { get; set; } = 0f;
     /// <summary>Coat surface under the fur = BaseColor x this (reference emitter Material.004: colour multiplied by 0.3).</summary>
     public float UndercoatDarken { get; set; } = 0.3f;

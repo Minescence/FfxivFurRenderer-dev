@@ -82,6 +82,7 @@ cbuffer Frame : register(b0)
     float Absorption;      float FacingDepth;  float CoverageScale; uint SampleCount;          // AgxToneMap: 0 = gamma only, 1 = AgX like the reference render   // SceneLighting: 0 = synthetic only, 1 = colour/light from the game's lit coat             // 0 = pure Kajiya-Kay, 1 = soft lighting from the growth direction
     float UndercoatDarken; uint TableMask;     uint DrawnStrands; uint CullFlags;   // TableMask: bit k / 4 + k / 8 + k = ColorTable<k> / IndexMap<k> / DiffuseMap<k> is bound
     uint2 HiZSize;         uint HiZLevels;     uint ArgsOffset;   // CullFlags: 1 = outside the view, 2 = behind the scene (Hi-Z)
+    uint RecolorUndyed;    float3 Padding;     // items in Hikari's undyed colour take BaseColor
 };
 
 struct VsOut
@@ -111,8 +112,8 @@ float4x4 SkinMatrix(SkinData s)
     return m;
 }
 
-// Row 0 of Hikari's materials, undyed. Such items take the configured fur colour so an outfit matches the coat; dyes and
-// other colours (the white boots, the red boa) show as they are.
+// Row 0 of Hikari's materials, undyed. Such items take the configured fur colour so an outfit matches the coat (unless
+// RecolorUndyed is off); dyes and other colours (the white boots, the red boa) show as they are.
 static const float3 UndyedFur = float3(0.984, 0.615, 0.603);
 static const float3 Luminance = float3(0.2126, 0.7152, 0.0722);
 
@@ -154,7 +155,8 @@ float4 MaterialColor(Texture2D<float4> table, Texture2D<float4> index, Texture2D
         tint = d * d / max(dot(mean * mean, Luminance), 1e-3);
     }
     float3 game = row * tint; // what the game draws there
-    float3 color = (mask & 1) && distance(row, UndyedFur) > 0.02 ? row : BaseColor;
+    bool undyed = !(mask & 1) || distance(row, UndyedFur) <= 0.02;
+    float3 color = undyed && RecolorUndyed != 0 ? BaseColor : row;
     return float4(color * tint, min(dot(UndyedFur, Luminance) / max(dot(game, Luminance), 1e-3), 16.0));
 }
 
