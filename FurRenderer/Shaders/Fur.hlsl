@@ -120,6 +120,9 @@ float4x4 SkinMatrix(SkinData s)
 // RecolorUndyed is off); dyes and other colours (the white boots, the red boa) show as they are.
 static const float3 UndyedFur = float3(0.984, 0.615, 0.603);
 static const float3 Luminance = float3(0.2126, 0.7152, 0.0722);
+// How far the game's depth may be from a point of the item's surface where the game shows that surface: under 5 mm in game
+// (skinning and depth precision). A tail or horns over the coat lie 1.5 cm and more in front of it.
+static const float OwnSurface = 0.01;
 
 float3 TableRow(Texture2D<float4> table, uint row)
 {
@@ -273,10 +276,10 @@ VsOut VSMain(uint vid : SV_VertexID, uint instance : SV_InstanceID)
     o.strand = strand * ChildCount + child;
     o.surface = float4(f16tof32(sm.color.x), f16tof32(sm.color.x >> 16), f16tof32(sm.color.y), f16tof32(sm.color.y >> 16));
     // Once per vertex instead of per fragment, as they are the same for the whole copy. The light comes from the game's item
-    // around the root; PSMain takes its own pixel's when the root is off-screen or hidden by something other than the
-    // character (a root just behind the item's own silhouette keeps the item in front of it).
+    // around the root; PSMain takes the surface's light at its own pixel when the root is off-screen or anything hides it,
+    // the item's own silhouette included.
     bool rootSeen = all(root.xy >= 4) && all(root.xy < ViewportSize - 4) && root.z > 0
-        && !(UseSceneDepth != 0 && LinearDepth(SceneDepth.Load(int3(root.xy * DepthUvScale, 0))) < root.z - 0.3);
+        && !(UseSceneDepth != 0 && LinearDepth(SceneDepth.Load(int3(root.xy * DepthUvScale, 0))) < root.z - OwnSurface);
     o.shade = float3(1.0 + (Hash(uint3(o.strand, 17u, 3u)) - 0.5) * 2.0 * HueJitter,
                      rootSeen ? SceneLit(1.0, root.xy, root.z, o.surface.a).x : 0, rootSeen ? 1 : 0);
     return o;
@@ -415,7 +418,9 @@ bool BehindScene(float4 pos)
 
 // Scales by how brightly the game lit its coat at pixel 'at', so the fur follows the scene's sun, lamps and shadows. Only
 // brightness is taken (not the coat texture's colour), averaged over a few taps so texture detail doesn't streak along strands.
-// Taps more than 30 cm from 'depth' (view distance) are background seen past a silhouette and would shade the fringe with it.
+// Taps more than OwnSurface from 'depth' (the surface's view distance there) show something else: background past a
+// silhouette, or a tail or horns in front of the coat, which a dark dye's gain made up to 16x too bright (white fur).
+// 'depth' 0: no point of the surface is known there (a strand's own pixel lies behind the strand), so only SurfaceLight.
 // 'gain' is SurfaceColor's light gain.
 float3 SceneLit(float3 color, float2 at, float depth, float gain)
 {
@@ -427,7 +432,7 @@ float3 SceneLit(float3 color, float2 at, float depth, float gain)
     {
         float2 s = SceneLuma.Load(int3(int2(at) + taps[k], 0));
         // s.y is 0 only off-screen (out-of-bounds read), where there is no scene to take light from.
-        if (UseSceneDepth != 0 && (s.y == 0 || abs(s.y - depth) > 0.3))
+        if (UseSceneDepth != 0 && (s.y == 0 || abs(s.y - depth) > OwnSurface))
             continue;
         luma += s.x;
         count++;
@@ -526,7 +531,7 @@ float4 PSUnder(UnderOut i) : SV_Target
 float2 PSSurfaceLight(UnderOut i) : SV_Target
 {
     float2 s = SceneLuma.Load(int3(i.pos.xy * 8, 0));
-    if (abs(s.y - LinearDepth(i.pos.z)) > 0.1)
+    if (abs(s.y - LinearDepth(i.pos.z)) > OwnSurface)
         discard;
     return float2(s.x, 1);
 }
@@ -585,7 +590,7 @@ float4 PSMain(VsOut i, uint geometry : SV_Coverage, out uint coverage : SV_Cover
     float shadow = lerp(RootDarken, 1.0, 1.0 - buried);
     float3 color = (albedo * (AmbientColor + diffuse * LightIntensity) + spec * LightIntensity) * shadow;
 
-    return Output(i.shade.z > 0 ? color * i.shade.y : SceneLit(color, i.pos.xy, LinearDepth(i.pos.z), i.surface.a));
+    return Output(i.shade.z > 0 ? color * i.shade.y : SceneLit(color, i.pos.xy, 0, i.surface.a));
 }
 
 float4 VSComposite(uint vid : SV_VertexID) : SV_Position
