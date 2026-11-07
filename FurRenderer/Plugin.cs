@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Game.Command;
@@ -639,64 +640,106 @@ public sealed unsafe class Plugin : IDalamudPlugin
         if (!ImGui.Begin("Fur Renderer", ref windowOpen)) { ImGui.End(); return; }
         var changed = false;
         ImGui.TextWrapped(status);
-        if (renderer is { PerfInfo: { Length: > 0 } perf }) ImGui.TextDisabled(perf);
+        ImGui.BeginDisabled(); // greyed; TextUnformatted because these hold '%'
+        if (renderer is { PerfInfo: { Length: > 0 } perf }) ImGui.TextUnformatted(perf);
+        ImGui.TextUnformatted("Ctrl+click a slider to type a value, right-click a setting to reset it, hover for what it means.");
+        ImGui.EndDisabled();
         ImGui.Separator();
 
-        changed |= Check("Enabled", () => config.Enabled, v => config.Enabled = v);
-        changed |= Check("Only in GPose", () => config.OnlyInGpose, v => config.OnlyInGpose = v);
-        changed |= Check("Require coat equipped", () => config.RequireCoatEquipped, v => config.RequireCoatEquipped = v);
+        var d = Defaults;
+        changed |= Check("Enabled", () => config.Enabled, v => config.Enabled = v, d.Enabled, "Draw fur.");
+        changed |= Check("Only in GPose", () => config.OnlyInGpose, v => config.OnlyInGpose = v, d.OnlyInGpose, "Draw fur only in GPose.");
+        changed |= Check("Require coat equipped", () => config.RequireCoatEquipped, v => config.RequireCoatEquipped = v, d.RequireCoatEquipped,
+            "Draw the coat's fur only while Hikari's coat is worn. Off: draw it anyway, for testing. Fur on other items always draws.");
         if (ImGui.CollapsingHeader("Strands", ImGuiTreeNodeFlags.DefaultOpen))
         {
-            changed |= Slider("Density", () => config.Density, v => config.Density = v, 0f, 1f);
-            var children = config.ChildCount;
-            if (ImGui.SliderInt("Children per strand", ref children, 1, 16)) { config.ChildCount = children; changed = true; }
-            var gposeChildren = config.GposeChildCount;
-            if (ImGui.SliderInt("Children per strand (GPose)", ref gposeChildren, 1, 16)) { config.GposeChildCount = gposeChildren; changed = true; }
-            changed |= Slider("Child spread (m)", () => config.ChildSpread, v => config.ChildSpread = v, 0f, 0.01f);
-            changed |= Slider("GPose density", () => config.GposeDensity, v => config.GposeDensity = v, 0f, 1f);
-            changed |= Check("Fewer strands far away", () => config.DistanceLod, v => config.DistanceLod = v);
-            changed |= Slider("Full density within (m)", () => config.LodDistance, v => config.LodDistance = v, 0.5f, 20f);
-            changed |= Slider("Least density far away", () => config.LodMinDensity, v => config.LodMinDensity = v, 0.05f, 1f);
-            changed |= Slider("Length", () => config.LengthScale, v => config.LengthScale = v, 0.2f, 3f);
-            changed |= Slider("Width", () => config.WidthScale, v => config.WidthScale = v, 0.2f, 5f);
-            changed |= Slider("Min pixel width", () => config.MinPixelWidth, v => config.MinPixelWidth = v, 0.25f, 3f);
-            changed |= Slider("Opacity", () => config.Opacity, v => config.Opacity = v, 0f, 1f);
-            changed |= Slider("Droop", () => config.Gravity, v => config.Gravity = v, 0f, 1.5f);
-            changed |= Slider("Tip fade start", () => config.FadeStart, v => config.FadeStart = v, 0f, 0.95f);
+            const string densityHelp = " 100% = every base strand: 15.3 per cm² of the item's surface (152,525 per m²), each drawn 'Strands per base strand' times.";
+            changed |= Slider("Strand density", () => config.Density, v => config.Density = v, d.Density, 0f, 1f,
+                "Share of each item's base strands drawn in normal play." + densityHelp, 0, "%", 100f);
+            changed |= SliderInt("Strands per base strand", () => config.ChildCount, v => config.ChildCount = v, d.ChildCount, 1, 16,
+                "How many strands each base strand draws in normal play: itself plus copies rooted around it (1 = no copies). Multiplies the density and the cost.");
+            changed |= Slider("Strand density (GPose)", () => config.GposeDensity, v => config.GposeDensity = v, d.GposeDensity, 0f, 1f,
+                "Share of each item's base strands drawn in GPose." + densityHelp, 0, "%", 100f);
+            changed |= SliderInt("Strands per base strand (GPose)", () => config.GposeChildCount, v => config.GposeChildCount = v, d.GposeChildCount, 1, 16,
+                "How many strands each base strand draws in GPose: itself plus copies rooted around it (1 = no copies).");
+            ImGui.BeginDisabled();
+            ImGui.TextUnformatted($"Up close: {BaseStrandsPerCm2 * config.Density * config.ChildCount:F0} strands per cm², {BaseStrandsPerCm2 * config.GposeDensity * config.GposeChildCount:F0} in GPose.");
+            ImGui.EndDisabled();
+            changed |= Slider("Copy scatter radius", () => config.ChildSpread, v => config.ChildSpread = v, d.ChildSpread, 0f, 0.01f,
+                "Copies root anywhere within this distance of their base strand.", 1, " mm", 1000f);
+            changed |= Check("Fewer strands far away", () => config.DistanceLod, v => config.DistanceLod = v, d.DistanceLod,
+                "Past the distance below, draw fewer strands (in proportion to 1 / distance) and widen the rest, so the fur looks about the same for less GPU time. Zooming in GPose counts as closer.");
+            changed |= Slider("Full density within", () => config.LodDistance, v => config.LodDistance = v, d.LodDistance, 0.5f, 20f,
+                "Distance from the item's wearer (their feet) up to which every strand is drawn.", 1, " m");
+            changed |= Slider("Least density far away", () => config.LodMinDensity, v => config.LodMinDensity = v, d.LodMinDensity, 0.05f, 1f,
+                "The fewest strands drawn however far away, as a share of the density above.", 0, "%", 100f);
+            changed |= Slider("Length", () => config.LengthScale, v => config.LengthScale = v, d.LengthScale, 0.2f, 3f,
+                "Multiplier on the grown length: 2.5 to 5 cm, half that on the head and neck.", 2, "x");
+            changed |= Slider("Width", () => config.WidthScale, v => config.WidthScale = v, d.WidthScale, 0.2f, 5f,
+                "Multiplier on the strand's thickness: 0.6 mm at the root, tapering to the tip.", 2, "x");
+            changed |= Slider("Min width on screen", () => config.MinPixelWidth, v => config.MinPixelWidth = v, d.MinPixelWidth, 0.25f, 3f,
+                "Strands thinner than this on screen are drawn this wide and proportionally more transparent, so they don't shimmer.", 2, " px");
+            changed |= Slider("Opacity", () => config.Opacity, v => config.Opacity = v, d.Opacity, 0f, 1f,
+                "Multiplier on each strand's coverage.", 0, "%", 100f);
+            changed |= Slider("Droop", () => config.Gravity, v => config.Gravity = v, d.Gravity, 0f, 1.5f,
+                "Bends strands towards the ground, keeping their length: at 0.5 a horizontal strand's tip points 45° down, at 1.5 about 70°.");
+            changed |= Slider("Taper starts at", () => config.FadeStart, v => config.FadeStart = v, d.FadeStart, 0f, 0.95f,
+                "Share of the length at full width; from there the strand narrows to nothing at the tip.", 0, "%", 100f);
         }
         if (ImGui.CollapsingHeader("Shading", ImGuiTreeNodeFlags.DefaultOpen))
         {
-            changed |= Color("Base colour (linear)", () => config.BaseColor, v => config.BaseColor = v);
-            changed |= Slider("Root brightness", () => config.RootDarken, v => config.RootDarken = v, 0f, 1f);
-            changed |= Slider("Undercoat brightness", () => config.UndercoatDarken, v => config.UndercoatDarken = v, 0f, 1f);
-            changed |= Slider("Per-strand variation", () => config.HueJitter, v => config.HueJitter = v, 0f, 0.5f);
-            changed |= Color("Ambient", () => config.AmbientColor, v => config.AmbientColor = v);
-            var dir = config.LightDirection;
-            if (ImGui.SliderFloat3("Light direction", ref dir, -1f, 1f)) { config.LightDirection = dir; changed = true; }
-            changed |= Slider("Light intensity", () => config.LightIntensity, v => config.LightIntensity = v, 0f, 3f);
-            changed |= Slider("Scene lighting", () => config.SceneLighting, v => config.SceneLighting = v, 0f, 1f);
-            changed |= Slider("Scene brightness", () => config.SceneGain, v => config.SceneGain = v, 0.5f, 10f);
-            changed |= Slider("Exposure", () => config.Exposure, v => config.Exposure = v, 0.1f, 8f);
-            changed |= Slider("Depth absorption", () => config.Absorption, v => config.Absorption = v, 0f, 6f);
-            changed |= Slider("Looking-in depth", () => config.FacingDepth, v => config.FacingDepth = v, 0f, 10f);
-            changed |= Slider("AgX tone map", () => config.AgxToneMap, v => config.AgxToneMap = v, 0f, 1f);
-            changed |= Slider("Soft lighting", () => config.SurfaceLighting, v => config.SurfaceLighting = v, 0f, 1f);
-            changed |= Slider("Specular", () => config.Specular, v => config.Specular = v, 0f, 1f);
-            changed |= Slider("Output gamma", () => config.OutputGamma, v => config.OutputGamma = v, 1f, 3f);
+            changed |= Color("Fur colour", () => config.BaseColor, v => config.BaseColor = v, d.BaseColor,
+                "Linear RGB, for items in Hikari's undyed colour. Dyed items and other colours show as the game colours them.");
+            changed |= Slider("Root brightness", () => config.RootDarken, v => config.RootDarken = v, d.RootDarken, 0f, 1f,
+                "Light reaching the roots compared with the tips (0% = black roots).", 0, "%", 100f);
+            changed |= Slider("Undercoat", () => config.UndercoatDarken, v => config.UndercoatDarken = v, d.UndercoatDarken, 0f, 1f,
+                "Colour of the surface under the fur, as a multiple of the fur colour.", 2, "x fur colour");
+            changed |= Slider("Strand brightness variation", () => config.HueJitter, v => config.HueJitter = v, d.HueJitter, 0f, 0.5f,
+                "Each strand is randomly up to this much brighter or darker.", 0, "%", 100f);
+            changed |= Color("Ambient light", () => config.AmbientColor, v => config.AmbientColor = v, d.AmbientColor,
+                "Synthetic fill light, linear RGB.");
+            changed |= Direction("Light direction", () => config.LightDirection, v => config.LightDirection = v, d.LightDirection,
+                "Synthetic key light: the direction from the fur towards the light, in world axes (Y is up).");
+            changed |= Slider("Key light", () => config.LightIntensity, v => config.LightIntensity = v, d.LightIntensity, 0f, 3f,
+                "Strength of the synthetic key light.", 2, "x");
+            changed |= Slider("Game lighting", () => config.SceneLighting, v => config.SceneLighting = v, d.SceneLighting, 0f, 1f,
+                "0% = synthetic light only. 100% = the fur's brightness follows how the game lit the item around each root (sun, lamps, shadows).", 0, "%", 100f);
+            changed |= Slider("Game lighting gain", () => config.SceneGain, v => config.SceneGain = v, d.SceneGain, 0.5f, 10f,
+                "Brightness multiplier on the game's lighting: about 1 / the item's brightness in full sun (0.66 gives 1.5).", 2, "x");
+            changed |= Slider("Exposure", () => config.Exposure, v => config.Exposure = v, d.Exposure, 0.1f, 8f,
+                "Linear multiplier before tone mapping (1.6x is about +0.7 EV).", 2, "x");
+            changed |= Slider("Depth absorption", () => config.Absorption, v => config.Absorption = v, d.Absorption, 0f, 6f,
+                "How much darker and more saturated the colour gets towards the roots: there it is the fur colour x fur colour^this.");
+            changed |= Slider("Looking-in absorption", () => config.FacingDepth, v => config.FacingDepth = v, d.FacingDepth, 0f, 10f,
+                "Extra depth absorption where you look straight down into the fur: the absorption is multiplied by 1 + this x facing^8.", 1, "x");
+            changed |= Slider("AgX tone map", () => config.AgxToneMap, v => config.AgxToneMap = v, d.AgxToneMap, 0f, 1f,
+                "Blend from a plain gamma curve (0%) to Blender's AgX view transform (100%), as in the reference renders.", 0, "%", 100f);
+            changed |= Slider("Soft lighting", () => config.SurfaceLighting, v => config.SurfaceLighting = v, d.SurfaceLighting, 0f, 1f,
+                "0% = per-strand hair lighting (Kajiya-Kay). 100% = soft wrap lighting on the direction the fur grows.", 0, "%", 100f);
+            changed |= Slider("Sheen", () => config.Specular, v => config.Specular = v, d.Specular, 0f, 1f,
+                "Strength of the white sheen; real hair reflects about 5%.", 0, "%", 100f);
+            changed |= Slider("Gamma", () => config.OutputGamma, v => config.OutputGamma = v, d.OutputGamma, 1f, 3f,
+                "Output curve while AgX is below 100%, and the curve used to read the game's frame for game lighting.");
         }
         if (ImGui.CollapsingHeader("Depth / debug"))
         {
-            var bind = config.BackBufferBind;
-            if (ImGui.SliderInt("Draw point (-1 auto, 0 over UI, N = bind N)", ref bind, -1, 8)) { config.BackBufferBind = bind; changed = true; }
+            changed |= SliderInt("Draw point", () => config.BackBufferBind, v => config.BackBufferBind = v, d.BackBufferBind, -1, 8,
+                "Where in the game's frame to draw: -1 = automatic (before the UI), 0 = at Present (over the UI), N = right after the Nth back-buffer bind.");
             if (ImGui.Button("Log one frame's render targets")) traceRequested = true;
             ImGui.SameLine();
             if (ImGui.Button("Run injection self-test") && testCases == null) StartSelfTest();
-            changed |= Check("Occlude with scene depth", () => config.UseSceneDepth, v => config.UseSceneDepth = v);
-            changed |= Check("Skip hidden strands", () => config.CullHiddenStrands, v => config.CullHiddenStrands = v);
-            changed |= Slider("Depth bias (m)", () => config.DepthBiasMeters, v => config.DepthBiasMeters = v, 0f, 0.1f);
-            changed |= Slider("Depth UV scale (0 = auto)", () => config.DepthUvScaleOverride, v => config.DepthUvScaleOverride = v, 0f, 2f);
-            changed |= Check("Debug: solid magenta", () => config.DebugSolid, v => config.DebugSolid = v);
-            changed |= Check("Temporal dither", () => config.TemporalDither, v => config.TemporalDither = v);
+            changed |= Check("Occlude with scene depth", () => config.UseSceneDepth, v => config.UseSceneDepth = v, d.UseSceneDepth,
+                "Hide fur behind the scene, the character's own body included. Off: fur draws over everything.");
+            changed |= Check("Skip hidden strands", () => config.CullHiddenStrands, v => config.CullHiddenStrands = v, d.CullHiddenStrands,
+                "Don't draw strands outside the view or wholly behind the scene. Faster; looks the same.");
+            changed |= Slider("Depth bias", () => config.DepthBiasMeters, v => config.DepthBiasMeters = v, d.DepthBiasMeters, 0f, 0.1f,
+                "Fur up to this far behind the scene still draws: the roots sit on the item's own surface.", 1, " cm", 100f);
+            changed |= Slider("Depth UV scale", () => config.DepthUvScaleOverride, v => config.DepthUvScaleOverride = v, d.DepthUvScaleOverride, 0f, 2f,
+                "Scene depth texels per screen pixel. 0 = automatic (depth size / screen size).");
+            changed |= Check("Debug: solid magenta", () => config.DebugSolid, v => config.DebugSolid = v, d.DebugSolid,
+                "Draw strands opaque magenta, without the undercoat, to check where they are.");
+            changed |= Check("Temporal dither", () => config.TemporalDither, v => config.TemporalDither = v, d.TemporalDither,
+                "Change each strand's transparency pattern every frame instead of keeping it fixed.");
             if (ImGui.Button("Reload fur")) reloadItems = true;
             ImGui.SameLine();
             if (ImGui.Button("Reset settings")) { CopyDefaults(); changed = true; }
@@ -711,28 +754,70 @@ public sealed unsafe class Plugin : IDalamudPlugin
         foreach (var p in typeof(Configuration).GetProperties()) if (p.CanWrite) p.SetValue(config, p.GetValue(d));
     }
 
-    private static bool Check(string label, Func<bool> get, Action<bool> set)
+    private static readonly Configuration Defaults = new();
+    private const float BaseStrandsPerCm2 = FurGrower.StrandsPerM2 / 10_000f;
+
+    private static bool Check(string label, Func<bool> get, Action<bool> set, bool initial, string help)
     {
         var v = get();
-        if (!ImGui.Checkbox(label, ref v)) return false;
-        set(v);
-        return true;
+        var changed = ImGui.Checkbox(label, ref v);
+        if (changed) set(v);
+        return HelpAndReset(label, help, initial ? "on" : "off", () => set(initial)) | changed;
     }
 
-    private static bool Slider(string label, Func<float> get, Action<float> set, float min, float max)
+    /// <summary>Shown as value x <paramref name="scale"/> with <paramref name="decimals"/> and <paramref name="unit"/>; stored unscaled.</summary>
+    private static bool Slider(string label, Func<float> get, Action<float> set, float initial, float min, float max, string help,
+        int decimals = 2, string unit = "", float scale = 1f)
     {
-        var v = get();
-        if (!ImGui.SliderFloat(label, ref v, min, max)) return false;
-        set(v);
-        return true;
+        var v = get() * scale;
+        // AlwaysClamp: Ctrl+click typing would otherwise save values outside the range.
+        var changed = ImGui.SliderFloat(label, ref v, min * scale, max * scale, $"%.{decimals}f{unit.Replace("%", "%%")}", ImGuiSliderFlags.AlwaysClamp);
+        if (changed) set(v / scale);
+        return HelpAndReset(label, help, (initial * scale).ToString($"F{decimals}", CultureInfo.InvariantCulture) + unit, () => set(initial)) | changed;
     }
 
-    private static bool Color(string label, Func<Vector3> get, Action<Vector3> set)
+    private static bool SliderInt(string label, Func<int> get, Action<int> set, int initial, int min, int max, string help)
     {
         var v = get();
-        if (!ImGui.ColorEdit3(label, ref v, ImGuiColorEditFlags.Float)) return false;
-        set(v);
-        return true;
+        var changed = ImGui.SliderInt(label, ref v, min, max, "%d", ImGuiSliderFlags.AlwaysClamp);
+        if (changed) set(v);
+        return HelpAndReset(label, help, initial.ToString(), () => set(initial)) | changed;
+    }
+
+    private static bool Direction(string label, Func<Vector3> get, Action<Vector3> set, Vector3 initial, string help)
+    {
+        var v = get();
+        var changed = ImGui.SliderFloat3(label, ref v, -1f, 1f, "%.2f", ImGuiSliderFlags.AlwaysClamp);
+        if (changed) set(v);
+        return HelpAndReset(label, help, string.Create(CultureInfo.InvariantCulture, $"{initial.X:F2}, {initial.Y:F2}, {initial.Z:F2}"), () => set(initial)) | changed;
+    }
+
+    private static bool Color(string label, Func<Vector3> get, Action<Vector3> set, Vector3 initial, string help)
+    {
+        var v = get();
+        // NoOptions: the colour editor's own right-click menu would take the place of the reset one.
+        var changed = ImGui.ColorEdit3(label, ref v, ImGuiColorEditFlags.Float | ImGuiColorEditFlags.NoOptions);
+        if (changed) set(v);
+        return HelpAndReset(label, help, string.Create(CultureInfo.InvariantCulture, $"{initial.X:F3}, {initial.Y:F3}, {initial.Z:F3}"), () => set(initial)) | changed;
+    }
+
+    // For the control just drawn: its explanation on hover and a right-click menu that resets it. True when reset.
+    private static bool HelpAndReset(string label, string help, string initial, Action reset)
+    {
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.BeginTooltip();
+            ImGui.PushTextWrapPos(ImGui.GetFontSize() * 24);
+            ImGui.TextUnformatted(help);
+            ImGui.PopTextWrapPos();
+            ImGui.EndTooltip();
+        }
+        // An explicit id: a colour editor leaves no item id of its own for the popup.
+        if (!ImGui.BeginPopupContextItem(label + "##reset", ImGuiPopupFlags.MouseButtonRight)) return false;
+        var clicked = ImGui.MenuItem($"Reset to default ({initial})");
+        if (clicked) reset();
+        ImGui.EndPopup();
+        return clicked;
     }
 
     public void Dispose()

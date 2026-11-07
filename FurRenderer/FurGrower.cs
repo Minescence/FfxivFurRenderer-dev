@@ -15,7 +15,7 @@ internal static class FurGrower
     // Mod files set the time and memory taken. Far above the largest surveyed (84,789 vertices, 127,488 triangles).
     private const int MaxVertices = 2_000_000, MaxIndices = 6_000_000;
 
-    private const float StrandsPerM2 = 152_525f; // the baked assets: 980,124 strands on coat_ril_f's 6.426 m2
+    internal const float StrandsPerM2 = 152_525f; // the baked assets: 980,124 strands on coat_ril_f's 6.426 m2
     private const float MaxLength = 0.05f, RandomTrim = 0.025f;
     private static readonly float[] Radii = [0.0003f, 0.0002535f, 0.0001902f, 0f]; // Set Hair Curve Profile, as baked
     // Clump Hair Curves: guides merged at 2.5 mm, each with a random sideways tip offset of up to 1.5 cm per axis, mixed in at
