@@ -160,7 +160,12 @@ float4 MaterialColor(Texture2D<float4> table, Texture2D<float4> index, Texture2D
         uint w, h, levels;
         diffuse.GetDimensions(0, w, h, levels);
         float3 d = diffuse.SampleGrad(LinearWrap, uv, dx, dy).rgb;
-        float3 mean = diffuse.SampleLevel(LinearWrap, float2(0.5, 0.5), levels - 1).rgb; // the smallest mip
+        // The map's mean from its 4x4 mip, all 16 texels in 4 bilinear taps: the 1x1 mip of some maps is black (a 4096x4096
+        // fur map's, with its 2x2 to 16x16 mips intact), which made the tint over 100x too bright.
+        int level = min(max((int)firstbithigh(min(w, h)) - 2, 0), (int)levels - 1);
+        float3 mean = 0;
+        [unroll] for (uint k = 0; k < 4; k++)
+            mean += diffuse.SampleLevel(LinearWrap, float2(k & 1 ? 0.75 : 0.25, k & 2 ? 0.75 : 0.25), level).rgb / 4;
         // Over the map's mean, so it varies the colour without changing its average.
         tint = d * d / max(dot(mean * mean, Luminance), 1e-3);
     }
