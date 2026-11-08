@@ -467,6 +467,8 @@ float3 SceneLit(float3 color, float2 at, float depth, float gain, float brightes
         return color;
     static const int2 taps[5] = { int2(0, 0), int2(-4, -4), int2(4, -4), int2(-4, 4), int2(4, 4) };
     float luma = 0, count = 0;
+    // Depth 0 can't lie within OwnSurface of any tap (the near plane is 0.1 m), so skip the taps.
+    [branch] if (depth > 0 || UseSceneDepth == 0)
     [unroll] for (int k = 0; k < 5; k++)
     {
         int2 p = int2(at) + taps[k];
@@ -599,16 +601,15 @@ float4 PSMain(VsOut i, uint geometry : SV_Coverage, out uint coverage : SV_Cover
     uint bits = HashU(uint3(i.pos.xy, (TemporalDither != 0 ? FrameIndex : 0u) + i.strand * 7919u));
     uint kept = (uint)(alpha * countbits(geometry) + (bits & 0xFFFF) / 65536.0);
     uint turn = (bits >> 16) & (SampleCount - 1); // SampleCount is 4 or 8
-    coverage = 0;
-    [unroll] for (uint k = 0; k < 8; k++)
-    {
-        uint s = (k + turn) & (SampleCount - 1);
-        if (k < SampleCount && kept > 0 && ((geometry >> s) & 1))
-        {
-            coverage |= 1u << s;
-            kept--;
-        }
-    }
+    // Rotate the covered samples so 'turn' is bit 0, keep the lowest 'kept' of them (the shortest prefix holding that many,
+    // by binary search on countbits), rotate back.
+    uint all = (1u << SampleCount) - 1;
+    uint rot = ((geometry >> turn) | (geometry << (SampleCount - turn))) & all;
+    uint n = 0;
+    [unroll] for (uint b = 4; b > 0; b >>= 1)
+        n = countbits(rot & ((1u << (n + b)) - 1)) < kept ? n + b : n;
+    uint keep = kept > 0 ? rot & ((2u << n) - 1) : 0;
+    coverage = ((keep << turn) | (keep >> (SampleCount - turn))) & all;
     if (coverage == 0)
         discard;
 
@@ -638,7 +639,12 @@ float4 PSMain(VsOut i, uint geometry : SV_Coverage, out uint coverage : SV_Cover
     float shadow = lerp(RootDarken, 1.0, 1.0 - buried);
     float3 color = (albedo * (AmbientColor + diffuse * LightIntensity) + spec * LightIntensity) * shadow;
 
-    return Output(i.shade.z > 0 ? color * i.shade.y : SceneLit(color, i.pos.xy, 0, i.surface.a, i.brightest));
+    // A branch: as ?: fxc flattened it, running SceneLit's taps and fallback on every fragment.
+    [branch] if (i.shade.z > 0)
+        color *= i.shade.y;
+    else
+        color = SceneLit(color, i.pos.xy, 0, i.surface.a, i.brightest);
+    return Output(color);
 }
 
 float4 VSComposite(uint vid : SV_VertexID) : SV_Position
