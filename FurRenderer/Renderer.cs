@@ -68,6 +68,9 @@ internal sealed unsafe class Renderer : IDisposable
     private ID3D11SamplerState* linearClamp, linearWrap;
     private ID3D11ComputeShader* csStrandMatrices;
     private ID3D11ComputeShader* csHiZFirst;
+    private ID3D11ComputeShader* csBucketOffsets, csScatter;
+    private ID3D11Buffer* buckets;
+    private ID3D11UnorderedAccessView* bucketsUav;
     private ID3D11ComputeShader* csHiZDown;
     // Hi-Z of the scene depth (see Fur.hlsl), rebuilt every frame for culling: all mips, and each mip on its own.
     private ID3D11Texture2D* hiZ;
@@ -190,6 +193,11 @@ internal sealed unsafe class Renderer : IDisposable
         fixed (ID3D11SamplerState** out_ = &linearWrap) Check(device->CreateSamplerState(&samplerDesc, out_), "CreateSamplerState(wrap)");
         using (var blob = Compile(source, shaderPath, "CSStrandMatrices", "cs_5_0"))
             fixed (ID3D11ComputeShader** out_ = &csStrandMatrices) Check(device->CreateComputeShader(blob.Pointer, blob.Size, null, out_), "CreateComputeShader");
+        using (var blob = Compile(source, shaderPath, "CSBucketOffsets", "cs_5_0"))
+            fixed (ID3D11ComputeShader** out_ = &csBucketOffsets) Check(device->CreateComputeShader(blob.Pointer, blob.Size, null, out_), "CreateComputeShader(bucket offsets)");
+        using (var blob = Compile(source, shaderPath, "CSScatter", "cs_5_0"))
+            fixed (ID3D11ComputeShader** out_ = &csScatter) Check(device->CreateComputeShader(blob.Pointer, blob.Size, null, out_), "CreateComputeShader(scatter)");
+        CreateUavBuffer(2 * 256, ref buckets, ref bucketsUav); // Fur.hlsl DepthBuckets
         using (var blob = Compile(source, shaderPath, "CSHiZFirst", "cs_5_0"))
             fixed (ID3D11ComputeShader** out_ = &csHiZFirst) Check(device->CreateComputeShader(blob.Pointer, blob.Size, null, out_), "CreateComputeShader(Hi-Z)");
         using (var blob = Compile(source, shaderPath, "CSHiZDown", "cs_5_0"))
@@ -381,7 +389,8 @@ internal sealed unsafe class Renderer : IDisposable
     {
         public ID3D11Buffer* Points, Skins, StrandSurfaces, MeshVertices, MeshSurfaces, MeshSkins, MeshIndices, StrandMatrices, VisibleStrands;
         public ID3D11ShaderResourceView* PointsSrv, SkinsSrv, StrandSurfacesSrv, MeshVerticesSrv, MeshSurfacesSrv, MeshSkinsSrv, StrandMatricesSrv, VisibleStrandsSrv;
-        public ID3D11UnorderedAccessView* StrandMatricesUav, VisibleStrandsUav;
+        public ID3D11UnorderedAccessView* StrandMatricesUav, VisibleStrandsUav, StrandKeysUav;
+        public ID3D11Buffer* StrandKeys;
         public Matrix4x4[]? LastSkin; // the skin palette drawn last frame
         public int StrandCount;
         public uint MeshIndexCount;
@@ -397,6 +406,7 @@ internal sealed unsafe class Renderer : IDisposable
             Release(ref MeshIndices);
             Release(ref StrandMatricesUav); Release(ref StrandMatricesSrv); Release(ref StrandMatrices);
             Release(ref VisibleStrandsUav); Release(ref VisibleStrandsSrv); Release(ref VisibleStrands);
+            Release(ref StrandKeysUav); Release(ref StrandKeys);
         }
     }
 
@@ -432,6 +442,7 @@ internal sealed unsafe class Renderer : IDisposable
                 Check(device->CreateShaderResourceView((ID3D11Resource*)b.VisibleStrands, null, out_), "CreateShaderResourceView(visible strands)");
             fixed (ID3D11UnorderedAccessView** out_ = &b.VisibleStrandsUav)
                 Check(device->CreateUnorderedAccessView((ID3D11Resource*)b.VisibleStrands, null, out_), "CreateUnorderedAccessView(visible strands)");
+            CreateUavBuffer(asset.StrandCount, ref b.StrandKeys, ref b.StrandKeysUav);
             if (asset.MeshIndices.Length > 0)
             {
                 fixed (MeshVertex* p = asset.MeshVertices)
@@ -666,7 +677,7 @@ internal sealed unsafe class Renderer : IDisposable
         var psSrvs = stackalloc ID3D11ShaderResourceView*[2] { sceneDepth, sceneLumaSrv };
         ctx->PSSetShaderResources(3, 2, psSrvs);
 
-        // Culling: each item's arguments start at 8 vertices and no instances, and CSStrandMatrices adds what it keeps.
+        // Culling: each item's arguments start at 8 vertices and no instances; CSBucketOffsets stores how many it keeps.
         EnsureDrawArgs(draws.Count);
         var args = stackalloc uint[draws.Count * 4];
         for (var k = 0; k < draws.Count; k++) (args[k * 4], args[k * 4 + 1], args[k * 4 + 2], args[k * 4 + 3]) = (8, 0, 0, 0);
@@ -679,7 +690,8 @@ internal sealed unsafe class Renderer : IDisposable
 
         ctx->CSSetShader(csStrandMatrices, null, 0);
         var csSrvs = stackalloc ID3D11ShaderResourceView*[3];
-        var csUavs = stackalloc ID3D11UnorderedAccessView*[3];
+        var csUavs = stackalloc ID3D11UnorderedAccessView*[6];
+        var zeros = stackalloc uint[4];
         var vsSrvs = stackalloc ID3D11ShaderResourceView*[7];
         for (var d = 0; d < draws.Count; d++)
         {
@@ -703,10 +715,19 @@ internal sealed unsafe class Renderer : IDisposable
             csUavs[0] = item.StrandMatricesUav;
             csUavs[1] = drawArgsUav;
             csUavs[2] = item.VisibleStrandsUav;
-            ctx->CSSetUnorderedAccessViews(0, 3, csUavs, null);
+            csUavs[3] = null;
+            csUavs[4] = item.StrandKeysUav;
+            csUavs[5] = bucketsUav;
+            ctx->ClearUnorderedAccessViewUint(bucketsUav, zeros);
+            ctx->CSSetUnorderedAccessViews(0, 6, csUavs, null);
             ctx->Dispatch((drawn + 63) / 64, 1, 1);
-            csUavs[0] = csUavs[1] = csUavs[2] = null;
-            ctx->CSSetUnorderedAccessViews(0, 3, csUavs, null); // or the VS can't read them and the draw can't take its arguments
+            ctx->CSSetShader(csBucketOffsets, null, 0);
+            ctx->Dispatch(1, 1, 1);
+            ctx->CSSetShader(csScatter, null, 0);
+            ctx->Dispatch((drawn + 63) / 64, 1, 1);
+            ctx->CSSetShader(csStrandMatrices, null, 0);
+            csUavs[0] = csUavs[1] = csUavs[2] = csUavs[4] = csUavs[5] = null;
+            ctx->CSSetUnorderedAccessViews(0, 6, csUavs, null); // or the VS can't read them and the draw can't take its arguments
 
             vsSrvs[0] = item.PointsSrv;
             vsSrvs[1] = null;
@@ -1021,6 +1042,21 @@ internal sealed unsafe class Renderer : IDisposable
         ctx->PSSetShaderResources(21, 2 * MaxMaterials, mapSrvs);
     }
 
+    // A GPU-only structured buffer of 'count' uints.
+    private void CreateUavBuffer(int count, ref ID3D11Buffer* buffer, ref ID3D11UnorderedAccessView* uav)
+    {
+        var desc = new D3D11_BUFFER_DESC
+        {
+            ByteWidth = checked((uint)(count * sizeof(uint))),
+            Usage = D3D11_USAGE_DEFAULT,
+            BindFlags = (uint)D3D11_BIND_UNORDERED_ACCESS,
+            MiscFlags = (uint)D3D11_RESOURCE_MISC_BUFFER_STRUCTURED,
+            StructureByteStride = sizeof(uint),
+        };
+        fixed (ID3D11Buffer** out_ = &buffer) Check(device->CreateBuffer(&desc, null, out_), "CreateBuffer(uav)");
+        fixed (ID3D11UnorderedAccessView** out_ = &uav) Check(device->CreateUnorderedAccessView((ID3D11Resource*)buffer, null, out_), "CreateUnorderedAccessView");
+    }
+
     private void CreateStructured(void* data, int count, int stride, bool dynamic, ref ID3D11Buffer* buffer, ref ID3D11ShaderResourceView* srv)
     {
         var desc = new D3D11_BUFFER_DESC
@@ -1105,6 +1141,7 @@ internal sealed unsafe class Renderer : IDisposable
         Release(ref vsUnder); Release(ref psUnder); Release(ref vsComposite); Release(ref psComposite); Release(ref psTemporal); Release(ref psDepth);
         Release(ref psSceneLuma); Release(ref psSurfaceLight); Release(ref linearClamp); Release(ref linearWrap); Release(ref csStrandMatrices);
         Release(ref csHiZFirst); Release(ref csHiZDown);
+        Release(ref csBucketOffsets); Release(ref csScatter); Release(ref bucketsUav); Release(ref buckets);
         ReleaseHiZ();
         ReleaseDrawArgs();
         Release(ref bonesSrv); Release(ref bones);
@@ -1155,7 +1192,7 @@ internal sealed unsafe class Renderer : IDisposable
         private readonly ID3D11SamplerState* vsSampler; // s0
         private readonly ID3D11ComputeShader* cs;
         private readonly ID3D11ShaderResourceView*[] csSrvs = new ID3D11ShaderResourceView*[29]; // t0..t28
-        private readonly ID3D11UnorderedAccessView*[] csUavs = new ID3D11UnorderedAccessView*[4]; // u0..u3
+        private readonly ID3D11UnorderedAccessView*[] csUavs = new ID3D11UnorderedAccessView*[6]; // u0..u5
         private readonly ID3D11Buffer* indexBuffer;
         private readonly DXGI_FORMAT indexFormat;
         private readonly uint indexOffset;
@@ -1211,7 +1248,7 @@ internal sealed unsafe class Renderer : IDisposable
             var vss = vsSampler; ctx->VSSetSamplers(0, 1, &vss);
             ctx->CSSetShader(cs, null, 0);
             fixed (ID3D11ShaderResourceView** c = csSrvs) ctx->CSSetShaderResources(0, (uint)csSrvs.Length, c);
-            var keepCounts = stackalloc uint[4] { uint.MaxValue, uint.MaxValue, uint.MaxValue, uint.MaxValue }; // leave append/counter UAVs' hidden counts as they were
+            var keepCounts = stackalloc uint[6] { uint.MaxValue, uint.MaxValue, uint.MaxValue, uint.MaxValue, uint.MaxValue, uint.MaxValue }; // leave append/counter UAVs' hidden counts as they were
             fixed (ID3D11UnorderedAccessView** u = csUavs) ctx->CSSetUnorderedAccessViews(0, (uint)csUavs.Length, u, keepCounts);
             ctx->IASetIndexBuffer(indexBuffer, indexFormat, indexOffset);
             ReleaseAll();

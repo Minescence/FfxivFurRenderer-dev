@@ -60,7 +60,7 @@ Texture2D<float4> DiffuseMap2 : register(t27);
 Texture2D<float4> DiffuseMap3 : register(t28);
 SamplerState LinearWrap : register(s1);
 // Culling: CSStrandMatrices lists the baked strands that can show, VSMain draws only those (DrawInstancedIndirect).
-StructuredBuffer<uint> VisibleStrands : register(t17);      // in no particular order
+StructuredBuffer<uint> VisibleStrands : register(t17);      // front to back, see DepthBuckets
 RWStructuredBuffer<uint> VisibleStrandsOut : register(u2);
 RWByteAddressBuffer DrawArgs : register(u1);                // DrawInstancedIndirect arguments; this item's InstanceCount at ArgsOffset + 4
 // Hi-Z: mip L holds the farthest scene view distance over 2^(L+1) x 2^(L+1) scene depth texels; mip 0 is a power of two at
@@ -68,6 +68,13 @@ RWByteAddressBuffer DrawArgs : register(u1);                // DrawInstancedIndi
 Texture2D<float> HiZ : register(t18);
 Texture2D<float> HiZSource : register(t19);                 // the mip below the one being built
 RWTexture2D<float> HiZDest : register(u3);
+// Front-to-back order: CSStrandMatrices keys each visible strand by its depth bucket and its place in it, CSBucketOffsets turns
+// the bucket counts into offsets and the instance count, CSScatter writes the visible list in bucket order: nearest first, so
+// early-Z rejects more of the strands behind (blending is off and the depth test strict, so only equal-depth ties change).
+// Within a bucket the order stays the shuffled asset order: Morton-ordered strands drew 2.8 ms slower (2026-11-08).
+static const uint DepthBuckets = 256;
+RWStructuredBuffer<uint> StrandKeys : register(u4);         // bucket << 24 | place, or ~0 when not drawn
+RWStructuredBuffer<uint> Buckets : register(u5);            // DepthBuckets counts, then DepthBuckets offsets
 
 cbuffer Frame : register(b0)
 {
@@ -363,16 +370,22 @@ bool StrandVisible(uint strand, float4x4 m)
     return nearest <= farthest + DepthBiasMeters;
 }
 
-groupshared uint groupVisible, groupFirst;
+groupshared uint groupBuckets[DepthBuckets], groupBase[DepthBuckets];
 
-// SkinMatrix and colour per visible baked strand, once per frame instead of in each of its children's 8 vertices, and the list of
-// strands to draw. Threads of the last group past the buffer's end read zeros and their writes are dropped (out-of-bounds UAV
+// Logarithmic in view distance from 0.1 to 100 m: about 8 cm wide at 3 m.
+uint DepthBucket(float distance)
+{
+    return (uint)clamp(log2(max(distance, 0.1) / 0.1) * (DepthBuckets / log2(1000.0)), 0.0, DepthBuckets - 1.0);
+}
+
+// SkinMatrix and colour per visible baked strand, once per frame instead of in each of its children's 8 vertices, and its key
+// in the front-to-back list of strands to draw (see DepthBuckets). Threads of the last group past the buffer's end read zeros and their writes are dropped (out-of-bounds UAV
 // writes are discarded).
 [numthreads(64, 1, 1)]
 void CSStrandMatrices(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
 {
-    if (index == 0)
-        groupVisible = 0;
+    for (uint b = index; b < DepthBuckets; b += 64)
+        groupBuckets[b] = 0;
     GroupMemoryBarrierWithGroupSync();
     float4x4 m = SkinMatrix(Skins[id.x], 0);
     bool visible = id.x < DrawnStrands && StrandVisible(id.x, m);
@@ -389,20 +402,50 @@ void CSStrandMatrices(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex
         o.color = uint3(f32tof16(c.r) | f32tof16(c.g) << 16, f32tof16(c.b) | f32tof16(c.a) << 16, asuint(brightest));
         StrandMatricesOut[id.x] = o;
     }
-    // One atomic on the draw arguments per group, not per strand.
-    uint slot = 0;
+    // By the root's view distance, the place counted per group first: one global atomic per group and bucket, not per strand.
+    uint bucket = 0, place = 0;
     if (visible)
-        InterlockedAdd(groupVisible, 1, slot);
-    GroupMemoryBarrierWithGroupSync();
-    if (index == 0)
     {
-        uint first;
-        DrawArgs.InterlockedAdd(ArgsOffset + 4, groupVisible * ChildCount, first);
-        groupFirst = first / ChildCount; // instances to strands: a multiple of ChildCount
+        bucket = DepthBucket(mul(float4(mul(float4(Points[id.x * 4].xyz, 1), m).xyz, 1), ViewProj).w);
+        InterlockedAdd(groupBuckets[bucket], 1, place);
     }
     GroupMemoryBarrierWithGroupSync();
-    if (visible)
-        VisibleStrandsOut[groupFirst + slot] = id.x;
+    for (uint k = index; k < DepthBuckets; k += 64)
+        if (groupBuckets[k] > 0)
+            InterlockedAdd(Buckets[k], groupBuckets[k], groupBase[k]);
+    GroupMemoryBarrierWithGroupSync();
+    if (id.x < DrawnStrands)
+        StrandKeys[id.x] = visible ? bucket << 24 | (groupBase[bucket] + place) : ~0u;
+}
+
+groupshared uint scanned[DepthBuckets];
+
+[numthreads(DepthBuckets, 1, 1)]
+void CSBucketOffsets(uint index : SV_GroupIndex)
+{
+    uint count = Buckets[index];
+    scanned[index] = count;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint step = 1; step < DepthBuckets; step <<= 1)
+    {
+        uint add = index >= step ? scanned[index - step] : 0;
+        GroupMemoryBarrierWithGroupSync();
+        scanned[index] += add;
+        GroupMemoryBarrierWithGroupSync();
+    }
+    Buckets[DepthBuckets + index] = scanned[index] - count;
+    if (index == DepthBuckets - 1)
+        DrawArgs.Store(ArgsOffset + 4, scanned[index] * ChildCount);
+}
+
+[numthreads(64, 1, 1)]
+void CSScatter(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= DrawnStrands)
+        return;
+    uint key = StrandKeys[id.x];
+    if (key != ~0u)
+        VisibleStrandsOut[Buckets[DepthBuckets + (key >> 24)] + (key & 0xFFFFFF)] = id.x;
 }
 
 // Hi-Z mip 0 from the scene depth (sky and texels past its edge are infinitely far), then each mip from the one below.
