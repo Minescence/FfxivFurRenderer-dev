@@ -38,6 +38,8 @@ public sealed class Configuration : IPluginConfiguration
     public float FadeStart { get; set; } = 0.25f;
     /// <summary>Share of the last frames' fur kept in each frame, following its motion (Renderer's temporal pass); 0 = off.</summary>
     public float TemporalSmoothing { get; set; } = 0.8f;
+    /// <summary>8 samples per pixel in the fur layer instead of 4 (about 1.2 ms more at 1440p), where the GPU has it.</summary>
+    public bool Msaa8 { get; set; }
     public float Gravity { get; set; } = 0f;
 
     // Reference material (Fur (Principled Hair BSDF)): tip colour linear (0.641, 0.205, 0.328) multiplied by the intercept, so

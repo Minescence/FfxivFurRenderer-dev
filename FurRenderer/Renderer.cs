@@ -97,6 +97,7 @@ internal sealed unsafe class Renderer : IDisposable
     private bool depthStateReverse;
     // Fur layer: multisampled colour (premultiplied once resolved) and depth, and its single-sample resolve.
     private uint sampleCount;
+    private uint maxSampleCount; // 8 where the GPU has it; used only with Configuration.Msaa8
     private ID3D11Texture2D* furColor;
     private ID3D11RenderTargetView* furColorRtv;
     private ID3D11Texture2D* ownDepth;
@@ -211,6 +212,7 @@ internal sealed unsafe class Renderer : IDisposable
         uint colorLevels, depthLevels;
         sampleCount = device->CheckMultisampleQualityLevels(DXGI_FORMAT_R8G8B8A8_UNORM, 8, &colorLevels).SUCCEEDED && colorLevels > 0
             && device->CheckMultisampleQualityLevels(DXGI_FORMAT_D32_FLOAT, 8, &depthLevels).SUCCEEDED && depthLevels > 0 ? 8u : 4u;
+        maxSampleCount = sampleCount;
 
         var cbDesc = new D3D11_BUFFER_DESC
         {
@@ -601,6 +603,9 @@ internal sealed unsafe class Renderer : IDisposable
         if (draws.Count == 0) return;
         D3D11_TEXTURE2D_DESC bbDesc;
         backBuffer->GetDesc(&bbDesc);
+        // 4x by default: it looked the same as 8x in the user's A/B recording, for 1.2 ms less at 1440p.
+        var samples = cfg.Msaa8 ? maxSampleCount : 4u;
+        if (samples != sampleCount) (sampleCount, ownDepthW) = (samples, 0); // remakes the fur targets
         EnsureTargets(backBuffer, bbDesc);
         var reverse = IsReverseZ(proj);
         EnsureDepthState(reverse);
