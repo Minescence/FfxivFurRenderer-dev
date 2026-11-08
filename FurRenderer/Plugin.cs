@@ -55,8 +55,12 @@ public sealed unsafe class Plugin : IDalamudPlugin
         public readonly nint[] Textures = new nint[Renderer.MaterialTextures];
         public readonly nint[] LoggedTextures = new nint[Renderer.MaterialTextures]; // render thread
         public volatile FurAsset? Upload; // held for the render thread, then dropped: the strands stay on the GPU only
+        // Buffers the growth task made (Renderer.CreateBuffers is free-threaded); Retired once the render thread released the item.
+        public Renderer.FurBuffers? Prepared;
         public Renderer.FurBuffers? Buffers; // render thread
     }
+
+    private static readonly Renderer.FurBuffers Retired = new();
 
     private readonly record struct ItemDraw(FurItem Item, Matrix4x4[] Skin, nint[] Textures, Vector3? Position);
 
@@ -449,6 +453,12 @@ public sealed unsafe class Plugin : IDalamudPlugin
             try
             {
                 var asset = build();
+                // Off the render thread: making a coat's buffers held it up to 18 ms.
+                if (asset != null && renderer is { FreeThreaded: true } r)
+                {
+                    var made = r.CreateBuffers(asset);
+                    if (Interlocked.CompareExchange(ref item.Prepared, made, null) != null) made.Dispose();
+                }
                 if (asset == null)
                 {
                     Diag("item " + name, $"skipped: no fur surface, or {maxStrands:N0} strands or more");
@@ -479,7 +489,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         {
             if (!growth.IsCompleted) { snap.Growing++; return; }
             item.Growth = null;
-            if (growth.Result is { } asset) (item.BoneNames, item.Upload) = (asset.BoneNames, asset);
+            if (growth.Result is { } asset) (item.BoneNames, item.Upload) = (asset.BoneNames, Volatile.Read(ref item.Prepared) == null ? asset : null);
         }
         var bones = item.BoneNames.Length;
         if (bones == 0) return;
@@ -530,6 +540,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         while (retiredItems.TryDequeue(out var retired))
         {
             retired.Buffers?.Dispose();
+            if (Interlocked.Exchange(ref retired.Prepared, Retired) is { } prepared && prepared != Retired) prepared.Dispose();
             ReleaseTextures(retired);
         }
         while (releasedTextures.TryDequeue(out var texture)) ((ID3D11ShaderResourceView*)texture)->Release();
@@ -568,13 +579,14 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 if (textures[k] == item.LoggedTextures[k]) continue;
                 item.LoggedTextures[k] = textures[k];
                 var (kind, rank) = Math.DivRem(k, Renderer.MaxMaterials);
-                Diag($"colour {item.Name} {rank} {kind}", kind switch
-                {
-                    _ when textures[k] == 0 => kind == 0 ? "no table: fur colour" : $"no {(kind == 1 ? "index" : "diffuse")} map",
-                    0 => $"table row 0 {renderer.ReadTableDiffuse(context, (ID3D11ShaderResourceView*)textures[k])?.ToString() ?? "unreadable"}",
-                    _ => $"{(kind == 1 ? "index" : "diffuse")} map {Renderer.Describe((ID3D11ShaderResourceView*)textures[k])}",
-                });
+                var key = $"colour {item.Name} {rank} {kind}";
+                if (kind == 0 && textures[k] != 0)
+                    renderer.ReadTableDiffuse(context, (ID3D11ShaderResourceView*)textures[k], diffuse => Diag(key, $"table row 0 {diffuse?.ToString() ?? "unreadable"}"));
+                else
+                    Diag(key, textures[k] == 0 ? kind == 0 ? "no table: fur colour" : $"no {(kind == 1 ? "index" : "diffuse")} map"
+                        : $"{(kind == 1 ? "index" : "diffuse")} map {Renderer.Describe((ID3D11ShaderResourceView*)textures[k])}");
             }
+            if (item.Buffers == null && Volatile.Read(ref item.Prepared) is { } prepared && prepared != Retired) (item.Buffers, item.Prepared) = (prepared, Retired);
             if (item.Upload is { } asset)
             {
                 item.Upload = null;

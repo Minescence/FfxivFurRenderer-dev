@@ -473,43 +473,63 @@ internal sealed unsafe class Renderer : IDisposable
     }
 
     /// <summary>
-    /// Row 0 diffuse of a material's live colour table (dye applied), for the log: the shaders read it themselves. Null if it
-    /// can't be read. Waits for the GPU, so call it only when the table changes.
+    /// Row 0 diffuse of a material's live colour table (dye applied), for the log: the shaders read it themselves. Calls
+    /// <paramref name="done"/> on the render thread a few frames later (null if it can't be read): mapping the copy at once
+    /// waited for the GPU, 7-24 ms per item on a dye change.
     /// </summary>
-    public Vector3? ReadTableDiffuse(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* view)
+    public void ReadTableDiffuse(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* view, Action<Vector3?> done)
     {
         ID3D11Resource* resource;
         view->GetResource(&resource);
-        try { return ReadTableDiffuse(ctx, (ID3D11Texture2D*)resource); }
-        finally { resource->Release(); }
+        D3D11_TEXTURE2D_DESC desc;
+        ((ID3D11Texture2D*)resource)->GetDesc(&desc);
+        ID3D11Texture2D* staging = null;
+        if (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT)
+        {
+            desc.Width = desc.Height = desc.MipLevels = desc.ArraySize = 1;
+            desc.SampleDesc = new DXGI_SAMPLE_DESC { Count = 1 };
+            desc.Usage = D3D11_USAGE_STAGING;
+            desc.BindFlags = 0;
+            desc.CPUAccessFlags = (uint)D3D11_CPU_ACCESS_READ;
+            desc.MiscFlags = 0;
+            if (device->CreateTexture2D(&desc, null, &staging).FAILED) staging = null;
+        }
+        if (staging != null)
+        {
+            var box = new D3D11_BOX { right = 1, bottom = 1, back = 1 };
+            ctx->CopySubresourceRegion((ID3D11Resource*)staging, 0, 0, 0, 0, resource, 0, &box);
+            tableReads.Add(((nint)staging, done));
+        }
+        resource->Release();
+        if (staging == null) done(null);
     }
 
-    private Vector3? ReadTableDiffuse(ID3D11DeviceContext* ctx, ID3D11Texture2D* table)
+    private readonly List<(nint Staging, Action<Vector3?> Done)> tableReads = [];
+
+    // The table copies the GPU has made by now.
+    private void FinishTableReads(ID3D11DeviceContext* ctx)
     {
-        D3D11_TEXTURE2D_DESC desc;
-        table->GetDesc(&desc);
-        if (desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT) return null;
-        desc.Width = desc.Height = desc.MipLevels = desc.ArraySize = 1;
-        desc.SampleDesc = new DXGI_SAMPLE_DESC { Count = 1 };
-        desc.Usage = D3D11_USAGE_STAGING;
-        desc.BindFlags = 0;
-        desc.CPUAccessFlags = (uint)D3D11_CPU_ACCESS_READ;
-        desc.MiscFlags = 0;
-        ID3D11Texture2D* staging;
-        if (device->CreateTexture2D(&desc, null, &staging).FAILED) return null;
-        var box = new D3D11_BOX { right = 1, bottom = 1, back = 1 };
-        ctx->CopySubresourceRegion((ID3D11Resource*)staging, 0, 0, 0, 0, (ID3D11Resource*)table, 0, &box);
-        Vector3? diffuse = null;
-        D3D11_MAPPED_SUBRESOURCE mapped;
-        if (ctx->Map((ID3D11Resource*)staging, 0, D3D11_MAP_READ, 0, &mapped).SUCCEEDED)
+        for (var i = tableReads.Count - 1; i >= 0; i--)
         {
-            var texel = (Half*)mapped.pData;
-            diffuse = new Vector3((float)texel[0], (float)texel[1], (float)texel[2]);
-            ctx->Unmap((ID3D11Resource*)staging, 0);
+            var (staging, done) = tableReads[i];
+            D3D11_MAPPED_SUBRESOURCE mapped;
+            var hr = ctx->Map((ID3D11Resource*)staging, 0, D3D11_MAP_READ, (uint)D3D11_MAP_FLAG.D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+            if (hr == DXGI.DXGI_ERROR_WAS_STILL_DRAWING) continue;
+            Vector3? diffuse = null;
+            if (hr.SUCCEEDED)
+            {
+                var texel = (Half*)mapped.pData;
+                diffuse = new Vector3((float)texel[0], (float)texel[1], (float)texel[2]);
+                ctx->Unmap((ID3D11Resource*)staging, 0);
+            }
+            ((ID3D11Texture2D*)staging)->Release();
+            tableReads.RemoveAt(i);
+            done(diffuse);
         }
-        staging->Release();
-        return diffuse;
     }
+
+    /// <summary>Whether <see cref="CreateBuffers"/> may run off the render thread (the device isn't single-threaded).</summary>
+    public bool FreeThreaded => (device->GetCreationFlags() & (uint)D3D11_CREATE_DEVICE_FLAG.D3D11_CREATE_DEVICE_SINGLETHREADED) == 0;
 
     /// <summary>A texture view's size, format and mips (for the log).</summary>
     public static string Describe(ID3D11ShaderResourceView* view)
@@ -532,6 +552,7 @@ internal sealed unsafe class Renderer : IDisposable
     public void Draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* backBuffer, ID3D11ShaderResourceView* sceneDepth, ID3D11ShaderResourceView* sceneAlbedo,
         Vector2 depthSize, List<FurDraw> draws, Matrix4x4 view, Matrix4x4 proj, int childCount, Configuration cfg)
     {
+        FinishTableReads(ctx);
         if (draws.Count == 0) return;
         D3D11_TEXTURE2D_DESC bbDesc;
         backBuffer->GetDesc(&bbDesc);
@@ -1153,6 +1174,8 @@ internal sealed unsafe class Renderer : IDisposable
         ReleaseHistory();
         Release(ref rtv);
         Release(ref readback);
+        foreach (var (staging, _) in tableReads) ((ID3D11Texture2D*)staging)->Release();
+        tableReads.Clear();
         ReleaseSceneCopy();
         for (var i = 0; i < QueryFrames; i++)
         {
