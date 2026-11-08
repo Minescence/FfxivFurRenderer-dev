@@ -75,6 +75,11 @@ RWTexture2D<float> HiZDest : register(u3);
 static const uint DepthBuckets = 256;
 RWStructuredBuffer<uint> StrandKeys : register(u4);         // bucket << 24 | place, or ~0 when not drawn
 RWStructuredBuffer<uint> Buckets : register(u5);            // DepthBuckets counts, then DepthBuckets offsets
+// Two passes (CullFlags & 4): strands that passed CSOcclusion last frame draw first; the rest of those in view wait (Deferred)
+// for CSOcclusion, which tests them against a Hi-Z of the scene and the fur drawn so far, so only fur hidden by fur this frame
+// is left out.
+RWStructuredBuffer<uint> LastVisible : register(u6);        // per strand: whether it passed CSOcclusion last frame
+static const uint Deferred = 0xFFFFFFFE;
 
 cbuffer Frame : register(b0)
 {
@@ -375,7 +380,7 @@ groupshared uint groupBuckets[DepthBuckets], groupBase[DepthBuckets];
 // Logarithmic in view distance from 0.1 to 100 m: about 8 cm wide at 3 m.
 uint DepthBucket(float distance)
 {
-    return (uint)clamp(log2(max(distance, 0.1) / 0.1) * (DepthBuckets / log2(1000.0)), 0.0, DepthBuckets - 1.0);
+    return (uint)clamp(log2(max(distance, 0.1) / 0.1) * (DepthBuckets / log2(1000.0)), 0.0, DepthBuckets - 2.0); // keys stay below Deferred
 }
 
 // SkinMatrix and colour per visible baked strand, once per frame instead of in each of its children's 8 vertices, and its key
@@ -403,8 +408,9 @@ void CSStrandMatrices(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex
         StrandMatricesOut[id.x] = o;
     }
     // By the root's view distance, the place counted per group first: one global atomic per group and bucket, not per strand.
+    bool now = visible && ((CullFlags & 4) == 0 || LastVisible[id.x] != 0);
     uint bucket = 0, place = 0;
-    if (visible)
+    if (now)
     {
         bucket = DepthBucket(mul(float4(mul(float4(Points[id.x * 4].xyz, 1), m).xyz, 1), ViewProj).w);
         InterlockedAdd(groupBuckets[bucket], 1, place);
@@ -415,7 +421,66 @@ void CSStrandMatrices(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex
             InterlockedAdd(Buckets[k], groupBuckets[k], groupBase[k]);
     GroupMemoryBarrierWithGroupSync();
     if (id.x < DrawnStrands)
-        StrandKeys[id.x] = visible ? bucket << 24 | (groupBase[bucket] + place) : ~0u;
+        StrandKeys[id.x] = now ? bucket << 24 | (groupBase[bucket] + place) : visible ? Deferred : ~0u;
+}
+
+// Second pass: every strand in view is tested against the Hi-Z with the fur drawn so far (CSHiZFur), which sets LastVisible;
+// the deferred ones that pass are keyed for drawing now.
+[numthreads(64, 1, 1)]
+void CSOcclusion(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
+{
+    for (uint b = index; b < DepthBuckets; b += 64)
+        groupBuckets[b] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    uint key = id.x < DrawnStrands ? StrandKeys[id.x] : ~0u;
+    bool draw = false;
+    uint bucket = 0, place = 0;
+    if (key != ~0u)
+    {
+        StrandMatrix sm = StrandMatricesOut[id.x];
+        float4x4 m = float4x4(float4(sm.r0, 0), float4(sm.r1, 0), float4(sm.r2, 0), float4(sm.r3, 1));
+        bool seen = StrandVisible(id.x, m);
+        LastVisible[id.x] = seen ? 1 : 0;
+        draw = key == Deferred && seen;
+        if (draw)
+        {
+            bucket = DepthBucket(mul(float4(mul(float4(Points[id.x * 4].xyz, 1), m).xyz, 1), ViewProj).w);
+            InterlockedAdd(groupBuckets[bucket], 1, place);
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for (uint k = index; k < DepthBuckets; k += 64)
+        if (groupBuckets[k] > 0)
+            InterlockedAdd(Buckets[k], groupBuckets[k], groupBase[k]);
+    GroupMemoryBarrierWithGroupSync();
+    if (id.x < DrawnStrands)
+        StrandKeys[id.x] = draw ? bucket << 24 | (groupBase[bucket] + place) : ~0u;
+}
+
+// Hi-Z mip 0 for CSOcclusion: per texel the nearer of the scene and the fur drawn so far, farthest over 2 x 2 texels and over
+// the fur's samples (a sample no strand covered holds the far clear, so partly covered pixels occlude nothing).
+[numthreads(8, 8, 1)]
+void CSHiZFur(uint3 id : SV_DispatchThreadID)
+{
+    uint w, h;
+    SceneDepth.GetDimensions(w, h);
+    float farthest = 0;
+    [unroll] for (uint k = 0; k < 4; k++)
+    {
+        uint2 p = id.xy * 2 + uint2(k & 1, k >> 1);
+        float scene = all(p < uint2(w, h)) ? LinearDepth(SceneDepth.Load(int3(p, 0))) : 1e30;
+        // The farthest sample is the smallest or the largest stored depth (forward or reverse Z): convert only those two.
+        float lo = 1, hi = 0;
+        for (uint s = 0; s < SampleCount; s++)
+        {
+            float d = FurDepth.Load(int2(float2(p) / DepthUvScale), s);
+            lo = min(lo, d);
+            hi = max(hi, d);
+        }
+        float fur = max(LinearDepth(lo), LinearDepth(hi));
+        farthest = max(farthest, min(scene, fur));
+    }
+    HiZDest[id.xy] = farthest;
 }
 
 groupshared uint scanned[DepthBuckets];
@@ -444,7 +509,7 @@ void CSScatter(uint3 id : SV_DispatchThreadID)
     if (id.x >= DrawnStrands)
         return;
     uint key = StrandKeys[id.x];
-    if (key != ~0u)
+    if (key < Deferred)
         VisibleStrandsOut[Buckets[DepthBuckets + (key >> 24)] + (key & 0xFFFFFF)] = id.x;
 }
 
