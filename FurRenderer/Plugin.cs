@@ -428,8 +428,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 // race deformer. Upgrade: ask Penumbra.GetGameObjectResourcePaths.V5 for the game path.
                 var named = System.Text.RegularExpressions.Regex.Match(name, @"^c([0-9]{4})");
                 var modelRace = race != 0 && named.Success ? ushort.Parse(named.Groups[1].Value) : race;
-                var maxStrands = coatSlots ? FurGrower.MaxCoatStrands : FurGrower.MaxStrands;
-                items[key] = item = StartItem(character, modelRace, race, name, () => FurGrower.Grow(ReadModel(fur.Path), fur.FurMaterials, fur.EnabledAttributes, maxStrands), maxStrands);
+                items[key] = item = StartItem(character, modelRace, race, name, () => FurGrower.Grow(ReadModel(fur.Path), fur.FurMaterials, fur.EnabledAttributes));
             }
             AddDraw(snap, character, item, fur.Slot, fur.FurMaterials);
         }
@@ -440,8 +439,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             : dataManager.GetFile(path)?.Data ?? throw new FileNotFoundException("model not in the game data", path);
 
     // Growth runs off the game's threads (under a second); its deformer inputs are game state, so they are read here.
-    // maxStrands: the limit 'build' returns null at, for the log.
-    private FurItem StartItem(nint character, ushort modelRace, ushort race, string name, Func<FurAsset?> build, int maxStrands = FurGrower.MaxStrands)
+    private FurItem StartItem(nint character, ushort modelRace, ushort race, string name, Func<FurAsset?> build)
     {
         var parents = modelRace != race ? interop.GetBoneParents(character) : null;
         byte[]? pbd = null;
@@ -461,7 +459,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 }
                 if (asset == null)
                 {
-                    Diag("item " + name, $"skipped: no fur surface, or {maxStrands:N0} strands or more");
+                    Diag("item " + name, "skipped: no fur surface");
                     return null;
                 }
                 if (asset.BoneNames.Length > Renderer.MaxBones) throw new InvalidDataException($"{asset.BoneNames.Length} bones; max {Renderer.MaxBones}");
