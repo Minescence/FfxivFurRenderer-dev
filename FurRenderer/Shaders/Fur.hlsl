@@ -365,7 +365,7 @@ bool StrandVisible(uint strand, float4x4 m)
 
 groupshared uint groupVisible, groupFirst;
 
-// SkinMatrix and colour per baked strand, once per frame instead of in each of its children's 8 vertices, and the list of
+// SkinMatrix and colour per visible baked strand, once per frame instead of in each of its children's 8 vertices, and the list of
 // strands to draw. Threads of the last group past the buffer's end read zeros and their writes are dropped (out-of-bounds UAV
 // writes are discarded).
 [numthreads(64, 1, 1)]
@@ -374,17 +374,22 @@ void CSStrandMatrices(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex
     if (index == 0)
         groupVisible = 0;
     GroupMemoryBarrierWithGroupSync();
-    float4x4 m = SkinMatrix(Skins[id.x], 0), last = SkinMatrix(Skins[id.x], MaxBones);
-    StrandMatrix o;
-    o.r0 = m[0].xyz; o.r1 = m[1].xyz; o.r2 = m[2].xyz; o.r3 = m[3].xyz;
-    o.l0 = last[0].xyz; o.l1 = last[1].xyz; o.l2 = last[2].xyz; o.l3 = last[3].xyz;
-    uint2 surface = StrandSurfaces[id.x];
-    float brightest;
-    float4 c = SurfaceColor(surface.x, UnpackUv(surface.y), 0, 0, brightest);
-    o.color = uint3(f32tof16(c.r) | f32tof16(c.g) << 16, f32tof16(c.b) | f32tof16(c.a) << 16, asuint(brightest));
-    StrandMatricesOut[id.x] = o;
-    // One atomic on the draw arguments per group, not per strand.
+    float4x4 m = SkinMatrix(Skins[id.x], 0);
     bool visible = id.x < DrawnStrands && StrandVisible(id.x, m);
+    // Only VSMain reads the record, through the visible list.
+    [branch] if (visible)
+    {
+        float4x4 last = SkinMatrix(Skins[id.x], MaxBones);
+        StrandMatrix o;
+        o.r0 = m[0].xyz; o.r1 = m[1].xyz; o.r2 = m[2].xyz; o.r3 = m[3].xyz;
+        o.l0 = last[0].xyz; o.l1 = last[1].xyz; o.l2 = last[2].xyz; o.l3 = last[3].xyz;
+        uint2 surface = StrandSurfaces[id.x];
+        float brightest;
+        float4 c = SurfaceColor(surface.x, UnpackUv(surface.y), 0, 0, brightest);
+        o.color = uint3(f32tof16(c.r) | f32tof16(c.g) << 16, f32tof16(c.b) | f32tof16(c.a) << 16, asuint(brightest));
+        StrandMatricesOut[id.x] = o;
+    }
+    // One atomic on the draw arguments per group, not per strand.
     uint slot = 0;
     if (visible)
         InterlockedAdd(groupVisible, 1, slot);
