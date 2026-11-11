@@ -10,6 +10,8 @@ public sealed class Configuration : IPluginConfiguration
 
     public bool Enabled { get; set; } = true;
     public bool OnlyInGpose { get; set; }
+    /// <summary>Also draw fur on the other visible characters (players around you, actors posed in GPose).</summary>
+    public bool OtherPlayers { get; set; }
 
     /// <summary>Fraction of the packed strands drawn in normal play / in GPose.</summary>
     public float Density { get; set; } = 1.0f;

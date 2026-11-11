@@ -391,47 +391,77 @@ public sealed unsafe class Plugin : IDalamudPlugin
         if (character == 0) { snap.Skip = "no target character"; return; }
         if (!interop.TryGetCamera(out snap.View, out snap.Proj)) { snap.Skip = "camera unavailable"; return; }
         Diag("camera", $"StandardZ-derived reverseZ {interop.LastCameraReverseZ}; proj row3 {snap.Proj.M31:G4} {snap.Proj.M32:G4} {snap.Proj.M33:G4} {snap.Proj.M34:G4}; row4 {snap.Proj.M41:G4} {snap.Proj.M42:G4} {snap.Proj.M43:G4} {snap.Proj.M44:G4}");
+        AddCharacter(snap, character, interop.GetTargetObjectIndex(), "");
+        // Others' items by object index, not draw object: a sync plugin applying someone's mods redraws them.
+        if (config.OtherPlayers)
+            foreach (var (other, index) in interop.GetOtherHumans())
+                AddCharacter(snap, other, index, $"#{index}");
+        foreach (var prop in interop.GetProps())
+            AddFurModels(snap, prop, -1, 0); // props have their own skeletons: no race deformer
+        if (snap.Items.Count == 0 && snap.Growing == 0) snap.Skip = "no fur items";
+    }
+
+    // owner: "" for the target, whose items are kept by race so its GPose copy reuses them; else the suffix of the character's own items.
+    private void AddCharacter(FrameSnapshot snap, nint character, int objectIndex, string owner)
+    {
         var race = interop.GetRaceSexId(character);
         var slot = interop.GetCoatSlot(character);
-        if (slot != CoatSlot.None)
+        // Without Hikari's textures the coat's model ids are the unmodded item, as on players no sync plugin applies the mod to.
+        if (slot != CoatSlot.None && interop.FindFurModels(character, coatSlots: true) is [var worn, ..])
         {
             var male = interop.IsMale(character);
             var name = $"coat_{(slot == CoatSlot.Ring ? "ril" : "glv")}_{(male ? "m" : "f")}.furasset";
-            var key = $"{name}@c{race:D4}";
+            var key = $"{name}@c{race:D4}{owner}";
             // Baked assets hold the mod's mesh, so releases can't ship them: there the coat grows from the worn model like any other item.
             if (!bakedAssets.TryGetValue(name, out var baked)) bakedAssets[name] = baked = File.Exists(Path.Combine(AssetDirectory, name));
             if (items.TryGetValue(key, out var coat) || baked)
             {
-                coat ??= items[key] = StartItem(character, (ushort)(male ? 101 : 201), race, name, () => FurAsset.Load(Path.Combine(AssetDirectory, name)));
+                coat ??= items[key] = StartItem(character, objectIndex, (ushort)(male ? 101 : 201), race, name + owner, () => FurAsset.Load(Path.Combine(AssetDirectory, name)));
                 // Baked strands are all coloured by the worn coat's first fur material.
-                var worn = interop.FindFurModels(character, coatSlots: true) is [var w, ..] ? w : default;
                 AddDraw(snap, character, coat, worn.Slot, worn.FurMaterials);
             }
-            else AddFurModels(snap, character, race, coatSlots: true);
+            else AddFurModels(snap, character, objectIndex, race, owner, coatSlots: true);
         }
-        AddFurModels(snap, character, race);
-        foreach (var prop in interop.GetProps())
-            AddFurModels(snap, prop, 0); // props have their own skeletons: no race deformer
-        if (snap.Items.Count == 0 && snap.Growing == 0) snap.Skip = "no fur items";
+        AddFurModels(snap, character, objectIndex, race, owner);
     }
 
-    private void AddFurModels(FrameSnapshot snap, nint character, ushort race, bool coatSlots = false)
+    private void AddFurModels(FrameSnapshot snap, nint character, int objectIndex, ushort race, string owner = "", bool coatSlots = false)
     {
         foreach (var fur in interop.FindFurModels(character, coatSlots))
         {
             // Props by actor: two with the same minion have their own bones and colour tables.
-            var key = $"{fur.Path}|{fur.FurMaterials:X}|{fur.EnabledAttributes:X}@{(race != 0 ? race : character):X}";
+            var key = $"{fur.Path}|{fur.FurMaterials:X}|{fur.EnabledAttributes:X}@{(race != 0 ? race : character):X}{owner}";
             if (!items.TryGetValue(key, out var item))
             {
-                var name = Path.GetFileName(fur.Path);
-                // shortcut: takes the model's race from its file name, as all 46 surveyed models keep it; a renamed file gets no
-                // race deformer. Upgrade: ask Penumbra.GetGameObjectResourcePaths.V5 for the game path.
-                var named = System.Text.RegularExpressions.Regex.Match(name, @"^c([0-9]{4})");
-                var modelRace = race != 0 && named.Success ? ushort.Parse(named.Groups[1].Value) : race;
-                items[key] = item = StartItem(character, modelRace, race, name, () => FurGrower.Grow(ReadModel(fur.Path), fur.FurMaterials, fur.EnabledAttributes));
+                var modelRace = race != 0 ? ModelRace(fur.Path, objectIndex, race) : race;
+                items[key] = item = StartItem(character, objectIndex, modelRace, race, Path.GetFileName(fur.Path) + owner,
+                    () => FurGrower.Grow(ReadModel(fur.Path), fur.FurMaterials, fur.EnabledAttributes));
             }
             AddDraw(snap, character, item, fur.Slot, fur.FurMaterials);
         }
+    }
+
+    // The race a model was made for, from the name of the game path it was loaded for. Under Penumbra a model is a mod's file, and
+    // sync plugins (Lightless, Mare) name theirs by hash, so Penumbra's resource tree (EQDP-resolved) gives that path. Without an
+    // answer the file's own name is the guess.
+    private ushort ModelRace(string path, int objectIndex, ushort race)
+    {
+        var name = Path.GetFileName(path);
+        if (Path.IsPathRooted(path) && objectIndex is >= 0 and <= ushort.MaxValue)
+        {
+            try
+            {
+                var trees = pluginInterface.GetIpcSubscriber<ushort[], Dictionary<string, HashSet<string>>?[]>("Penumbra.GetGameObjectResourcePaths.V5")
+                    .InvokeFunc([(ushort)objectIndex]);
+                var normal = path.Replace('\\', '/');
+                if (trees is [{ } files]
+                    && files.FirstOrDefault(f => string.Equals(f.Key.Replace('\\', '/'), normal, StringComparison.OrdinalIgnoreCase)).Value?.FirstOrDefault() is { } gamePath)
+                    name = Path.GetFileName(gamePath);
+            }
+            catch (Dalamud.Plugin.Ipc.Exceptions.IpcError) { } // Penumbra not loaded
+        }
+        var named = System.Text.RegularExpressions.Regex.Match(name, @"^c([0-9]{4})");
+        return named.Success ? ushort.Parse(named.Groups[1].Value) : race;
     }
 
     private byte[] ReadModel(string path)
@@ -439,12 +469,12 @@ public sealed unsafe class Plugin : IDalamudPlugin
             : dataManager.GetFile(path)?.Data ?? throw new FileNotFoundException("model not in the game data", path);
 
     // Growth runs off the game's threads (under a second); its deformer inputs are game state, so they are read here.
-    private FurItem StartItem(nint character, ushort modelRace, ushort race, string name, Func<FurAsset?> build)
+    private FurItem StartItem(nint character, int objectIndex, ushort modelRace, ushort race, string name, Func<FurAsset?> build)
     {
         var parents = modelRace != race ? interop.GetBoneParents(character) : null;
         byte[]? pbd = null;
         var pbdSource = "";
-        if (parents != null) (pbd, pbdSource) = ReadPbd(interop.GetTargetObjectIndex());
+        if (parents != null) (pbd, pbdSource) = ReadPbd(objectIndex);
         var item = new FurItem { Name = name, LastUsed = frame };
         item.Growth = Task.Run(() =>
         {
@@ -674,6 +704,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
         var d = Defaults;
         changed |= Check("Enabled", () => config.Enabled, v => config.Enabled = v, d.Enabled, "Draw fur.");
         changed |= Check("Only in GPose", () => config.OnlyInGpose, v => config.OnlyInGpose = v, d.OnlyInGpose, "Draw fur only in GPose.");
+        changed |= Check("Other players", () => config.OtherPlayers, v => config.OtherPlayers = v, d.OtherPlayers,
+            "Also draw fur on the other characters around you and on actors posed in GPose. Others wear a mod's items on your screen only when a sync plugin (Lightless, Mare, Snowcloak) applies their mods. Each fur coat costs GPU time and about 230 MB of GPU memory, like your own.");
         if (ImGui.CollapsingHeader("Strands", ImGuiTreeNodeFlags.DefaultOpen))
         {
             const string densityHelp = " 100% = every base strand: 15.3 per cm² of the item's surface (152,525 per m²), each drawn 'Strands per base strand' times.";

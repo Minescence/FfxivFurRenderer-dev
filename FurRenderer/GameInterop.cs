@@ -440,6 +440,25 @@ internal sealed unsafe class GameInterop : IDisposable
             props.Add((nint)character);
     }
 
+    /// <summary>Visible humans other than the target, as CharacterBase addresses with their object indices: players, NPCs, cutscene and GPose actors.</summary>
+    public List<(nint Character, int ObjectIndex)> GetOtherHumans()
+    {
+        var humans = new List<(nint, int)>();
+        var manager = FFXIVClientStructs.FFXIV.Client.Game.Object.GameObjectManager.Instance();
+        if (manager == null)
+            return humans;
+        var target = GetTargetObject();
+        // From 1: object 0 is the local player, the target or hidden behind its GPose copy.
+        for (var i = 1; i < CutsceneObjectEnd; i++)
+        {
+            var gameObject = manager->Objects.IndexSorted[i].Value;
+            var character = gameObject == null || gameObject == target ? null : AsCharacter((nint)gameObject->DrawObject);
+            if (character != null && character->GetModelType() == CharacterBase.ModelType.Human && character->DrawObject.IsVisible)
+                humans.Add(((nint)character, i));
+        }
+        return humans;
+    }
+
     /// <summary>
     /// The live colour table (dye applied) of a slot's material as the game's shader view, not AddRef'd; null while there is
     /// none or it isn't the float table the fur shaders read. Dyes and Glamourer/Penumbra edits replace the texture.
