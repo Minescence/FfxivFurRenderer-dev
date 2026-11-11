@@ -98,7 +98,7 @@ cbuffer Frame : register(b0)
     float Absorption;      float FacingDepth;  float CoverageScale; uint SampleCount;
     float UndercoatDarken; uint TableMask;     uint DrawnStrands; uint CullFlags;   // TableMask: bit k / 4 + k / 8 + k = ColorTable<k> / IndexMap<k> / DiffuseMap<k> is bound
     uint2 HiZSize;         uint HiZLevels;     uint ArgsOffset;   // CullFlags: 1 = outside the view, 2 = behind the scene (Hi-Z)
-    uint RecolorUndyed;    float TemporalBlend; float2 Padding;   // RecolorUndyed: items in Hikari's undyed colour take BaseColor; TemporalBlend: PSTemporal's weight of this frame (1 = no history)
+    uint RecolorUndyed;    float TemporalBlend; uint HideBuried; float Padding;   // RecolorUndyed: items in Hikari's undyed colour take BaseColor; TemporalBlend: PSTemporal's weight of this frame (1 = no history); HideBuried: see VSMain
     row_major float4x4 LastViewProj;
 };
 
@@ -322,6 +322,13 @@ VsOut VSMain(uint vid : SV_VertexID, uint instance : SV_InstanceID)
         && !(UseSceneDepth != 0 && LinearDepth(SceneDepth.Load(int3(root.xy * DepthUvScale, 0))) < root.z - OwnSurface);
     o.shade = float3(1.0 + (Hash(uint3(o.strand, 17u, 3u)) - 0.5) * 2.0 * HueJitter,
                      rootSeen ? SceneLit(1.0, root.xy, root.z, o.surface.a, o.brightest).x : 0, rootSeen ? 1 : 0);
+    // The game draws hair, a tail or an arm resting on the item a few mm above its surface, inside the fur (grown strands are at
+    // most 5 cm x LengthScale): strands rooted under it covered it and it showed through their gaps as dark streaks. Lying on
+    // the fur instead, it hides them, so they aren't drawn (all vertices at w = 0). Something further in front leaves them to
+    // the depth test, so fur still shows past its silhouette.
+    float aboveRoot = root.z - LinearDepth(SceneDepth.Load(int3(root.xy * DepthUvScale, 0)));
+    if (HideBuried != 0 && UseSceneDepth != 0 && all(root.xy >= 0) && all(root.xy < ViewportSize) && aboveRoot > OwnSurface && aboveRoot < 0.05 * LengthScale)
+        o.pos = 0;
     return o;
 }
 

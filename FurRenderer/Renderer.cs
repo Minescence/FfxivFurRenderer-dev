@@ -38,7 +38,7 @@ internal struct FrameConstants
     public float Absorption, FacingDepth, CoverageScale; public uint SampleCount;
     public float UndercoatDarken; public uint TableMask, DrawnStrands, CullFlags;
     public uint HiZWidth, HiZHeight, HiZLevels, ArgsOffset;
-    public uint RecolorUndyed; public float TemporalBlend; public Vector2 Padding;
+    public uint RecolorUndyed; public float TemporalBlend; public uint HideBuried; public float Padding;
     public Matrix4x4 LastViewProj;
 }
 
@@ -644,6 +644,7 @@ internal sealed unsafe class Renderer : IDisposable
             HueJitter = cfg.HueJitter,
             FrameIndex = frameIndex++,
             UseSceneDepth = cfg.UseSceneDepth && sceneDepth != null ? 1u : 0u,
+            HideBuried = cfg.HideBuriedStrands ? 1u : 0u,
             TemporalDither = cfg.TemporalDither ? 1u : 0u,
             DebugSolid = cfg.DebugSolid ? 1u : 0u,
             Gravity = cfg.Gravity,

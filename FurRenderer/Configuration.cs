@@ -79,6 +79,8 @@ public sealed class Configuration : IPluginConfiguration
     public bool UseSceneDepth { get; set; } = true;
     /// <summary>Skip strands outside the view or hidden behind the scene (the character's own body included) before drawing.</summary>
     public bool CullHiddenStrands { get; set; } = true;
+    /// <summary>Leave out strands rooted under something resting on the item within the fur's reach (hair, a tail), which then lies on the fur.</summary>
+    public bool HideBuriedStrands { get; set; } = true;
     /// <summary>
     /// Where to draw in the game's render commands: -1 = auto (just before the first back-buffer bind without depth that follows
     /// the scene-depth binds: after the scene is composited, before nameplates/UI), N = right after the Nth back-buffer bind,

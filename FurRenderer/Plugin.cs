@@ -798,6 +798,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 "Hide fur behind the scene, the character's own body included. Off: fur draws over everything.");
             changed |= Check("Skip hidden strands", () => config.CullHiddenStrands, v => config.CullHiddenStrands = v, d.CullHiddenStrands,
                 "Don't draw strands outside the view or wholly behind the scene. Faster; looks the same.");
+            changed |= Check("Hair lies on the fur", () => config.HideBuriedStrands, v => config.HideBuriedStrands = v, d.HideBuriedStrands,
+                "Leave out strands rooted under something resting on the item (hair, a tail), so it lies on the fur. Off: it sinks into the fur and shows through it as dark streaks.");
             changed |= Slider("Depth bias", () => config.DepthBiasMeters, v => config.DepthBiasMeters = v, d.DepthBiasMeters, 0f, 0.1f,
                 "Fur up to this far behind the scene still draws: the roots sit on the item's own surface.", 1, " cm", 100f);
             changed |= Slider("Depth UV scale", () => config.DepthUvScaleOverride, v => config.DepthUvScaleOverride = v, d.DepthUvScaleOverride, 0f, 2f,
