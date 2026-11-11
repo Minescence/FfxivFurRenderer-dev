@@ -4,7 +4,7 @@
   "Punchline": "Real strand fur on items that use Hikari's fur textures.",
   "Description": "Grows hundreds of thousands of skinned hair strands on any worn item or minion whose mod uses Hikari's fur textures, and draws them with the GPU. Follows the dye and the scene's light. Only you see it. The mods aren't included.",
   "InternalName": "FurRenderer",
-  "AssemblyVersion": "0.4.2.0",
+  "AssemblyVersion": "0.4.3.0",
   "RepoUrl": "https://github.com/Minescence/FfxivFurRenderer",
   "ApplicableVersion": "any",
   "Tags": ["visual", "gpose"],

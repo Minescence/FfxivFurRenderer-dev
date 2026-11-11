@@ -11,7 +11,7 @@
     <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <DalamudLibPath>$(APPDATA)\XIVLauncher\addon\Hooks\dev\</DalamudLibPath>
-    <Version>0.4.2</Version>
+    <Version>0.4.3</Version>
     <RootNamespace>FurRenderer</RootNamespace>
   </PropertyGroup>
 
