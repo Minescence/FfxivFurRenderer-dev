@@ -49,6 +49,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         public string[] BoneNames = [];
         public readonly BoneLookup Lookup = new();
         public int LastUsed;
+        public bool Recolor = true; // 'Recolour undyed items' applies: the player's own items, not others' (they look as the game colours them)
         // The fur materials' live colour tables, index and diffuse maps (SRVs, laid out as FurDraw.Textures), AddRef'd so a
         // replaced one's address can't be reused while it is held: a pointer change is always a new texture. Main thread; the
         // render thread releases them.
@@ -411,12 +412,13 @@ public sealed unsafe class Plugin : IDalamudPlugin
         {
             var male = interop.IsMale(character);
             var name = $"coat_{(slot == CoatSlot.Ring ? "ril" : "glv")}_{(male ? "m" : "f")}.furasset";
-            var key = $"{name}@c{race:D4}{owner}";
+            var key = $"{name}@c{race:D4}";
             // Baked assets hold the mod's mesh, so releases can't ship them: there the coat grows from the worn model like any other item.
+            // So do others' coats: theirs is the mod as their sync plugin applies it, maybe two-tone, and baked strands take one colour.
             if (!bakedAssets.TryGetValue(name, out var baked)) bakedAssets[name] = baked = File.Exists(Path.Combine(AssetDirectory, name));
-            if (items.TryGetValue(key, out var coat) || baked)
+            if (owner == "" && (items.TryGetValue(key, out var coat) || baked))
             {
-                coat ??= items[key] = StartItem(character, objectIndex, (ushort)(male ? 101 : 201), race, name + owner, () => FurAsset.Load(Path.Combine(AssetDirectory, name)));
+                coat ??= items[key] = StartItem(character, objectIndex, (ushort)(male ? 101 : 201), race, name, () => FurAsset.Load(Path.Combine(AssetDirectory, name)));
                 // Baked strands are all coloured by the worn coat's first fur material.
                 AddDraw(snap, character, coat, worn.Slot, worn.FurMaterials);
             }
@@ -436,6 +438,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 var modelRace = race != 0 ? ModelRace(fur.Path, objectIndex, race) : race;
                 items[key] = item = StartItem(character, objectIndex, modelRace, race, Path.GetFileName(fur.Path) + owner,
                     () => FurGrower.Grow(ReadModel(fur.Path), fur.FurMaterials, fur.EnabledAttributes));
+                item.Recolor = owner == "";
             }
             AddDraw(snap, character, item, fur.Slot, fur.FurMaterials);
         }
@@ -628,7 +631,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 var distance = Vector3.Distance(invView.Translation, p) / zoom;
                 if (distance > config.LodDistance) itemDensity *= Math.Max(config.LodMinDensity, MathF.Pow(config.LodDistance / distance, config.LodBias));
             }
-            draws.Add(new FurDraw(buffers, skin, textures, itemDensity));
+            draws.Add(new FurDraw(buffers, skin, textures, itemDensity, config.RecolorUndyed && item.Recolor));
             strands += buffers.StrandCount;
             drawnStrands += (int)(buffers.StrandCount * itemDensity);
         }
@@ -750,7 +753,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         if (ImGui.CollapsingHeader("Shading", ImGuiTreeNodeFlags.DefaultOpen))
         {
             changed |= Check("Recolour undyed items", () => config.RecolorUndyed, v => config.RecolorUndyed = v, d.RecolorUndyed,
-                "Items in Hikari's undyed colour take the fur colour below, so an outfit matches. Off: they keep the game's colour. Dyed items and other colours always show as the game colours them.");
+                "Your items in Hikari's undyed colour take the fur colour below, so an outfit matches. Off: they keep the game's colour. Dyed items, other colours and other players' items always show as the game colours them.");
             changed |= Color("Fur colour", () => config.BaseColor, v => config.BaseColor = v, d.BaseColor,
                 "Linear RGB, for items in Hikari's undyed colour while 'Recolour undyed items' is on.");
             changed |= Slider("Root brightness", () => config.RootDarken, v => config.RootDarken = v, d.RootDarken, 0f, 1f,

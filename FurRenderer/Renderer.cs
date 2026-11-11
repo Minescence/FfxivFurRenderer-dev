@@ -44,9 +44,10 @@ internal struct FrameConstants
 
 /// <summary>
 /// One item's fur for a frame: its skin palette, its fur materials' textures (SRVs, 0 = none: per material k the live colour
-/// table at k, the index map at MaxMaterials + k, the diffuse map at 2 MaxMaterials + k) and the share of its strands to draw.
+/// table at k, the index map at MaxMaterials + k, the diffuse map at 2 MaxMaterials + k), the share of its strands to draw and
+/// whether its undyed materials take the configured fur colour.
 /// </summary>
-internal readonly record struct FurDraw(Renderer.FurBuffers Buffers, Matrix4x4[] Skin, nint[] Textures, float Density);
+internal readonly record struct FurDraw(Renderer.FurBuffers Buffers, Matrix4x4[] Skin, nint[] Textures, float Density, bool RecolorUndyed);
 
 /// <summary>
 /// Draws fur assets (undercoat, then strands) into one multisampled fur layer and blends the resolved layer over the swap-chain
@@ -627,8 +628,7 @@ internal sealed unsafe class Renderer : IDisposable
             DepthUvScale = cfg.DepthUvScaleOverride > 0 ? new Vector2(cfg.DepthUvScaleOverride) : autoUv,
             LightDir = light,
             LightIntensity = cfg.LightIntensity,
-            BaseColor = cfg.BaseColor,
-            RecolorUndyed = cfg.RecolorUndyed ? 1u : 0u,
+            BaseColor = cfg.BaseColor, // RecolorUndyed is per item: BindMaterials
             // Without a recent result (none yet, resized, or the fur not drawn for a while), start from this frame.
             TemporalBlend = historyTime != 0 && Stopwatch.GetElapsedTime(historyTime).TotalSeconds < 0.5 ? 1f - Math.Clamp(cfg.TemporalSmoothing, 0f, 0.9f) : 1f,
             RootDarken = cfg.RootDarken,
@@ -1115,6 +1115,7 @@ internal sealed unsafe class Renderer : IDisposable
         var colorSrvs = stackalloc ID3D11ShaderResourceView*[1 + MaxMaterials]; // t12: strand surfaces, t13..: colour tables
         var mapSrvs = stackalloc ID3D11ShaderResourceView*[2 * MaxMaterials];   // t21..: index maps, then diffuse maps
         fc.TableMask = 0;
+        fc.RecolorUndyed = draw.RecolorUndyed ? 1u : 0u;
         colorSrvs[0] = draw.Buffers.StrandSurfacesSrv;
         for (var k = 0; k < MaterialTextures; k++)
         {
