@@ -40,6 +40,7 @@ internal struct FrameConstants
     public uint HiZWidth, HiZHeight, HiZLevels, ArgsOffset;
     public uint RecolorUndyed; public float TemporalBlend; public uint HideBuried; public float Padding;
     public Matrix4x4 LastViewProj;
+    public uint SeenBase, SeenDrawn, Padding1, Padding2;
 }
 
 /// <summary>
@@ -70,10 +71,18 @@ internal sealed unsafe class Renderer : IDisposable
     private ID3D11ComputeShader* csStrandMatrices;
     private ID3D11ComputeShader* csHiZFirst;
     private ID3D11ComputeShader* csBucketOffsets, csScatter;
-    private ID3D11ComputeShader* csHiZFur, csOcclusion;
     private ID3D11Buffer* buckets;
     private ID3D11UnorderedAccessView* bucketsUav;
     private ID3D11ComputeShader* csHiZDown;
+    // Seen-strand feedback: per fur layer sample the strand that won it (SeenBase + strand + 1, 0 = none), and per strand of all
+    // drawn items whether it won any or wasn't tested (CSSeen, CSStrandMatrices), copied into each item's LastSeen for the next frame.
+    private ID3D11ComputeShader* csSeen;
+    private ID3D11Texture2D* idTarget;
+    private ID3D11RenderTargetView* idRtv;
+    private ID3D11ShaderResourceView* idSrv;
+    private ID3D11Buffer* seenNow;
+    private ID3D11UnorderedAccessView* seenNowUav;
+    private uint idW, idH, idSamples, seenCapacity;
     // Hi-Z of the scene depth (see Fur.hlsl), rebuilt every frame for culling: all mips, and each mip on its own.
     private ID3D11Texture2D* hiZ;
     private ID3D11ShaderResourceView* hiZSrv;
@@ -198,15 +207,13 @@ internal sealed unsafe class Renderer : IDisposable
             fixed (ID3D11ComputeShader** out_ = &csStrandMatrices) Check(device->CreateComputeShader(blob.Pointer, blob.Size, null, out_), "CreateComputeShader");
         using (var blob = Compile(source, shaderPath, "CSBucketOffsets", "cs_5_0"))
             fixed (ID3D11ComputeShader** out_ = &csBucketOffsets) Check(device->CreateComputeShader(blob.Pointer, blob.Size, null, out_), "CreateComputeShader(bucket offsets)");
-        using (var blob = Compile(source, shaderPath, "CSHiZFur", "cs_5_0"))
-            fixed (ID3D11ComputeShader** out_ = &csHiZFur) Check(device->CreateComputeShader(blob.Pointer, blob.Size, null, out_), "CreateComputeShader(fur Hi-Z)");
-        using (var blob = Compile(source, shaderPath, "CSOcclusion", "cs_5_0"))
-            fixed (ID3D11ComputeShader** out_ = &csOcclusion) Check(device->CreateComputeShader(blob.Pointer, blob.Size, null, out_), "CreateComputeShader(occlusion)");
         using (var blob = Compile(source, shaderPath, "CSScatter", "cs_5_0"))
             fixed (ID3D11ComputeShader** out_ = &csScatter) Check(device->CreateComputeShader(blob.Pointer, blob.Size, null, out_), "CreateComputeShader(scatter)");
         CreateUavBuffer(2 * 256, ref buckets, ref bucketsUav); // Fur.hlsl DepthBuckets
         using (var blob = Compile(source, shaderPath, "CSHiZFirst", "cs_5_0"))
             fixed (ID3D11ComputeShader** out_ = &csHiZFirst) Check(device->CreateComputeShader(blob.Pointer, blob.Size, null, out_), "CreateComputeShader(Hi-Z)");
+        using (var blob = Compile(source, shaderPath, "CSSeen", "cs_5_0"))
+            fixed (ID3D11ComputeShader** out_ = &csSeen) Check(device->CreateComputeShader(blob.Pointer, blob.Size, null, out_), "CreateComputeShader(seen)");
         using (var blob = Compile(source, shaderPath, "CSHiZDown", "cs_5_0"))
             fixed (ID3D11ComputeShader** out_ = &csHiZDown) Check(device->CreateComputeShader(blob.Pointer, blob.Size, null, out_), "CreateComputeShader(Hi-Z down)");
         // 4x is guaranteed for these formats at feature level 11; 8x where the GPU has it.
@@ -382,35 +389,6 @@ internal sealed unsafe class Renderer : IDisposable
         return true;
     }
 
-    // Rebuilds the Hi-Z (made by BuildHiZ this frame) from the scene and the fur drawn so far, for CSOcclusion; binds it (t18).
-    // The fur depth must not be bound as the depth target.
-    private void BuildFurHiZ(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* sceneDepth)
-    {
-        ID3D11ShaderResourceView* none = null;
-        ctx->CSSetShaderResources(18, 1, &none);
-        ctx->CSSetShaderResources(3, 1, &sceneDepth);
-        var furDepth = ownDepthSrv;
-        ctx->CSSetShaderResources(8, 1, &furDepth);
-        ctx->CSSetShader(csHiZFur, null, 0);
-        for (var l = 0; l < hiZLevelUavs.Length; l++)
-        {
-            var uav = hiZLevelUavs[l];
-            ctx->CSSetUnorderedAccessViews(3, 1, &uav, null);
-            if (l == 1) ctx->CSSetShader(csHiZDown, null, 0);
-            if (l > 0) { var below = hiZLevelSrvs[l - 1]; ctx->CSSetShaderResources(19, 1, &below); }
-            // Only the texels over the depth: the padding past it keeps the open sky BuildHiZ wrote this frame.
-            uint w = Math.Max((hiZDepthW + (2u << l) - 1) >> (l + 1), 1u), h = Math.Max((hiZDepthH + (2u << l) - 1) >> (l + 1), 1u);
-            ctx->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
-        }
-        ID3D11UnorderedAccessView* noUav = null;
-        ctx->CSSetUnorderedAccessViews(3, 1, &noUav, null);
-        ctx->CSSetShaderResources(19, 1, &none);
-        ctx->CSSetShaderResources(3, 1, &none);
-        ctx->CSSetShaderResources(8, 1, &none);
-        var all = hiZSrv;
-        ctx->CSSetShaderResources(18, 1, &all);
-    }
-
     private void ReleaseHiZ()
     {
         for (var l = 0; l < hiZLevelSrvs.Length; l++) Release(ref hiZLevelSrvs[l]);
@@ -426,12 +404,13 @@ internal sealed unsafe class Renderer : IDisposable
     {
         public ID3D11Buffer* Points, Skins, StrandSurfaces, MeshVertices, MeshSurfaces, MeshSkins, MeshIndices, StrandMatrices, VisibleStrands;
         public ID3D11ShaderResourceView* PointsSrv, SkinsSrv, StrandSurfacesSrv, MeshVerticesSrv, MeshSurfacesSrv, MeshSkinsSrv, StrandMatricesSrv, VisibleStrandsSrv;
-        public ID3D11UnorderedAccessView* StrandMatricesUav, VisibleStrandsUav, StrandKeysUav, LastVisibleUav;
-        public ID3D11Buffer* StrandKeys, LastVisible;
-        public ID3D11Buffer* VisibleStrands2; // the second pass's list (see CSOcclusion)
-        public ID3D11ShaderResourceView* VisibleStrands2Srv;
-        public ID3D11UnorderedAccessView* VisibleStrands2Uav;
+        public ID3D11UnorderedAccessView* StrandMatricesUav, VisibleStrandsUav, StrandKeysUav;
+        public ID3D11Buffer* StrandKeys;
         public Matrix4x4[]? LastSkin; // the skin palette drawn last frame
+        public ID3D11Buffer* LastSeen; // per strand: whether it won a fur sample or wasn't tested, in the frame drawn at SeenFrame
+        public ID3D11ShaderResourceView* LastSeenSrv;
+        public long SeenFrame = -2;
+        public uint SeenDrawn; // the strands drawn then (DrawnStrands): the rest weren't tested
         public int StrandCount;
         public uint MeshIndexCount;
 
@@ -447,8 +426,7 @@ internal sealed unsafe class Renderer : IDisposable
             Release(ref StrandMatricesUav); Release(ref StrandMatricesSrv); Release(ref StrandMatrices);
             Release(ref VisibleStrandsUav); Release(ref VisibleStrandsSrv); Release(ref VisibleStrands);
             Release(ref StrandKeysUav); Release(ref StrandKeys);
-            Release(ref LastVisibleUav); Release(ref LastVisible);
-            Release(ref VisibleStrands2Uav); Release(ref VisibleStrands2Srv); Release(ref VisibleStrands2);
+            Release(ref LastSeenSrv); Release(ref LastSeen);
         }
     }
 
@@ -484,13 +462,11 @@ internal sealed unsafe class Renderer : IDisposable
                 Check(device->CreateShaderResourceView((ID3D11Resource*)b.VisibleStrands, null, out_), "CreateShaderResourceView(visible strands)");
             fixed (ID3D11UnorderedAccessView** out_ = &b.VisibleStrandsUav)
                 Check(device->CreateUnorderedAccessView((ID3D11Resource*)b.VisibleStrands, null, out_), "CreateUnorderedAccessView(visible strands)");
-            fixed (ID3D11Buffer** out_ = &b.VisibleStrands2) Check(device->CreateBuffer(&matricesDesc, null, out_), "CreateBuffer(visible strands 2)");
-            fixed (ID3D11ShaderResourceView** out_ = &b.VisibleStrands2Srv)
-                Check(device->CreateShaderResourceView((ID3D11Resource*)b.VisibleStrands2, null, out_), "CreateShaderResourceView(visible strands 2)");
-            fixed (ID3D11UnorderedAccessView** out_ = &b.VisibleStrands2Uav)
-                Check(device->CreateUnorderedAccessView((ID3D11Resource*)b.VisibleStrands2, null, out_), "CreateUnorderedAccessView(visible strands 2)");
             CreateUavBuffer(asset.StrandCount, ref b.StrandKeys, ref b.StrandKeysUav);
-            CreateUavBuffer(asset.StrandCount, ref b.LastVisible, ref b.LastVisibleUav); // any start is safe: 0 only defers a strand
+            matricesDesc.BindFlags = (uint)D3D11_BIND_SHADER_RESOURCE; // a copy target (see Draw), read by CSStrandMatrices
+            fixed (ID3D11Buffer** out_ = &b.LastSeen) Check(device->CreateBuffer(&matricesDesc, null, out_), "CreateBuffer(last seen)");
+            fixed (ID3D11ShaderResourceView** out_ = &b.LastSeenSrv)
+                Check(device->CreateShaderResourceView((ID3D11Resource*)b.LastSeen, null, out_), "CreateShaderResourceView(last seen)");
             if (asset.MeshIndices.Length > 0)
             {
                 fixed (MeshVertex* p = asset.MeshVertices)
@@ -673,8 +649,20 @@ internal sealed unsafe class Renderer : IDisposable
         ctx->ClearRenderTargetView(furColorRtv, transparent);
         ctx->ClearRenderTargetView(motionRtv, transparent);
         ctx->ClearDepthStencilView(ownDepthDsv, (uint)D3D11_CLEAR_FLAG.D3D11_CLEAR_DEPTH, reverse ? 0f : 1f, 0);
-        var furRtvs = stackalloc ID3D11RenderTargetView*[2] { furColorRtv, motionRtv };
-        ctx->OMSetRenderTargets(2, furRtvs, ownDepthDsv);
+        // Seen-strand feedback (see LastSeen in Fur.hlsl): which strands won a fur layer sample, for leaving out fur hidden by fur.
+        var feedback = cfg.CullHiddenStrands;
+        var seenBases = stackalloc uint[draws.Count];
+        for (var d = 1; d < draws.Count; d++) seenBases[d] = seenBases[d - 1] + (uint)draws[d - 1].Buffers.StrandCount;
+        if (feedback)
+        {
+            EnsureSeen(bbDesc, seenBases[draws.Count - 1] + (uint)draws[^1].Buffers.StrandCount);
+            ctx->ClearRenderTargetView(idRtv, transparent);
+            var none = stackalloc uint[4];
+            ctx->ClearUnorderedAccessViewUint(seenNowUav, none);
+        }
+        var furRtvCount = feedback ? 3u : 2u;
+        var furRtvs = stackalloc ID3D11RenderTargetView*[3] { furColorRtv, motionRtv, feedback ? idRtv : null };
+        ctx->OMSetRenderTargets(furRtvCount, furRtvs, ownDepthDsv);
         var viewport = new D3D11_VIEWPORT { Width = bbDesc.Width, Height = bbDesc.Height, MaxDepth = 1 };
         ctx->RSSetViewports(1, &viewport);
         ctx->RSSetState(raster);
@@ -735,7 +723,7 @@ internal sealed unsafe class Renderer : IDisposable
                     ctx->DrawIndexed(item.MeshIndexCount, 0, 0);
                 }
                 ctx->RSSetViewports(1, &viewport);
-                ctx->OMSetRenderTargets(2, furRtvs, ownDepthDsv); // or the map can't be read: D3D nulls a view of a bound target
+                ctx->OMSetRenderTargets(furRtvCount, furRtvs, ownDepthDsv); // or the map can't be read: D3D nulls a view of a bound target
                 ctx->GenerateMips(surfaceLightSrv);
                 var lightSrv = surfaceLightSrv;
                 ctx->PSSetShaderResources(11, 1, &lightSrv);
@@ -744,110 +732,125 @@ internal sealed unsafe class Renderer : IDisposable
                 ctx->PSSetSamplers(0, 1, &sampler);
                 ctx->VSSetSamplers(0, 1, &sampler);
             }
-            else ctx->OMSetRenderTargets(2, furRtvs, ownDepthDsv);
+            else ctx->OMSetRenderTargets(furRtvCount, furRtvs, ownDepthDsv);
         }
         var psSrvs = stackalloc ID3D11ShaderResourceView*[2] { sceneDepth, sceneLumaSrv };
         ctx->PSSetShaderResources(3, 2, psSrvs);
 
-        // Culling: each item has two draw arguments (its first pass at d, its second at draws.Count + d), starting at 8 vertices and
-        // no instances; CSBucketOffsets stores how many each pass keeps.
-        EnsureDrawArgs(2 * draws.Count);
-        var args = stackalloc uint[draws.Count * 8];
-        for (var k = 0; k < 2 * draws.Count; k++) (args[k * 4], args[k * 4 + 1], args[k * 4 + 2], args[k * 4 + 3]) = (8, 0, 0, 0);
-        var argsBox = new D3D11_BOX { right = (uint)(draws.Count * 32), bottom = 1, back = 1 };
+        // Culling: each item has a draw argument, starting at 8 vertices and no instances; CSBucketOffsets stores how many it keeps.
+        EnsureDrawArgs(draws.Count);
+        var args = stackalloc uint[draws.Count * 4];
+        for (var k = 0; k < draws.Count; k++) (args[k * 4], args[k * 4 + 1], args[k * 4 + 2], args[k * 4 + 3]) = (8, 0, 0, 0);
+        var argsBox = new D3D11_BOX { right = (uint)(draws.Count * 16), bottom = 1, back = 1 };
         ctx->UpdateSubresource((ID3D11Resource*)drawArgs, 0, &argsBox, args, 0, 0);
         fc.CullFlags = cfg.CullHiddenStrands ? 1u : 0u;
         if (fc.CullFlags != 0 && fc.UseSceneDepth != 0 && BuildHiZ(ctx, sceneDepth, depthSize))
             (fc.CullFlags, fc.HiZWidth, fc.HiZHeight, fc.HiZLevels) = (3u, hiZW, hiZH, (uint)hiZLevelUavs.Length);
-        // With a Hi-Z, a second pass leaves out strands the fur drawn in the first hides (see CSOcclusion).
-        var passes = fc.CullFlags == 3u ? 2 : 1;
-        if (passes == 2) fc.CullFlags |= 4u;
+        if (feedback) fc.CullFlags |= 4u;
         long strandInstances = 0;
 
         var csSrvs = stackalloc ID3D11ShaderResourceView*[3];
-        var csUavs = stackalloc ID3D11UnorderedAccessView*[7];
+        var csUavs = stackalloc ID3D11UnorderedAccessView*[8];
         var zeros = stackalloc uint[4];
         var vsSrvs = stackalloc ID3D11ShaderResourceView*[7];
-        for (var pass = 0; pass < passes; pass++)
+        ctx->CSSetShader(csStrandMatrices, null, 0);
+        for (var d = 0; d < draws.Count; d++)
         {
-            if (pass == 1)
+            var draw = draws[d];
+            var item = draw.Buffers;
+            var drawn = (uint)(item.StrandCount * Math.Clamp(draw.Density, 0f, 1f));
+            if (drawn == 0) continue;
+            var argsAt = (uint)(d * 16);
+            (fc.DrawnStrands, fc.ArgsOffset, fc.SeenBase) = (drawn, argsAt, seenBases[d]);
+            // Without last frame's flags (a new item, or not drawn last frame) every strand in view is drawn.
+            fc.SeenDrawn = item.SeenFrame + 1 == fc.FrameIndex ? item.SeenDrawn : 0;
+            if (feedback) (item.SeenFrame, item.SeenDrawn) = (fc.FrameIndex, drawn);
+            strandInstances += drawn * fc.ChildCount;
+            BindMaterials(ctx, draw, ref fc);
+            // Assets hold 10% of the reference strand density (Interpolate amount 0.10); thicken coverage by the shortfall so
+            // silhouettes stay as solid as the reference instead of showing the background between strands.
+            fc.CoverageScale = Math.Max(1f, item.StrandCount / (AssetDensityFraction * drawn * fc.ChildCount));
+            Upload(ctx, (ID3D11Resource*)constants, &fc, sizeof(FrameConstants));
+            UploadBones(ctx, draw);
+
+            csSrvs[0] = item.PointsSrv;
+            csSrvs[1] = item.SkinsSrv;
+            csSrvs[2] = bonesSrv;
+            ctx->CSSetShaderResources(0, 3, csSrvs);
+            csUavs[0] = item.StrandMatricesUav;
+            csUavs[1] = drawArgsUav;
+            csUavs[2] = item.VisibleStrandsUav;
+            csUavs[3] = null;
+            csUavs[4] = item.StrandKeysUav;
+            csUavs[5] = bucketsUav;
+            csUavs[6] = null;
+            csUavs[7] = feedback ? seenNowUav : null;
+            ctx->ClearUnorderedAccessViewUint(bucketsUav, zeros);
+            ctx->CSSetUnorderedAccessViews(0, 8, csUavs, null);
+            var lastSeen = item.LastSeenSrv;
+            ctx->CSSetShaderResources(35, 1, &lastSeen);
+            ctx->Dispatch((drawn + 63) / 64, 1, 1);
+            ctx->CSSetShader(csBucketOffsets, null, 0);
+            ctx->Dispatch(1, 1, 1);
+            ctx->CSSetShader(csScatter, null, 0);
+            ctx->Dispatch((drawn + 63) / 64, 1, 1);
+            ctx->CSSetShader(csStrandMatrices, null, 0);
+            for (var u = 0; u < 8; u++) csUavs[u] = null;
+            ctx->CSSetUnorderedAccessViews(0, 8, csUavs, null); // or the VS can't read them and the draw can't take its arguments
+
+            vsSrvs[0] = item.PointsSrv;
+            vsSrvs[1] = null;
+            vsSrvs[2] = bonesSrv;
+            vsSrvs[3] = sceneDepth;   // VSMain: the light at strand roots
+            vsSrvs[4] = sceneLumaSrv;
+            vsSrvs[5] = item.MeshVerticesSrv;
+            vsSrvs[6] = item.MeshSkinsSrv;
+            ctx->VSSetShaderResources(0, 7, vsSrvs);
+            var matrices = item.StrandMatricesSrv;
+            ctx->VSSetShaderResources(9, 1, &matrices);
+            var visible = item.VisibleStrandsSrv;
+            ctx->VSSetShaderResources(17, 1, &visible);
+            var meshSurfaces = item.MeshSurfacesSrv;
+            ctx->VSSetShaderResources(20, 1, &meshSurfaces);
+            // Undercoat first so strands depth-test against it; left out when checking strand placement.
+            if (item.MeshIndices != null && !cfg.DebugSolid)
             {
-                ctx->OMSetRenderTargets(2, furRtvs, null); // the fur depth is read below
-                BuildFurHiZ(ctx, sceneDepth);
-                ctx->OMSetRenderTargets(2, furRtvs, ownDepthDsv);
+                ctx->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                ctx->IASetIndexBuffer(item.MeshIndices, DXGI_FORMAT_R32_UINT, 0);
+                ctx->VSSetShader(vsUnder, null, 0);
+                ctx->PSSetShader(psUnder, null, 0);
+                ctx->DrawIndexed(item.MeshIndexCount, 0, 0);
             }
-            var cullShader = pass == 0 ? csStrandMatrices : csOcclusion;
-            ctx->CSSetShader(cullShader, null, 0);
+            ctx->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            ctx->VSSetShader(vs, null, 0);
+            ctx->PSSetShader(ps, null, 0);
+            ctx->DrawInstancedIndirect(drawArgs, argsAt);
+        }
+        if (feedback)
+        {
+            ctx->OMSetRenderTargets(2, furRtvs, ownDepthDsv); // the id target is read below
+            var ids = idSrv;
+            ctx->CSSetShaderResources(34, 1, &ids);
+            var seenUav = seenNowUav;
+            ctx->CSSetUnorderedAccessViews(7, 1, &seenUav, null);
+            ctx->CSSetShader(csSeen, null, 0);
+            ctx->Dispatch((bbDesc.Width + 7) / 8, (bbDesc.Height + 7) / 8, 1);
+            ids = null;
+            ctx->CSSetShaderResources(34, 1, &ids);
+            ctx->CSSetShaderResources(35, 1, &ids);
+            seenUav = null;
+            ctx->CSSetUnorderedAccessViews(7, 1, &seenUav, null);
             for (var d = 0; d < draws.Count; d++)
             {
-                var draw = draws[d];
-                var item = draw.Buffers;
-                var drawn = (uint)(item.StrandCount * Math.Clamp(draw.Density, 0f, 1f));
-                if (drawn == 0) continue;
-                var argsAt = (uint)((pass * draws.Count + d) * 16);
-                (fc.DrawnStrands, fc.ArgsOffset) = (drawn, argsAt);
-                if (pass == 0) strandInstances += drawn * fc.ChildCount;
-                BindMaterials(ctx, draw, ref fc);
-                // Assets hold 10% of the reference strand density (Interpolate amount 0.10); thicken coverage by the shortfall so
-                // silhouettes stay as solid as the reference instead of showing the background between strands.
-                fc.CoverageScale = Math.Max(1f, item.StrandCount / (AssetDensityFraction * drawn * fc.ChildCount));
-                Upload(ctx, (ID3D11Resource*)constants, &fc, sizeof(FrameConstants));
-                UploadBones(ctx, draw);
-
-                csSrvs[0] = item.PointsSrv;
-                csSrvs[1] = item.SkinsSrv;
-                csSrvs[2] = bonesSrv;
-                ctx->CSSetShaderResources(0, 3, csSrvs);
-                csUavs[0] = item.StrandMatricesUav;
-                csUavs[1] = drawArgsUav;
-                csUavs[2] = pass == 0 ? item.VisibleStrandsUav : item.VisibleStrands2Uav;
-                csUavs[3] = null;
-                csUavs[4] = item.StrandKeysUav;
-                csUavs[5] = bucketsUav;
-                csUavs[6] = item.LastVisibleUav;
-                ctx->ClearUnorderedAccessViewUint(bucketsUav, zeros);
-                ctx->CSSetUnorderedAccessViews(0, 7, csUavs, null);
-                ctx->Dispatch((drawn + 63) / 64, 1, 1);
-                ctx->CSSetShader(csBucketOffsets, null, 0);
-                ctx->Dispatch(1, 1, 1);
-                ctx->CSSetShader(csScatter, null, 0);
-                ctx->Dispatch((drawn + 63) / 64, 1, 1);
-                ctx->CSSetShader(cullShader, null, 0);
-                for (var u = 0; u < 7; u++) csUavs[u] = null;
-                ctx->CSSetUnorderedAccessViews(0, 7, csUavs, null); // or the VS can't read them and the draw can't take its arguments
-
-                vsSrvs[0] = item.PointsSrv;
-                vsSrvs[1] = null;
-                vsSrvs[2] = bonesSrv;
-                vsSrvs[3] = sceneDepth;   // VSMain: the light at strand roots
-                vsSrvs[4] = sceneLumaSrv;
-                vsSrvs[5] = item.MeshVerticesSrv;
-                vsSrvs[6] = item.MeshSkinsSrv;
-                ctx->VSSetShaderResources(0, 7, vsSrvs);
-                var matrices = item.StrandMatricesSrv;
-                ctx->VSSetShaderResources(9, 1, &matrices);
-                var visible = pass == 0 ? item.VisibleStrandsSrv : item.VisibleStrands2Srv;
-                ctx->VSSetShaderResources(17, 1, &visible);
-                var meshSurfaces = item.MeshSurfacesSrv;
-                ctx->VSSetShaderResources(20, 1, &meshSurfaces);
-                // Undercoat first so strands depth-test against it; left out when checking strand placement.
-                if (pass == 0 && item.MeshIndices != null && !cfg.DebugSolid)
-                {
-                    ctx->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                    ctx->IASetIndexBuffer(item.MeshIndices, DXGI_FORMAT_R32_UINT, 0);
-                    ctx->VSSetShader(vsUnder, null, 0);
-                    ctx->PSSetShader(psUnder, null, 0);
-                    ctx->DrawIndexed(item.MeshIndexCount, 0, 0);
-                }
-                ctx->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-                ctx->VSSetShader(vs, null, 0);
-                ctx->PSSetShader(ps, null, 0);
-                ctx->DrawInstancedIndirect(drawArgs, argsAt);
+                var item = draws[d].Buffers;
+                if (item.SeenFrame != fc.FrameIndex) continue; // not drawn
+                var box = new D3D11_BOX { left = seenBases[d] * 4, right = (seenBases[d] + (uint)item.StrandCount) * 4, bottom = 1, back = 1 };
+                ctx->CopySubresourceRegion((ID3D11Resource*)item.LastSeen, 0, 0, 0, 0, (ID3D11Resource*)seenNow, 0, &box);
             }
         }
         foreach (var draw in draws) draw.Buffers.LastSkin = draw.Skin;
         ctx->CopyResource((ID3D11Resource*)argsStaging[querySlot], (ID3D11Resource*)drawArgs);
-        (argsItems[querySlot], argsTotal[querySlot]) = (2 * draws.Count, strandInstances);
+        (argsItems[querySlot], argsTotal[querySlot]) = (draws.Count, strandInstances);
 
         // Resolve the fur layer, blend it with the last frames' (PSTemporal) and that over the frame.
         ctx->ResolveSubresource((ID3D11Resource*)furResolved, 0, (ID3D11Resource*)furColor, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
@@ -1132,6 +1135,29 @@ internal sealed unsafe class Renderer : IDisposable
     }
 
     // A GPU-only structured buffer of 'count' uints.
+    // The strand id target at the fur layer's size and samples, and a flag per strand of all drawn items.
+    private void EnsureSeen(D3D11_TEXTURE2D_DESC bb, uint strands)
+    {
+        if (idTarget == null || idW != bb.Width || idH != bb.Height || idSamples != sampleCount)
+        {
+            Release(ref idSrv); Release(ref idRtv); Release(ref idTarget);
+            var desc = new D3D11_TEXTURE2D_DESC
+            {
+                Width = bb.Width, Height = bb.Height, MipLevels = 1, ArraySize = 1, Format = DXGI_FORMAT_R32_UINT,
+                SampleDesc = new DXGI_SAMPLE_DESC { Count = sampleCount }, Usage = D3D11_USAGE_DEFAULT,
+                BindFlags = (uint)(D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE),
+            };
+            fixed (ID3D11Texture2D** out_ = &idTarget) Check(device->CreateTexture2D(&desc, null, out_), "CreateTexture2D(strand ids)");
+            fixed (ID3D11RenderTargetView** out_ = &idRtv) Check(device->CreateRenderTargetView((ID3D11Resource*)idTarget, null, out_), "CreateRenderTargetView(strand ids)");
+            fixed (ID3D11ShaderResourceView** out_ = &idSrv) Check(device->CreateShaderResourceView((ID3D11Resource*)idTarget, null, out_), "CreateShaderResourceView(strand ids)");
+            (idW, idH, idSamples) = (bb.Width, bb.Height, sampleCount);
+        }
+        if (seenNow != null && seenCapacity >= strands) return;
+        Release(ref seenNowUav); Release(ref seenNow);
+        seenCapacity = Math.Max(strands, 1u << 20);
+        CreateUavBuffer((int)seenCapacity, ref seenNow, ref seenNowUav);
+    }
+
     private void CreateUavBuffer(int count, ref ID3D11Buffer* buffer, ref ID3D11UnorderedAccessView* uav)
     {
         var desc = new D3D11_BUFFER_DESC
@@ -1230,7 +1256,8 @@ internal sealed unsafe class Renderer : IDisposable
         Release(ref vsUnder); Release(ref psUnder); Release(ref vsComposite); Release(ref psComposite); Release(ref psTemporal); Release(ref psDepth);
         Release(ref psSceneLuma); Release(ref psSurfaceLight); Release(ref linearClamp); Release(ref linearWrap); Release(ref csStrandMatrices);
         Release(ref csHiZFirst); Release(ref csHiZDown);
-        Release(ref csBucketOffsets); Release(ref csScatter); Release(ref csHiZFur); Release(ref csOcclusion); Release(ref bucketsUav); Release(ref buckets);
+        Release(ref csSeen); Release(ref idSrv); Release(ref idRtv); Release(ref idTarget); Release(ref seenNowUav); Release(ref seenNow);
+        Release(ref csBucketOffsets); Release(ref csScatter); Release(ref bucketsUav); Release(ref buckets);
         ReleaseHiZ();
         ReleaseDrawArgs();
         Release(ref bonesSrv); Release(ref bones);

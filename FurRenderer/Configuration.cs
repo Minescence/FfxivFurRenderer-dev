@@ -77,7 +77,10 @@ public sealed class Configuration : IPluginConfiguration
     public float AgxToneMap { get; set; } = 1f;
 
     public bool UseSceneDepth { get; set; } = true;
-    /// <summary>Skip strands outside the view or hidden behind the scene (the character's own body included) before drawing.</summary>
+    /// <summary>
+    /// Skip strands outside the view, hidden behind the scene (the character's own body included) or behind other fur (none of
+    /// their pixels showed last frame) before drawing.
+    /// </summary>
     public bool CullHiddenStrands { get; set; } = true;
     /// <summary>Leave out strands rooted under something resting on the item within the fur's reach (hair, a tail), which then lies on the fur.</summary>
     public bool HideBuriedStrands { get; set; } = true;
