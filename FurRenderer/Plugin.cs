@@ -705,112 +705,130 @@ public sealed unsafe class Plugin : IDalamudPlugin
         ImGui.Separator();
 
         var d = Defaults;
-        changed |= Check("Enabled", () => config.Enabled, v => config.Enabled = v, d.Enabled, "Draw fur.");
-        changed |= Check("Only in GPose", () => config.OnlyInGpose, v => config.OnlyInGpose = v, d.OnlyInGpose, "Draw fur only in GPose.");
+        changed |= Check("Enabled", () => config.Enabled, v => config.Enabled = v, d.Enabled, "Turn the fur on or off.");
         changed |= Check("Other players", () => config.OtherPlayers, v => config.OtherPlayers = v, d.OtherPlayers,
-            "Also draw fur on the other characters around you and on actors posed in GPose. Others wear a mod's items on your screen only when a sync plugin (Lightless, Mare, Snowcloak) applies their mods. Each fur coat costs GPU time and about 230 MB of GPU memory, like your own.");
-        if (ImGui.CollapsingHeader("Strands", ImGuiTreeNodeFlags.DefaultOpen))
+            "Also grow fur on other characters around you and on GPose actors. They only wear a fur mod on your screen when a sync plugin (Lightless, Mare, Snowcloak) applies their mods. Each coat costs about as much as your own (GPU time and ~230 MB of video memory).");
+
+        if (ImGui.CollapsingHeader("Performance", ImGuiTreeNodeFlags.DefaultOpen))
         {
-            const string densityHelp = " 100% = every base strand: 15.3 per cm² of the item's surface (152,525 per m²), each drawn 'Strands per base strand' times.";
-            changed |= Slider("Strand density", () => config.Density, v => config.Density = v, d.Density, 0f, 1f,
-                "Share of each item's base strands drawn in normal play." + densityHelp, 0, "%", 100f);
-            changed |= SliderInt("Strands per base strand", () => config.ChildCount, v => config.ChildCount = v, d.ChildCount, 1, 16,
-                "How many strands each base strand draws in normal play: itself plus copies rooted around it (1 = no copies). Multiplies the density and the cost.");
-            changed |= Slider("Strand density (GPose)", () => config.GposeDensity, v => config.GposeDensity = v, d.GposeDensity, 0f, 1f,
-                "Share of each item's base strands drawn in GPose." + densityHelp, 0, "%", 100f);
-            changed |= SliderInt("Strands per base strand (GPose)", () => config.GposeChildCount, v => config.GposeChildCount = v, d.GposeChildCount, 1, 16,
-                "How many strands each base strand draws in GPose: itself plus copies rooted around it (1 = no copies).");
+            const string density = " Higher: thicker, fuller fur, costs more. Lower: sparser fur, faster.";
+            changed |= Slider("Density", () => config.Density, v => config.Density = v, d.Density, 0f, 1f,
+                "How many of the coat's strands are drawn in normal play." + density, 0, "%", 100f);
+            changed |= SliderInt("Strands per root", () => config.ChildCount, v => config.ChildCount = v, d.ChildCount, 1, 16,
+                "Each grown strand is drawn this many times, the extra ones placed around it. Higher: denser fur, costs about that many times more. 1 = no extras.");
             ImGui.BeginDisabled();
-            ImGui.TextUnformatted($"Up close: {BaseStrandsPerCm2 * config.Density * config.ChildCount:F0} strands per cm², {BaseStrandsPerCm2 * config.GposeDensity * config.GposeChildCount:F0} in GPose.");
+            ImGui.TextUnformatted($"Up close: {BaseStrandsPerCm2 * config.Density * config.ChildCount:F0} strands per cm².");
             ImGui.EndDisabled();
-            changed |= Slider("Copy scatter radius", () => config.ChildSpread, v => config.ChildSpread = v, d.ChildSpread, 0f, 0.01f,
-                "Copies root anywhere within this distance of their base strand.", 1, " mm", 1000f);
             changed |= Check("Fewer strands far away", () => config.DistanceLod, v => config.DistanceLod = v, d.DistanceLod,
-                "Past the distance below, draw fewer strands and widen the rest, so the fur looks about the same for less GPU time. Zooming in GPose counts as closer.");
-            changed |= Slider("Full density within", () => config.LodDistance, v => config.LodDistance = v, d.LodDistance, 0.5f, 20f,
-                "Distance from the item's wearer (their feet) up to which every strand is drawn.", 1, " m");
-            changed |= Slider("LOD bias", () => config.LodBias, v => config.LodBias = v, d.LodBias, 0.25f, 3f,
-                "How fast strands thin out past that distance: the density falls with 1 / distance^this. 1 keeps the fur looking about the same; higher saves more GPU time but leaves coarser tufts, lower keeps more strands.");
+                "Draw fewer but wider strands on far-away characters. Looks about the same from a distance and saves a lot of GPU time with many coats around.");
+            changed |= Slider("Full detail within", () => config.LodDistance, v => config.LodDistance = v, d.LodDistance, 0.5f, 20f,
+                "Characters closer than this always get every strand. Higher: full detail further out, costs more. Lower: saves sooner.", 1, " m");
+            changed |= Slider("Thin-out speed", () => config.LodBias, v => config.LodBias = v, d.LodBias, 0.25f, 3f,
+                "How quickly strands thin out beyond that distance. Higher: faster, but far fur gets clumpy. Lower: keeps more strands, costs more. 1 keeps the look about the same.");
             changed |= Slider("Least density far away", () => config.LodMinDensity, v => config.LodMinDensity = v, d.LodMinDensity, 0.05f, 1f,
-                "The fewest strands drawn however far away, as a share of the density above.", 0, "%", 100f);
-            changed |= Slider("Length", () => config.LengthScale, v => config.LengthScale = v, d.LengthScale, 0.2f, 3f,
-                "Multiplier on the grown length: 2.5 to 5 cm, half that on the head and neck.", 2, "x");
-            changed |= Slider("Width", () => config.WidthScale, v => config.WidthScale = v, d.WidthScale, 0.2f, 5f,
-                "Multiplier on the strand's thickness: 0.6 mm at the root, tapering to the tip.", 2, "x");
-            changed |= Slider("Min width on screen", () => config.MinPixelWidth, v => config.MinPixelWidth = v, d.MinPixelWidth, 0.25f, 3f,
-                "Strands thinner than this on screen are drawn this wide and proportionally more transparent, so they don't shimmer.", 2, " px");
-            changed |= Slider("Opacity", () => config.Opacity, v => config.Opacity = v, d.Opacity, 0f, 1f,
-                "Multiplier on each strand's coverage.", 0, "%", 100f);
-            changed |= Slider("Droop", () => config.Gravity, v => config.Gravity = v, d.Gravity, 0f, 1.5f,
-                "Bends strands towards the ground, keeping their length: at 0.5 a horizontal strand's tip points 45° down, at 1.5 about 70°.");
-            changed |= Slider("Taper starts at", () => config.FadeStart, v => config.FadeStart = v, d.FadeStart, 0f, 0.95f,
-                "Share of the length at full width; from there the strand narrows to nothing at the tip.", 0, "%", 100f);
+                "Never thin out below this share of the density, however far away. Higher: far fur stays fuller. Lower: cheaper crowds.", 0, "%", 100f);
+            changed |= Check("Skip hidden strands", () => config.CullHiddenStrands, v => config.CullHiddenStrands = v, d.CullHiddenStrands,
+                "Don't draw strands you can't see (off screen, behind walls or behind other fur). Looks the same and roughly halves the cost; only turn off to troubleshoot.");
             changed |= Check("8x anti-aliasing", () => config.Msaa8, v => config.Msaa8 = v, d.Msaa8,
-                "Eight coverage samples per pixel in the fur instead of four: finer strand edges and transparency steps, for about 1.2 ms more GPU time at 1440p.");
+                "Smoother strand edges and see-through tips. Costs about 1.2 ms per frame more at 1440p; the difference is small.");
             changed |= Slider("Temporal smoothing", () => config.TemporalSmoothing, v => config.TemporalSmoothing = v, d.TemporalSmoothing, 0f, 0.9f,
-                "Blends each frame with the last ones, following the fur as it moves, so thin strands and tips don't twinkle. Higher is steadier but softer; 0 = off.", 0, "%", 100f);
+                "Blends each frame with the previous ones so thin strands and tips don't flicker. Higher: calmer but softer, can smear in fast motion. Lower: sharper but more shimmer. 0 = off.", 0, "%", 100f);
         }
-        if (ImGui.CollapsingHeader("Shading", ImGuiTreeNodeFlags.DefaultOpen))
+
+        if (ImGui.CollapsingHeader("GPose", ImGuiTreeNodeFlags.DefaultOpen))
+        {
+            const string density = " Higher: thicker, fuller fur, costs more. Lower: sparser fur, faster.";
+            changed |= Check("Only in GPose", () => config.OnlyInGpose, v => config.OnlyInGpose = v, d.OnlyInGpose,
+                "Show fur only in GPose. Saves all of its cost during normal play.");
+            changed |= Slider("Density (GPose)", () => config.GposeDensity, v => config.GposeDensity = v, d.GposeDensity, 0f, 1f,
+                "How many of the coat's strands are drawn in GPose, where you can afford more for screenshots." + density, 0, "%", 100f);
+            changed |= SliderInt("Strands per root (GPose)", () => config.GposeChildCount, v => config.GposeChildCount = v, d.GposeChildCount, 1, 16,
+                "The same as 'Strands per root', used in GPose. Higher: denser fur, costs about that many times more.");
+            ImGui.BeginDisabled();
+            ImGui.TextUnformatted($"Up close: {BaseStrandsPerCm2 * config.GposeDensity * config.GposeChildCount:F0} strands per cm² in GPose.");
+            ImGui.EndDisabled();
+        }
+
+        if (ImGui.CollapsingHeader("Strand shape", ImGuiTreeNodeFlags.DefaultOpen))
+        {
+            changed |= Slider("Length", () => config.LengthScale, v => config.LengthScale = v, d.LengthScale, 0.2f, 3f,
+                "Higher: longer, shaggier fur. Lower: short, velvety fur. 1x = 2.5 to 5 cm (half that on the head and neck).", 2, "x");
+            changed |= Slider("Thickness", () => config.WidthScale, v => config.WidthScale = v, d.WidthScale, 0.2f, 5f,
+                "Higher: thicker strands, fuller and more solid fur. Lower: finer, wispier strands.", 2, "x");
+            changed |= Slider("Least thickness on screen", () => config.MinPixelWidth, v => config.MinPixelWidth = v, d.MinPixelWidth, 0.25f, 3f,
+                "Strands thinner than this on screen are drawn this thick but fainter, so far fur doesn't shimmer. Higher: calmer but softer from afar. Lower: crisper but more shimmer.", 2, " px");
+            changed |= Slider("Opacity", () => config.Opacity, v => config.Opacity = v, d.Opacity, 0f, 1f,
+                "Higher: solid fur you can't see through. Lower: see-through, airy fur.", 0, "%", 100f);
+            changed |= Slider("Droop", () => config.Gravity, v => config.Gravity = v, d.Gravity, 0f, 1.5f,
+                "How much strands hang down. Higher: heavy, flowing fur. 0: strands stand straight out from the surface.");
+            changed |= Slider("Tip taper", () => config.FadeStart, v => config.FadeStart = v, d.FadeStart, 0f, 0.95f,
+                "Where along the strand it starts to narrow towards its tip. Higher: blunt, full-width strands. Lower: soft, pointed tips.", 0, "%", 100f);
+            changed |= Slider("Scatter", () => config.ChildSpread, v => config.ChildSpread = v, d.ChildSpread, 0f, 0.01f,
+                "How far the extra strands ('Strands per root') spread around their root. Higher: even, fluffy coverage. Lower: strands clump into tufts.", 1, " mm", 1000f);
+            changed |= Check("Hair lies on the fur", () => config.HideBuriedStrands, v => config.HideBuriedStrands = v, d.HideBuriedStrands,
+                "Hair or a tail resting on the coat lies on top of the fur. Off: it sinks into the fur and shows through as dark streaks.");
+        }
+
+        if (ImGui.CollapsingHeader("Colour and light", ImGuiTreeNodeFlags.DefaultOpen))
         {
             changed |= Check("Recolour undyed items", () => config.RecolorUndyed, v => config.RecolorUndyed = v, d.RecolorUndyed,
-                "Your items in Hikari's undyed colour take the fur colour below, so an outfit matches. Off: they keep the game's colour. Dyed items, other colours and other players' items always show as the game colours them.");
+                "Your undyed fur items take the fur colour below, so a whole outfit matches. Off: they keep the game's colour. Dyed items and other players' items always keep their own colours.");
             changed |= Color("Fur colour", () => config.BaseColor, v => config.BaseColor = v, d.BaseColor,
-                "Linear RGB, for items in Hikari's undyed colour while 'Recolour undyed items' is on.");
-            changed |= Slider("Root brightness", () => config.RootDarken, v => config.RootDarken = v, d.RootDarken, 0f, 1f,
-                "Light reaching the roots compared with the tips (0% = black roots).", 0, "%", 100f);
-            changed |= Slider("Undercoat", () => config.UndercoatDarken, v => config.UndercoatDarken = v, d.UndercoatDarken, 0f, 1f,
-                "Colour of the surface under the fur, as a multiple of the fur colour.", 2, "x fur colour");
-            changed |= Slider("Strand brightness variation", () => config.HueJitter, v => config.HueJitter = v, d.HueJitter, 0f, 0.5f,
-                "Each strand is randomly up to this much brighter or darker.", 0, "%", 100f);
-            changed |= Color("Ambient light", () => config.AmbientColor, v => config.AmbientColor = v, d.AmbientColor,
-                "Synthetic fill light, linear RGB.");
-            changed |= Direction("Light direction", () => config.LightDirection, v => config.LightDirection = v, d.LightDirection,
-                "Synthetic key light: the direction from the fur towards the light, in world axes (Y is up).");
-            changed |= Slider("Key light", () => config.LightIntensity, v => config.LightIntensity = v, d.LightIntensity, 0f, 3f,
-                "Strength of the synthetic key light.", 2, "x");
+                "The colour of your undyed fur items while 'Recolour undyed items' is on.");
             changed |= Slider("Game lighting", () => config.SceneLighting, v => config.SceneLighting = v, d.SceneLighting, 0f, 1f,
-                "0% = synthetic light only. 100% = the fur's brightness follows how the game lit the item around each root (sun, lamps, shadows).", 0, "%", 100f);
-            changed |= Slider("Game lighting gain", () => config.SceneGain, v => config.SceneGain = v, d.SceneGain, 0.5f, 10f,
-                "Brightness multiplier on the game's lighting: about 1 / the item's brightness in full sun (0.66 gives 1.5).", 2, "x");
+                "How much the fur follows the game's lighting (sun, lamps, shadows). Higher: fits into the scene. Lower: lit evenly by the plugin's own light, the same everywhere.", 0, "%", 100f);
+            changed |= Slider("Game lighting strength", () => config.SceneGain, v => config.SceneGain = v, d.SceneGain, 0.5f, 10f,
+                "Brightness of the fur under the game's lighting. Higher: brighter. Lower: darker.", 2, "x");
             changed |= Slider("Exposure", () => config.Exposure, v => config.Exposure = v, d.Exposure, 0.1f, 8f,
-                "Linear multiplier before tone mapping (1.6x is about +0.7 EV).", 2, "x");
-            changed |= Slider("Depth absorption", () => config.Absorption, v => config.Absorption = v, d.Absorption, 0f, 6f,
-                "How much darker and more saturated the colour gets towards the roots: there it is the fur colour x fur colour^this.");
-            changed |= Slider("Looking-in absorption", () => config.FacingDepth, v => config.FacingDepth = v, d.FacingDepth, 0f, 10f,
-                "Extra depth absorption where you look straight down into the fur: the absorption is multiplied by 1 + this x facing^8.", 1, "x");
-            changed |= Slider("AgX tone map", () => config.AgxToneMap, v => config.AgxToneMap = v, d.AgxToneMap, 0f, 1f,
-                "Blend from a plain gamma curve (0%) to Blender's AgX view transform (100%), as in the reference renders.", 0, "%", 100f);
-            changed |= Slider("Soft lighting", () => config.SurfaceLighting, v => config.SurfaceLighting = v, d.SurfaceLighting, 0f, 1f,
-                "0% = per-strand hair lighting (Kajiya-Kay). 100% = soft wrap lighting on the direction the fur grows.", 0, "%", 100f);
+                "Overall brightness of the fur. Higher: brighter. Lower: darker.", 2, "x");
+            changed |= Slider("Root brightness", () => config.RootDarken, v => config.RootDarken = v, d.RootDarken, 0f, 1f,
+                "How much light reaches deep into the fur. Higher: evenly bright fur. Lower: dark roots, more depth and contrast.", 0, "%", 100f);
+            changed |= Slider("Depth colour", () => config.Absorption, v => config.Absorption = v, d.Absorption, 0f, 6f,
+                "Deep fur gets darker and richer in colour, like real fur. Higher: stronger, more saturated shadows near the roots. 0 = off.");
+            changed |= Slider("Partings", () => config.FacingDepth, v => config.FacingDepth = v, d.FacingDepth, 0f, 10f,
+                "Extra depth colour where you look straight down into the fur (partings, swirls). Higher: darker, more visible partings.", 1, "x");
+            changed |= Slider("Undercoat", () => config.UndercoatDarken, v => config.UndercoatDarken = v, d.UndercoatDarken, 0f, 1f,
+                "Brightness of the surface under the fur, which shows through gaps. Higher: brighter gaps. Lower: darker gaps, more depth.", 2, "x fur colour");
+            changed |= Slider("Strand variation", () => config.HueJitter, v => config.HueJitter = v, d.HueJitter, 0f, 0.5f,
+                "Random brightness per strand. Higher: more natural, varied fur. Lower: one even colour.", 0, "%", 100f);
             changed |= Slider("Sheen", () => config.Specular, v => config.Specular = v, d.Specular, 0f, 1f,
-                "Strength of the white sheen; real hair reflects about 5%.", 0, "%", 100f);
+                "The soft shine on the fur. Higher: glossier. Lower: matte.", 0, "%", 100f);
+            changed |= Slider("Soft lighting", () => config.SurfaceLighting, v => config.SurfaceLighting = v, d.SurfaceLighting, 0f, 1f,
+                "Higher: soft, plush lighting. Lower: every strand lit on its own, more defined and stringy, like hair.", 0, "%", 100f);
+            changed |= Slider("Film look", () => config.AgxToneMap, v => config.AgxToneMap = v, d.AgxToneMap, 0f, 1f,
+                "Higher: softer, filmic brights that don't blow out to white (as in the reference renders). Lower: plainer, punchier colours.", 0, "%", 100f);
             changed |= Slider("Gamma", () => config.OutputGamma, v => config.OutputGamma = v, d.OutputGamma, 1f, 3f,
-                "Output curve while AgX is below 100%, and the curve used to read the game's frame for game lighting.");
+                "Fine brightness curve for the midtones while 'Film look' is below 100%. Leave at default unless the fur looks washed out or too dark.");
+            changed |= Color("Ambient light", () => config.AmbientColor, v => config.AmbientColor = v, d.AmbientColor,
+                "The plugin's own fill light, which keeps shadowed fur from going black.");
+            changed |= Slider("Key light", () => config.LightIntensity, v => config.LightIntensity = v, d.LightIntensity, 0f, 3f,
+                "Strength of the plugin's own main light. Higher: brighter highlights and sheen.", 2, "x");
+            changed |= Direction("Key light direction", () => config.LightDirection, v => config.LightDirection = v, d.LightDirection,
+                "Where the plugin's main light comes from (X, Y = up, Z).");
         }
-        if (ImGui.CollapsingHeader("Depth / debug"))
+
+        if (ImGui.CollapsingHeader("Advanced / troubleshooting"))
         {
+            ImGui.TextWrapped("Leave these at their defaults unless something looks wrong.");
+            changed |= Check("Hide fur behind objects", () => config.UseSceneDepth, v => config.UseSceneDepth = v, d.UseSceneDepth,
+                "Fur is hidden behind walls, other characters and your own body. Off: fur draws over everything.");
+            changed |= Slider("Root depth tolerance", () => config.DepthBiasMeters, v => config.DepthBiasMeters = v, d.DepthBiasMeters, 0f, 0.1f,
+                "Raise if fur roots flicker or vanish against the item's own surface. Too high: fur shows through things in front of it.", 1, " cm", 100f);
+            changed |= Slider("Depth scale override", () => config.DepthUvScaleOverride, v => config.DepthUvScaleOverride = v, d.DepthUvScaleOverride, 0f, 2f,
+                "Only for render-resolution mods where fur is hidden in the wrong places. 0 = automatic.");
             changed |= SliderInt("Draw point", () => config.BackBufferBind, v => config.BackBufferBind = v, d.BackBufferBind, -1, 8,
-                "Where in the game's frame to draw: -1 = automatic (before the UI), 0 = at Present (over the UI), N = right after the Nth back-buffer bind.");
-            if (ImGui.Button("Log one frame's render targets")) traceRequested = true;
+                "When in the game's frame the fur is drawn. -1 = automatic (under the UI). 0 = last, over the UI. Change only if fur flickers or is missing with other overlay or ReShade plugins.");
+            changed |= Check("Changing dither", () => config.TemporalDither, v => config.TemporalDither = v, d.TemporalDither,
+                "Change the strands' see-through pattern every frame. With 'Temporal smoothing' this averages out to softer fur; without it, it sparkles.");
+            changed |= Check("Show strands in magenta", () => config.DebugSolid, v => config.DebugSolid = v, d.DebugSolid,
+                "Draws every strand solid magenta to see where fur is placed.");
+            if (ImGui.Button("Regrow fur")) reloadItems = true;
             ImGui.SameLine();
-            if (ImGui.Button("Run injection self-test") && testCases == null) StartSelfTest();
-            changed |= Check("Occlude with scene depth", () => config.UseSceneDepth, v => config.UseSceneDepth = v, d.UseSceneDepth,
-                "Hide fur behind the scene, the character's own body included. Off: fur draws over everything.");
-            changed |= Check("Skip hidden strands", () => config.CullHiddenStrands, v => config.CullHiddenStrands = v, d.CullHiddenStrands,
-                "Don't draw strands outside the view, wholly behind the scene or behind other fur. Faster; looks the same.");
-            changed |= Check("Hair lies on the fur", () => config.HideBuriedStrands, v => config.HideBuriedStrands = v, d.HideBuriedStrands,
-                "Leave out strands rooted under something resting on the item (hair, a tail), so it lies on the fur. Off: it sinks into the fur and shows through it as dark streaks.");
-            changed |= Slider("Depth bias", () => config.DepthBiasMeters, v => config.DepthBiasMeters = v, d.DepthBiasMeters, 0f, 0.1f,
-                "Fur up to this far behind the scene still draws: the roots sit on the item's own surface.", 1, " cm", 100f);
-            changed |= Slider("Depth UV scale", () => config.DepthUvScaleOverride, v => config.DepthUvScaleOverride = v, d.DepthUvScaleOverride, 0f, 2f,
-                "Scene depth texels per screen pixel. 0 = automatic (depth size / screen size).");
-            changed |= Check("Debug: solid magenta", () => config.DebugSolid, v => config.DebugSolid = v, d.DebugSolid,
-                "Draw strands opaque magenta, without the undercoat, to check where they are.");
-            changed |= Check("Temporal dither", () => config.TemporalDither, v => config.TemporalDither = v, d.TemporalDither,
-                "Change each strand's transparency pattern every frame instead of keeping it fixed.");
-            if (ImGui.Button("Reload fur")) reloadItems = true;
+            if (ImGui.Button("Log one frame")) traceRequested = true;
             ImGui.SameLine();
-            if (ImGui.Button("Reset settings")) { CopyDefaults(); changed = true; }
+            if (ImGui.Button("Self-test") && testCases == null) StartSelfTest();
+            ImGui.SameLine();
+            if (ImGui.Button("Reset all settings")) { CopyDefaults(); changed = true; }
         }
         if (changed) pluginInterface.SavePluginConfig(config);
         ImGui.End();
