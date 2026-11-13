@@ -327,9 +327,14 @@ VsOut VSMain(uint vid : SV_VertexID, uint instance : SV_InstanceID)
     // The game draws hair, a tail or an arm resting on the item a few mm above its surface, inside the fur (grown strands are at
     // most 5 cm x LengthScale): strands rooted under it covered it and it showed through their gaps as dark streaks. Lying on
     // the fur instead, it hides them, so they aren't drawn (all vertices at w = 0). Something further in front leaves them to
-    // the depth test, so fur still shows past its silhouette.
+    // the depth test, so fur still shows past its silhouette. The tip must lie over it too: an object pushed through a fur
+    // tube sits just as close above the roots at its rim, but their tips stick out past its silhouette and must still show.
     float aboveRoot = root.z - LinearDepth(SceneDepth.Load(int3(root.xy * DepthUvScale, 0)));
-    if (HideBuried != 0 && UseSceneDepth != 0 && all(root.xy >= 0) && all(root.xy < ViewportSize) && aboveRoot > OwnSurface && aboveRoot < 0.05 * LengthScale)
+    float4 tipClip = mul(float4(rootWorld + tip, 1), ViewProj);
+    float2 tipPx = (tipClip.xy / tipClip.w * float2(0.5, -0.5) + 0.5) * ViewportSize;
+    float aboveTipRoot = root.z - LinearDepth(SceneDepth.Load(int3(tipPx * DepthUvScale, 0)));
+    if (HideBuried != 0 && UseSceneDepth != 0 && all(root.xy >= 0) && all(root.xy < ViewportSize) && aboveRoot > OwnSurface && aboveRoot < 0.05 * LengthScale
+        && tipClip.w > 0 && all(tipPx >= 0) && all(tipPx < ViewportSize) && aboveTipRoot > OwnSurface && aboveTipRoot < 0.05 * LengthScale)
         o.pos = 0;
     return o;
 }
