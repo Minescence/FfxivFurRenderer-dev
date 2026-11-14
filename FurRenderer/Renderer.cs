@@ -998,7 +998,7 @@ internal sealed unsafe class Renderer : IDisposable
             if (device->CreateTexture2D(&desc, null, out_).FAILED) return false; // e.g. typeless back buffer format
         fixed (ID3D11ShaderResourceView** out_ = &sceneCopySrv)
             if (device->CreateShaderResourceView((ID3D11Resource*)sceneCopy, null, out_).FAILED) { Release(ref sceneCopy); return false; }
-        desc.Format = DXGI_FORMAT_R32G32_FLOAT;
+        desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
         desc.BindFlags = (uint)(D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
         bool created;
         fixed (ID3D11Texture2D** out_ = &sceneLuma) created = device->CreateTexture2D(&desc, null, out_).SUCCEEDED;
@@ -1007,7 +1007,7 @@ internal sealed unsafe class Renderer : IDisposable
         desc.Width = Math.Max(bb.Width / SurfaceLightDivisor, 1);
         desc.Height = Math.Max(bb.Height / SurfaceLightDivisor, 1);
         desc.MipLevels = 0;
-        desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+        desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         desc.MiscFlags = (uint)D3D11_RESOURCE_MISC_GENERATE_MIPS;
         if (created) fixed (ID3D11Texture2D** out_ = &surfaceLight) created = device->CreateTexture2D(&desc, null, out_).SUCCEEDED;
         if (created) fixed (ID3D11RenderTargetView** out_ = &surfaceLightRtv) created = device->CreateRenderTargetView((ID3D11Resource*)surfaceLight, null, out_).SUCCEEDED;

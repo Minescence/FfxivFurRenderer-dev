@@ -16,7 +16,7 @@ StructuredBuffer<float4> Points : register(t0);       // xyz model/bind space, w
 StructuredBuffer<SkinData> Skins : register(t1);
 StructuredBuffer<float4> Bones : register(t2);        // 4 rows per bone (explicit rows: no matrix-packing ambiguity); from MaxBones on, last frame's
 Texture2D<float> SceneDepth : register(t3);
-Texture2D<float2> SceneLuma : register(t4);           // per pixel: the frame's linear luminance and the scene's view distance
+Texture2D<float4> SceneLuma : register(t4);           // per pixel: the frame's linear luminance, the scene's view distance, LightTint
 struct MeshVertex
 {
     float3 position;
@@ -34,7 +34,7 @@ struct StrandMatrix
 };
 StructuredBuffer<StrandMatrix> StrandMatrices : register(t9);
 RWStructuredBuffer<StrandMatrix> StrandMatricesOut : register(u0);
-Texture2D<float2> SurfaceLight : register(t11);       // 1/8 size with mips: the fur surface's luminance x coverage, coverage
+Texture2D<float4> SurfaceLight : register(t11);       // 1/8 size with mips: the fur surface's luminance x coverage, coverage, luminance x LightTint x coverage
 SamplerState LinearClamp : register(s0);
 Texture2D<float4> SceneColor : register(t10);         // copy of the lit frame (display-encoded) taken just before drawing
 Texture2D<float4> FurHistory : register(t30);         // PSTemporal's output last frame
@@ -114,8 +114,9 @@ struct VsOut
     float coverage : COVERAGE;
     nointerpolation uint strand : STRAND;
     nointerpolation float4 surface : SURFACE;   // SurfaceColor of the strand's material
-    // Per strand copy: brightness jitter, the scene light at the root (SceneLit's scale) and whether the root is usable for it.
-    nointerpolation float3 shade : SHADE;
+    // Per strand copy: brightness jitter and whether the root is usable for SceneLit; then the scene light there (SceneLit's scale).
+    nointerpolation float2 shade : SHADE;
+    nointerpolation float3 rootLight : ROOTLIGHT;
     nointerpolation float brightest : BRIGHTEST; // SurfaceColor's
     float4 lastClip : LASTCLIP; // clip position last frame
 };
@@ -322,8 +323,8 @@ VsOut VSMain(uint vid : SV_VertexID, uint instance : SV_InstanceID)
     // the item's own silhouette included.
     bool rootSeen = all(root.xy >= 4) && all(root.xy < ViewportSize - 4) && root.z > 0
         && !(UseSceneDepth != 0 && LinearDepth(SceneDepth.Load(int3(root.xy * DepthUvScale, 0))) < root.z - OwnSurface);
-    o.shade = float3(1.0 + (Hash(uint3(o.strand, 17u, 3u)) - 0.5) * 2.0 * HueJitter,
-                     rootSeen ? SceneLit(1.0, root.xy, root.z, o.surface.a, o.brightest).x : 0, rootSeen ? 1 : 0);
+    o.shade = float2(1.0 + (Hash(uint3(o.strand, 17u, 3u)) - 0.5) * 2.0 * HueJitter, rootSeen ? 1 : 0);
+    o.rootLight = rootSeen ? SceneLit(1.0, root.xy, root.z, o.surface.a, o.brightest) : 0;
     // The game draws hair, a tail or an arm resting on the item a few mm above its surface, inside the fur (grown strands are at
     // most 5 cm x LengthScale): strands rooted under it covered it and it showed through their gaps as dark streaks. Lying on
     // the fur instead, it hides them, so they aren't drawn (all vertices at w = 0). Something further in front leaves them to
@@ -546,8 +547,9 @@ bool BrighterThanItem(int2 p, float brightest)
     return dot(g * g, Luminance) > brightest * 1.5;
 }
 
-// Scales by how brightly the game lit its coat at pixel 'at', so the fur follows the scene's sun, lamps and shadows. Only
-// brightness is taken (not the coat texture's colour), averaged over a few taps so texture detail doesn't streak along strands.
+// Scales by how brightly the game lit its coat at pixel 'at', and tints by the colour of that light (LightTint), so the fur
+// follows the scene's sun, lamps and shadows. Not the coat texture's colour; averaged over a few taps so texture detail doesn't
+// streak along strands.
 // Taps more than OwnSurface from 'depth' (the surface's view distance there) or BrighterThanItem show something else:
 // background past a silhouette, or another part of the character. 'depth' 0: no point of the surface is known there (a
 // strand's own pixel lies behind the strand), so only SurfaceLight. 'gain' and 'brightest' are SurfaceColor's.
@@ -557,16 +559,18 @@ float3 SceneLit(float3 color, float2 at, float depth, float gain, float brightes
         return color;
     static const int2 taps[5] = { int2(0, 0), int2(-4, -4), int2(4, -4), int2(-4, 4), int2(4, 4) };
     float luma = 0, count = 0;
+    float2 tinted = 0; // luma x LightTint, so the brighter taps decide the hue
     // Depth 0 can't lie within OwnSurface of any tap (the near plane is 0.1 m), so skip the taps.
     [branch] if (depth > 0 || UseSceneDepth == 0)
     [unroll] for (int k = 0; k < 5; k++)
     {
         int2 p = int2(at) + taps[k];
-        float2 s = SceneLuma.Load(int3(p, 0));
+        float4 s = SceneLuma.Load(int3(p, 0));
         // s.y is 0 only off-screen (out-of-bounds read), where there is no scene to take light from.
         if (UseSceneDepth != 0 && (s.y == 0 || abs(s.y - depth) > OwnSurface) || BrighterThanItem(p, brightest))
             continue;
         luma += s.x;
+        tinted += s.x * s.zw;
         count++;
     }
     // No surface here: a strand past the silhouette whose root is off-screen or hidden, up close hundreds of pixels from the
@@ -577,20 +581,40 @@ float3 SceneLit(float3 color, float2 at, float depth, float gain, float brightes
         static const float levels[4] = { 1, 3, 5, 8 };
         [unroll] for (int k = 0; k < 4; k++)
         {
-            float2 s = SurfaceLight.SampleLevel(LinearClamp, at / ViewportSize, levels[k]);
+            float4 s = SurfaceLight.SampleLevel(LinearClamp, at / ViewportSize, levels[k]);
             luma += (1 - count) * s.x;
+            tinted += (1 - count) * s.zw;
             count += (1 - count) * s.y;
         }
     }
-    return count > 0 ? color * lerp(1.0, luma / count * SceneGain * gain, SceneLighting) : color;
+    float2 rb = luma > 1e-6 ? tinted / luma : 1;
+    float3 tint = float3(rb.x, max((1 - Luminance.r * rb.x - Luminance.b * rb.y) / Luminance.g, 0), rb.y);
+    return count > 0 ? color * lerp(1.0, luma / count * SceneGain * gain * tint, SceneLighting) : color;
+}
+
+// The colour of the light on a pixel the game lit as 'scene' (linear) from diffuse colour 'albedo' (GBuffer 2, squared): their
+// ratio, as red and blue at luminance 1 (green follows; 1, 1 = white). A channel the albedo (nearly) lacks says nothing about
+// the light (what the game shows there is sheen and ambient), so it takes the mean of the others: a red dye under a white lamp
+// stays white, not red. White where the albedo is unknown (no GBuffer 2) or too dark in every channel.
+float2 LightTint(float3 scene, float3 albedo)
+{
+    float3 trusted = albedo >= 0.05;
+    float n = dot(trusted, 1);
+    if (n == 0)
+        return 1;
+    float3 light = scene / max(albedo, 0.05);
+    light = lerp(dot(light * trusted, 1) / n, light, trusted);
+    float l = dot(light, Luminance);
+    return l > 1e-6 ? clamp(light.rb / l, 0, 3) : 1;
 }
 
 // What SceneLit reads, once per pixel instead of per tap and fragment.
-float2 PSSceneLuma(float4 pos : SV_Position) : SV_Target
+float4 PSSceneLuma(float4 pos : SV_Position) : SV_Target
 {
     int2 p = int2(pos.xy);
-    return float2(dot(pow(saturate(SceneColor.Load(int3(p, 0)).rgb), OutputGamma), Luminance),
-                  LinearDepth(SceneDepth.Load(int3(float2(p) * DepthUvScale, 0))));
+    float3 scene = pow(saturate(SceneColor.Load(int3(p, 0)).rgb), OutputGamma);
+    float3 albedo = SceneAlbedo.Load(int3(float2(p) * DepthUvScale, 0)).rgb;
+    return float4(dot(scene, Luminance), LinearDepth(SceneDepth.Load(int3(float2(p) * DepthUvScale, 0))), LightTint(scene, albedo * albedo));
 }
 
 float4 Output(float3 color)
@@ -665,15 +689,15 @@ float4 PSUnder(UnderOut i, out float2 motion : SV_Target1, out uint strandId : S
 }
 
 // Into SurfaceLight, with VSUnder: what the game lit where its surface is the one this mesh draws (not what is in front of it).
-float2 PSSurfaceLight(UnderOut i) : SV_Target
+float4 PSSurfaceLight(UnderOut i) : SV_Target
 {
     int2 p = int2(i.pos.xy * 8);
-    float2 s = SceneLuma.Load(int3(p, 0));
+    float4 s = SceneLuma.Load(int3(p, 0));
     float brightest;
     SurfaceColor(i.material, i.uv, ddx(i.uv), ddy(i.uv), brightest);
     if (abs(s.y - LinearDepth(i.pos.z)) > OwnSurface || BrighterThanItem(p, brightest))
         discard;
-    return float2(s.x, 1);
+    return float4(s.x, 1, s.x * s.zw);
 }
 
 float4 PSMain(VsOut i, uint geometry : SV_Coverage, out uint coverage : SV_Coverage, out float2 motion : SV_Target1,
@@ -733,8 +757,8 @@ float4 PSMain(VsOut i, uint geometry : SV_Coverage, out uint coverage : SV_Cover
     float3 color = (albedo * (AmbientColor + diffuse * LightIntensity) + spec * LightIntensity) * shadow;
 
     // A branch: as ?: fxc flattened it, running SceneLit's taps and fallback on every fragment.
-    [branch] if (i.shade.z > 0)
-        color *= i.shade.y;
+    [branch] if (i.shade.y > 0)
+        color *= i.rootLight;
     else
         color = SceneLit(color, i.pos.xy, 0, i.surface.a, i.brightest);
     return Output(color);
