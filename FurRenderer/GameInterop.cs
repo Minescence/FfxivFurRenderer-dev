@@ -397,12 +397,13 @@ internal sealed unsafe class GameInterop : IDisposable
 
     private bool UsesFurTexture(FFXIVClientStructs.FFXIV.Client.System.Resource.Handle.MaterialResourceHandle* material)
     {
+        // Read-only: this is the game's own string. Penumbra prefixes it with |collection|.
+        ReadOnlySpan<byte> mat = material->FileName.AsSpan();
+        mat = mat[(mat.LastIndexOf((byte)'|') + 1)..];
         for (int i = 0; i < FurTexPaths.Length; i++)
         {
             // If the material name matches, then its a valid material, min length to avoid matching ALL materials.
-            ReadOnlySpan<byte> mat = material->FileName.AsSpan();
-
-            if (FurTexPaths[i].Length > 6 && mat[(mat.LastIndexOf((byte)'|') + 1)..].SequenceEqual(FurTexPaths[i]))
+            if (FurTexPaths[i].Length > 6 && mat.SequenceEqual(FurTexPaths[i]))
                 return true;
 
             // Else check if any of the materials textures are in the list
