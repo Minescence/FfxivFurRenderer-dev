@@ -133,7 +133,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         }
         // 6 (the reference fit) turned every camera-facing stretch of fur into deep crimson bands and spots.
         if (config.Version < 11) { config.FacingDepth = 2f; config.Version = 11; }
-        if (config.Version < 12) { config.FurTexturePaths = ["chara/common/texture/minamotohikari/fur_diff.tex"]; config.Version = 12; }
+        if (config.Version < 12) { config.FurTexturePaths = Defaults.FurTexturePaths; config.Version = 12; }
         interop = new GameInterop(log, config);
         debugCapture = new DebugCapture(pluginInterface.GetPluginConfigDirectory(), config, interop.SetCamera, () => traceRequested = true);
         try
