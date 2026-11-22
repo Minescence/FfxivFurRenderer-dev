@@ -24,9 +24,6 @@ internal static class FurGrower
 
     // Full fur buries the face between a hat and a collar (both closed meshes, so no border to lean from). Strands skinned to
     // these bones are shorter, don't point at the face from above or below, and lean back from a border like the trim of a hood.
-    private static readonly HashSet<string> AboveFaceBones = ["j_kao", "j_ex_met_va"];
-    private static readonly HashSet<string> BelowFaceBones = ["j_kubi", "j_ago"];
-    private const float HeadLengthFactor = 0.5f;
 
     /// <summary>Null when there is no fur surface.</summary>
     /// <param name="furMaterials">Bit per model material: the ones whose meshes grow fur.</param>
@@ -65,17 +62,13 @@ internal static class FurGrower
             int i0 = triangles[t * 3], i1 = triangles[t * 3 + 1], i2 = triangles[t * 3 + 2];
             var root = surface.Positions[i0] * w + surface.Positions[i1] * u + surface.Positions[i2] * v;
             var normal = Unit(surface.Normals[i0] * w + surface.Normals[i1] * u + surface.Normals[i2] * v);
-            var above = surface.AboveFace[i0] * w + surface.AboveFace[i1] * u + surface.AboveFace[i2] * v;
-            var below = surface.BelowFace[i0] * w + surface.BelowFace[i1] * u + surface.BelowFace[i2] * v;
-            var head = above + below;
-            normal.Y *= 1 - (normal.Y < 0 ? above : below);
             normal = Unit(normal);
             var side = Unit(Vector3.Cross(normal, MathF.Abs(normal.Y) < 0.9f ? Vector3.UnitY : Vector3.UnitX));
             var (clumpX, clumpY) = ClumpDirection(root);
-            var length = (MaxLength - rng.NextSingle() * RandomTrim) * (1 - (1 - HeadLengthFactor) * head);
+            var length = (MaxLength - rng.NextSingle() * RandomTrim);
             var strand = (normal * MaxLength + (side * clumpX + Vector3.Cross(normal, side) * clumpY) * ClumpOffset) * (length / MaxLength);
             if (border.Nearest(root, OverhangDistance, out var edge, out var distance))
-                strand = Lean(strand, normal, edge - root, OverhangRadians * (1 - distance / OverhangDistance) * (1 - 2 * head));
+                strand = Lean(strand, normal, edge - root, OverhangRadians * (1 - distance / OverhangDistance));
             for (var k = 0; k < FurAsset.PointsPerStrand; k++)
             {
                 var p = root + strand * (k / (FurAsset.PointsPerStrand - 1f));
@@ -190,7 +183,6 @@ internal static class FurGrower
         public readonly List<Vector2?> Uvs = [];    // per vertex: UV0, if its mesh has one
         public readonly List<int> Triangles = [];
         public readonly List<string> BoneNames = [];
-        public float[] AboveFace = [], BelowFace = []; // skin weight on those bones, per vertex
         private int[] weld = [];
         private Vector3[] weldPositions = [];
 
@@ -335,8 +327,6 @@ internal static class FurGrower
                 }
             }
             surface.SmoothNormals();
-            surface.AboveFace = surface.WeightOn(AboveFaceBones);
-            surface.BelowFace = surface.WeightOn(BelowFaceBones);
             return surface;
         }
 
