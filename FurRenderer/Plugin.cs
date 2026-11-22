@@ -862,8 +862,12 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
     private void CopyDefaults()
     {
-        foreach (var p in typeof(Configuration).GetProperties()) if (p.CanWrite) p.SetValue(config, p.GetValue(Defaults));
-        config.FurTexturePaths = [];
+        foreach (var p in typeof(Configuration).GetProperties())
+        {
+            if (p.CanWrite && p.Name != "FurTexturePaths") 
+                p.SetValue(config, p.GetValue(Defaults));
+        }
+            
     }
 
     private static readonly Configuration Defaults = new();
