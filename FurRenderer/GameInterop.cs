@@ -10,7 +10,6 @@ using CharacterBase = FFXIVClientStructs.FFXIV.Client.Graphics.Scene.CharacterBa
 using Device = FFXIVClientStructs.FFXIV.Client.Graphics.Kernel.Device;
 using Texture = FFXIVClientStructs.FFXIV.Client.Graphics.Kernel.Texture;
 using Skeleton = FFXIVClientStructs.FFXIV.Client.Graphics.Render.Skeleton;
-using Dalamud.Utility;
 
 namespace FurRenderer;
 
@@ -25,7 +24,7 @@ internal sealed unsafe class GameInterop : IDisposable
     private const ushort RingModelSetId = 122;
     private const int CutsceneObjectEnd = 440; // actors spawned in GPose (Brio, Anamnesis) sit in the cutscene range
     private readonly IPluginLog log;
-    private byte[][] FurTexPaths;
+    private byte[][] FurTexPaths = [];
     // Typed depth SRV created over a typeless resource, keyed by resource pointer.
     private nint depthSrvResource;
     private ID3D11ShaderResourceView* depthSrv;
@@ -401,11 +400,9 @@ internal sealed unsafe class GameInterop : IDisposable
         for (int i = 0; i < FurTexPaths.Length; i++)
         {
             // If the material name matches, then its a valid material, min length to avoid matching ALL materials.
-            var mat = material->FileName.AsSpan();
-            mat.Replace((byte)'\\', (byte)'/');
-            mat = mat[(mat.LastIndexOf((byte)'|') + 1)..];
+            ReadOnlySpan<byte> mat = material->FileName.AsSpan();
 
-            if (FurTexPaths[i].Length > 6 && mat.SequenceEqual(FurTexPaths[i]))
+            if (FurTexPaths[i].Length > 6 && mat[(mat.LastIndexOf((byte)'|') + 1)..].SequenceEqual(FurTexPaths[i]))
                 return true;
 
             // Else check if any of the materials textures are in the list

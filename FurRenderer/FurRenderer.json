@@ -2,7 +2,7 @@
   "Author": "Minescence",
   "Name": "Fur Renderer",
   "Punchline": "Real strand fur on items.",
-  "Description": "Grows hundreds of thousands of skinned hair strands on any worn item or minion, and draws them with the GPU. Follows the dye and the scene's light. Only you see it. The mods aren't included.",
+  "Description": "Grows hundreds of thousands of skinned hair strands on any choosen item or minion based on their texture or material, and draws them with the GPU. Follows the dye and the scene's light. Only you see it.",
   "InternalName": "FurRenderer",
   "AssemblyVersion": "0.5.4.0",
   "RepoUrl": "https://github.com/Minescence/FfxivFurRenderer",

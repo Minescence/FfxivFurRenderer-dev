@@ -170,7 +170,6 @@ public sealed unsafe class Plugin : IDalamudPlugin
     // Present runs after all of the frame's render commands: close out the per-frame bind counter and trace here.
     private void OnDraw()
     {
-        //Diag("binds", $"back buffer bound {backBufferBinds}x last frame; drawing at {(DrawAtPresent ? "Present" : config.BackBufferBind < 0 ? "auto" : $"bind {config.BackBufferBind}")}");
         drewThisFrame = false;
         lastFrameBinds = backBufferBinds;
         lastFrameInfo = $"frame: binds {backBufferBinds}, fur draws {furDraws}, last fur target 0x{lastFurTarget:X}; {renderer?.PerfInfo}";
