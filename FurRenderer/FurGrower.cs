@@ -22,9 +22,6 @@ internal static class FurGrower
     // Strands near an open border lean out across it, so slits between sheets are covered like a real pelt's edge.
     private const float OverhangDistance = 0.045f, OverhangRadians = 85f * MathF.PI / 180f;
 
-    // Full fur buries the face between a hat and a collar (both closed meshes, so no border to lean from). Strands skinned to
-    // these bones are shorter, don't point at the face from above or below, and lean back from a border like the trim of a hood.
-
     /// <summary>Null when there is no fur surface.</summary>
     /// <param name="furMaterials">Bit per model material: the ones whose meshes grow fur.</param>
     /// <param name="enabledAttributes">Model.EnabledAttributeIndexMask: the game keeps a submesh if all its attribute bits are enabled.</param>
@@ -62,10 +59,9 @@ internal static class FurGrower
             int i0 = triangles[t * 3], i1 = triangles[t * 3 + 1], i2 = triangles[t * 3 + 2];
             var root = surface.Positions[i0] * w + surface.Positions[i1] * u + surface.Positions[i2] * v;
             var normal = Unit(surface.Normals[i0] * w + surface.Normals[i1] * u + surface.Normals[i2] * v);
-            normal = Unit(normal);
             var side = Unit(Vector3.Cross(normal, MathF.Abs(normal.Y) < 0.9f ? Vector3.UnitY : Vector3.UnitX));
             var (clumpX, clumpY) = ClumpDirection(root);
-            var length = (MaxLength - rng.NextSingle() * RandomTrim);
+            var length = MaxLength - rng.NextSingle() * RandomTrim;
             var strand = (normal * MaxLength + (side * clumpX + Vector3.Cross(normal, side) * clumpY) * ClumpOffset) * (length / MaxLength);
             if (border.Nearest(root, OverhangDistance, out var edge, out var distance))
                 strand = Lean(strand, normal, edge - root, OverhangRadians * (1 - distance / OverhangDistance));
@@ -328,17 +324,6 @@ internal static class FurGrower
             }
             surface.SmoothNormals();
             return surface;
-        }
-
-        private float[] WeightOn(HashSet<string> bones)
-        {
-            var on = BoneNames.Select(bones.Contains).ToArray();
-            var weights = new float[Positions.Count];
-            for (var v = 0; v < weights.Length; v++)
-            for (var k = 0; k < 8; k++)
-                if (Weights[v * 8 + k] > 0 && on[Bones[v * 8 + k]])
-                    weights[v] += Weights[v * 8 + k];
-            return weights;
         }
 
         private static (byte Stream, byte Offset, byte Type) Element(Dictionary<byte, (byte Stream, byte Offset, byte Type)> declaration, byte usage, int requiredType = -1)
