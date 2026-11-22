@@ -133,7 +133,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
         }
         // 6 (the reference fit) turned every camera-facing stretch of fur into deep crimson bands and spots.
         if (config.Version < 11) { config.FacingDepth = 2f; config.Version = 11; }
-        interop = new GameInterop(log);
+        if (config.Version < 12) { config.FurTexturePaths = ["chara/common/texture/minamotohikari/fur_diff.tex"]; config.Version = 12; }
+        interop = new GameInterop(log, config);
         debugCapture = new DebugCapture(pluginInterface.GetPluginConfigDirectory(), config, interop.SetCamera, () => traceRequested = true);
         try
         {
@@ -166,7 +167,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
     // Present runs after all of the frame's render commands: close out the per-frame bind counter and trace here.
     private void OnDraw()
     {
-        Diag("binds", $"back buffer bound {backBufferBinds}x last frame; drawing at {(DrawAtPresent ? "Present" : config.BackBufferBind < 0 ? "auto" : $"bind {config.BackBufferBind}")}");
+        //Diag("binds", $"back buffer bound {backBufferBinds}x last frame; drawing at {(DrawAtPresent ? "Present" : config.BackBufferBind < 0 ? "auto" : $"bind {config.BackBufferBind}")}");
         drewThisFrame = false;
         lastFrameBinds = backBufferBinds;
         lastFrameInfo = $"frame: binds {backBufferBinds}, fur draws {furDraws}, last fur target 0x{lastFurTarget:X}; {renderer?.PerfInfo}";
@@ -692,6 +693,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
         }
     }
 
+    private string newPath = "";
+
     private void DrawWindow()
     {
         ImGui.SetNextWindowSize(new Vector2(420, 560), ImGuiCond.FirstUseEver);
@@ -708,6 +711,29 @@ public sealed unsafe class Plugin : IDalamudPlugin
         changed |= Check("Enabled", () => config.Enabled, v => config.Enabled = v, d.Enabled, "Turn the fur on or off.");
         changed |= Check("Other players", () => config.OtherPlayers, v => config.OtherPlayers = v, d.OtherPlayers,
             "Also grow fur on other characters around you and on GPose actors. They only wear a fur mod on your screen when a sync plugin (Lightless, Mare, Snowcloak) applies their mods. Each coat costs about as much as your own (GPU time and ~230 MB of video memory).");
+        if (ImGui.CollapsingHeader("Texture Paths", ImGuiTreeNodeFlags.DefaultOpen))
+        {
+            for (int i = 0; i < config.FurTexturePaths.Count; i++)
+            {
+                changed |= InputText("##Path_" + i, () => config.FurTexturePaths[i], v => config.FurTexturePaths[i] = v);
+                ImGui.SameLine();
+                if (ImGui.Button($"Remove##RemovePath_{i}") || config.FurTexturePaths[i] == "")
+                {
+                    config.FurTexturePaths.RemoveAt(i);
+                    changed = true;
+                    i--; // Adjust index after removal
+                }
+            }
+
+            ImGui.InputText("New Path", ref newPath);
+            ImGui.SameLine();
+            if (ImGui.Button("Add Path") && !string.IsNullOrWhiteSpace(newPath) && !config.FurTexturePaths.Contains(newPath.Trim()))
+            {
+                config.FurTexturePaths.Add(newPath.Trim());
+                newPath = "";
+                changed = true;
+            }
+        }
 
         if (ImGui.CollapsingHeader("Performance", ImGuiTreeNodeFlags.DefaultOpen))
         {
@@ -848,6 +874,14 @@ public sealed unsafe class Plugin : IDalamudPlugin
         var changed = ImGui.Checkbox(label, ref v);
         if (changed) set(v);
         return HelpAndReset(label, help, initial ? "on" : "off", () => set(initial)) | changed;
+    }
+
+    private static bool InputText(string label, Func<string> get, Action<string> set)
+    {
+        var v = get();
+        var changed = ImGui.InputText(label, ref v);
+        if (changed) set(v);
+        return changed;
     }
 
     /// <summary>Shown as value x <paramref name="scale"/> with <paramref name="decimals"/> and <paramref name="unit"/>; stored unscaled.</summary>

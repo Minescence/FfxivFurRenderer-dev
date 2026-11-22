@@ -23,7 +23,7 @@ internal sealed unsafe class GameInterop : IDisposable
     private const ushort GlovesModelSetId = 239;
     private const ushort RingModelSetId = 122;
     private const int CutsceneObjectEnd = 440; // actors spawned in GPose (Brio, Anamnesis) sit in the cutscene range
-
+    private readonly Configuration config;
     private readonly IPluginLog log;
 
     // Typed depth SRV created over a typeless resource, keyed by resource pointer.
@@ -38,8 +38,9 @@ internal sealed unsafe class GameInterop : IDisposable
     /// <summary>Why the last scene-depth lookup succeeded or failed (for the debug log).</summary>
     public string DepthInfo { get; private set; } = "not queried";
 
-    public GameInterop(IPluginLog log)
+    public GameInterop(IPluginLog log, Configuration config)
     {
+        this.config = config;
         this.log = log;
     }
 
@@ -396,11 +397,18 @@ internal sealed unsafe class GameInterop : IDisposable
         return models;
     }
 
-    private static bool UsesFurTexture(FFXIVClientStructs.FFXIV.Client.System.Resource.Handle.MaterialResourceHandle* material)
+    private bool UsesFurTexture(FFXIVClientStructs.FFXIV.Client.System.Resource.Handle.MaterialResourceHandle* material)
     {
         for (var t = 0; t < material->TextureCount; t++)
-            if (material->TexturePath(t).AsSpan().StartsWith("chara/common/texture/minamotohikari/fur_"u8))
-                return true;
+        {
+            string texPath = material->TexturePath(t).ToString();
+            for (int i = 0; i < config.FurTexturePaths.Count; i++)
+            {
+                string targetPath = config.FurTexturePaths[i];
+                if (string.Equals(texPath, targetPath, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+        }
         return false;
     }
 
