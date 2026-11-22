@@ -717,7 +717,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             {
                 changed |= InputText("##Path_" + i, () => config.FurTexturePaths[i], v => config.FurTexturePaths[i] = v);
                 ImGui.SameLine();
-                if (ImGui.Button($"Remove##RemovePath_{i}") || config.FurTexturePaths[i] == "")
+                if (ImGui.Button($"Remove##RemovePath_{i}"))
                 {
                     config.FurTexturePaths.RemoveAt(i);
                     changed = true;
