@@ -8,6 +8,7 @@ using FFXIVClientStructs.FFXIV.Client.Graphics.Kernel;
 using FFXIVClientStructs.FFXIV.Client.Graphics.Render;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
+using System.Text;
 using TerraFX.Interop.DirectX;
 
 namespace FurRenderer;
@@ -133,8 +134,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
         }
         // 6 (the reference fit) turned every camera-facing stretch of fur into deep crimson bands and spots.
         if (config.Version < 11) { config.FacingDepth = 2f; config.Version = 11; }
-        if (config.Version < 12) { config.FurTexturePaths = Defaults.FurTexturePaths; config.Version = 12; }
-        interop = new GameInterop(log, config);
+        if (config.Version < 12) { config.Version = 12; }
+        interop = new GameInterop(log);
         debugCapture = new DebugCapture(pluginInterface.GetPluginConfigDirectory(), config, interop.SetCamera, () => traceRequested = true);
         try
         {
@@ -156,6 +157,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
         pluginInterface.UiBuilder.Draw += OnDraw;
         pluginInterface.UiBuilder.OpenConfigUi += () => windowOpen = true;
         pluginInterface.UiBuilder.OpenMainUi += () => windowOpen = true;
+
+        GenerateFurPaths();
     }
 
     private string AssetDirectory => Path.Combine(pluginInterface.AssemblyLocation.DirectoryName!, "Assets");
@@ -692,6 +695,13 @@ public sealed unsafe class Plugin : IDalamudPlugin
             return (dataManager.GetFile(gamePath)?.Data, gamePath + " (fallback)");
         }
     }
+    private void GenerateFurPaths()
+    {
+        interop.SetFurTexPaths(config.FurTexturePaths
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .Select(p => Encoding.UTF8.GetBytes(p.Trim().Replace('\\', '/')))
+            .ToArray());
+    }
 
     private string newPath = "";
 
@@ -856,7 +866,10 @@ public sealed unsafe class Plugin : IDalamudPlugin
             ImGui.SameLine();
             if (ImGui.Button("Reset all settings")) { CopyDefaults(); changed = true; }
         }
-        if (changed) pluginInterface.SavePluginConfig(config);
+        if (changed) {
+            pluginInterface.SavePluginConfig(config);
+            GenerateFurPaths();
+        }
         ImGui.End();
     }
 
@@ -864,7 +877,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
     {
         foreach (var p in typeof(Configuration).GetProperties())
         {
-            if (p.CanWrite && p.Name != "FurTexturePaths") 
+            if (p.CanWrite && p.Name != nameof(Configuration.FurTexturePaths))
                 p.SetValue(config, p.GetValue(Defaults));
         }
             

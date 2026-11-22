@@ -10,6 +10,7 @@ using CharacterBase = FFXIVClientStructs.FFXIV.Client.Graphics.Scene.CharacterBa
 using Device = FFXIVClientStructs.FFXIV.Client.Graphics.Kernel.Device;
 using Texture = FFXIVClientStructs.FFXIV.Client.Graphics.Kernel.Texture;
 using Skeleton = FFXIVClientStructs.FFXIV.Client.Graphics.Render.Skeleton;
+using Dalamud.Utility;
 
 namespace FurRenderer;
 
@@ -23,9 +24,8 @@ internal sealed unsafe class GameInterop : IDisposable
     private const ushort GlovesModelSetId = 239;
     private const ushort RingModelSetId = 122;
     private const int CutsceneObjectEnd = 440; // actors spawned in GPose (Brio, Anamnesis) sit in the cutscene range
-    private readonly Configuration config;
     private readonly IPluginLog log;
-
+    private byte[][] FurTexPaths;
     // Typed depth SRV created over a typeless resource, keyed by resource pointer.
     private nint depthSrvResource;
     private ID3D11ShaderResourceView* depthSrv;
@@ -38,9 +38,8 @@ internal sealed unsafe class GameInterop : IDisposable
     /// <summary>Why the last scene-depth lookup succeeded or failed (for the debug log).</summary>
     public string DepthInfo { get; private set; } = "not queried";
 
-    public GameInterop(IPluginLog log, Configuration config)
+    public GameInterop(IPluginLog log)
     {
-        this.config = config;
         this.log = log;
     }
 
@@ -399,17 +398,23 @@ internal sealed unsafe class GameInterop : IDisposable
 
     private bool UsesFurTexture(FFXIVClientStructs.FFXIV.Client.System.Resource.Handle.MaterialResourceHandle* material)
     {
-        for (int i = 0; i < config.FurTexturePaths.Count; i++)
+        for (int i = 0; i < FurTexPaths.Length; i++)
         {
-            // If the material name matches, then its a valid material
-            if (material->FileName.ToString().Contains(config.FurTexturePaths[i]))
+            // If the material name matches, then its a valid material, min length to avoid matching ALL materials.
+            var mat = material->FileName.AsSpan();
+            mat.Replace((byte)'\\', (byte)'/');
+            mat = mat[(mat.LastIndexOf((byte)'|') + 1)..];
+
+            if (FurTexPaths[i].Length > 6 && mat.SequenceEqual(FurTexPaths[i]))
                 return true;
 
             // Else check if any of the materials textures are in the list
             for (var t = 0; t < material->TextureCount; t++)
             {
-                if (material->TexturePath(t).ToString().Equals(config.FurTexturePaths[i]))
+                if (material->TexturePath(t).AsSpan().SequenceEqual(FurTexPaths[i]))
+                {
                     return true;
+                }
             }
         }
         return false;
@@ -669,6 +674,11 @@ internal sealed unsafe class GameInterop : IDisposable
 
         depthSrv = null;
         depthSrvResource = 0;
+    }
+
+    public void SetFurTexPaths(byte[][] bytes)
+    {
+        FurTexPaths = bytes;
     }
 }
 
