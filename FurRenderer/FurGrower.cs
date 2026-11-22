@@ -267,8 +267,9 @@ internal static class FurGrower
                 var mesh = meshes[m];
                 if (mesh.Material >= 32 || (furMaterials >> mesh.Material & 1) == 0) continue;
                 // Vertex layouts of all 47 fur models surveyed: Single3 position and normal, 4 influences (UByte4/NByte4) or 8 (UShort4 holding 8 bytes).
-                var position = Element(declarations[m], 0, 2);
-                var normal = Element(declarations[m], 3, 2);
+                // Vanilla gear (3,473 models): Half4 normals, Single3 positions in LOD 0 and Half4 in the others.
+                var position = Element(declarations[m], 0, 2, 14);
+                var normal = Element(declarations[m], 3, 2, 14);
                 var weights = Element(declarations[m], 1);
                 var joints = Element(declarations[m], 2);
                 var influences = Influences(weights.Type);
@@ -282,8 +283,8 @@ internal static class FurGrower
                 var hasUv = declarations[m].TryGetValue(4, out var uv) && uv.Type is 1 or 3 or 13 or 14;
                 for (var v = 0; v < mesh.Vertices; v++)
                 {
-                    var vertexPosition = ReadVector3(file, At(position, v));
-                    var vertexNormal = ReadVector3(file, At(normal, v));
+                    var vertexPosition = ReadVector3(file, At(position, v), position.Type);
+                    var vertexNormal = ReadVector3(file, At(normal, v), normal.Type);
                     // Written so that NaN fails it too.
                     if (!(vertexPosition.LengthSquared() < 1e6f && vertexNormal.LengthSquared() < 1e6f)) throw new InvalidDataException($"vertex {v} is out of range");
                     surface.Positions.Add(vertexPosition);
@@ -326,10 +327,10 @@ internal static class FurGrower
             return surface;
         }
 
-        private static (byte Stream, byte Offset, byte Type) Element(Dictionary<byte, (byte Stream, byte Offset, byte Type)> declaration, byte usage, int requiredType = -1)
+        private static (byte Stream, byte Offset, byte Type) Element(Dictionary<byte, (byte Stream, byte Offset, byte Type)> declaration, byte usage, params byte[] types)
         {
             if (!declaration.TryGetValue(usage, out var element)) throw new InvalidDataException($"mesh has no vertex element of usage {usage}");
-            if (requiredType >= 0 && element.Type != requiredType) throw new InvalidDataException($"vertex element of usage {usage} has unsupported type {element.Type}");
+            if (types.Length > 0 && !types.Contains(element.Type)) throw new InvalidDataException($"vertex element of usage {usage} has unsupported type {element.Type}");
             return element;
         }
 
@@ -344,8 +345,9 @@ internal static class FurGrower
             ? new((float)BitConverter.ToHalf(file, at), (float)BitConverter.ToHalf(file, at + 2))
             : new(BitConverter.ToSingle(file, at), BitConverter.ToSingle(file, at + 4));
 
-        private static Vector3 ReadVector3(byte[] file, int at)
-            => new(BitConverter.ToSingle(file, at), BitConverter.ToSingle(file, at + 4), BitConverter.ToSingle(file, at + 8));
+        private static Vector3 ReadVector3(byte[] file, int at, byte type) => type == 14
+            ? new((float)BitConverter.ToHalf(file, at), (float)BitConverter.ToHalf(file, at + 2), (float)BitConverter.ToHalf(file, at + 4))
+            : new(BitConverter.ToSingle(file, at), BitConverter.ToSingle(file, at + 4), BitConverter.ToSingle(file, at + 8));
 
         // The game splits vertices at UV and material seams, which would part the fur there: average over vertices sharing a
         // position. Only those facing the same way: the double-sided pants would cancel to nothing, and each side has its own borders.
