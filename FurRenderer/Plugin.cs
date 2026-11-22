@@ -8,6 +8,7 @@ using FFXIVClientStructs.FFXIV.Client.Graphics.Kernel;
 using FFXIVClientStructs.FFXIV.Client.Graphics.Render;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
+using System.Text;
 using TerraFX.Interop.DirectX;
 
 namespace FurRenderer;
@@ -133,6 +134,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         }
         // 6 (the reference fit) turned every camera-facing stretch of fur into deep crimson bands and spots.
         if (config.Version < 11) { config.FacingDepth = 2f; config.Version = 11; }
+        if (config.Version < 12) { config.Version = 12; }
         interop = new GameInterop(log);
         debugCapture = new DebugCapture(pluginInterface.GetPluginConfigDirectory(), config, interop.SetCamera, () => traceRequested = true);
         try
@@ -155,6 +157,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
         pluginInterface.UiBuilder.Draw += OnDraw;
         pluginInterface.UiBuilder.OpenConfigUi += () => windowOpen = true;
         pluginInterface.UiBuilder.OpenMainUi += () => windowOpen = true;
+
+        GenerateFurPaths();
     }
 
     private string AssetDirectory => Path.Combine(pluginInterface.AssemblyLocation.DirectoryName!, "Assets");
@@ -166,7 +170,6 @@ public sealed unsafe class Plugin : IDalamudPlugin
     // Present runs after all of the frame's render commands: close out the per-frame bind counter and trace here.
     private void OnDraw()
     {
-        Diag("binds", $"back buffer bound {backBufferBinds}x last frame; drawing at {(DrawAtPresent ? "Present" : config.BackBufferBind < 0 ? "auto" : $"bind {config.BackBufferBind}")}");
         drewThisFrame = false;
         lastFrameBinds = backBufferBinds;
         lastFrameInfo = $"frame: binds {backBufferBinds}, fur draws {furDraws}, last fur target 0x{lastFurTarget:X}; {renderer?.PerfInfo}";
@@ -691,6 +694,15 @@ public sealed unsafe class Plugin : IDalamudPlugin
             return (dataManager.GetFile(gamePath)?.Data, gamePath + " (fallback)");
         }
     }
+    private void GenerateFurPaths()
+    {
+        interop.SetFurTexPaths(config.FurTexturePaths
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .Select(p => Encoding.UTF8.GetBytes(p.Trim().Replace('\\', '/')))
+            .ToArray());
+    }
+
+    private string newPath = "";
 
     private void DrawWindow()
     {
@@ -708,6 +720,29 @@ public sealed unsafe class Plugin : IDalamudPlugin
         changed |= Check("Enabled", () => config.Enabled, v => config.Enabled = v, d.Enabled, "Turn the fur on or off.");
         changed |= Check("Other players", () => config.OtherPlayers, v => config.OtherPlayers = v, d.OtherPlayers,
             "Also grow fur on other characters around you and on GPose actors. They only wear a fur mod on your screen when a sync plugin (Lightless, Mare, Snowcloak) applies their mods. Each coat costs about as much as your own (GPU time and ~230 MB of video memory).");
+        if (ImGui.CollapsingHeader("Texture/Material Paths", ImGuiTreeNodeFlags.DefaultOpen))
+        {
+            for (int i = 0; i < config.FurTexturePaths.Count; i++)
+            {
+                changed |= InputText("##Path_" + i, () => config.FurTexturePaths[i], v => config.FurTexturePaths[i] = v);
+                ImGui.SameLine();
+                if (ImGui.Button($"Remove##RemovePath_{i}"))
+                {
+                    config.FurTexturePaths.RemoveAt(i);
+                    changed = true;
+                    i--; // Adjust index after removal
+                }
+            }
+
+            ImGui.InputText("##New Path", ref newPath);
+            ImGui.SameLine();
+            if (ImGui.Button("Add Texture/Material Path") && !string.IsNullOrWhiteSpace(newPath) && !config.FurTexturePaths.Contains(newPath.Trim()))
+            {
+                config.FurTexturePaths.Add(newPath.Trim());
+                newPath = "";
+                changed = true;
+            }
+        }
 
         if (ImGui.CollapsingHeader("Performance", ImGuiTreeNodeFlags.DefaultOpen))
         {
@@ -830,13 +865,21 @@ public sealed unsafe class Plugin : IDalamudPlugin
             ImGui.SameLine();
             if (ImGui.Button("Reset all settings")) { CopyDefaults(); changed = true; }
         }
-        if (changed) pluginInterface.SavePluginConfig(config);
+        if (changed) {
+            pluginInterface.SavePluginConfig(config);
+            GenerateFurPaths();
+        }
         ImGui.End();
     }
 
     private void CopyDefaults()
     {
-        foreach (var p in typeof(Configuration).GetProperties()) if (p.CanWrite) p.SetValue(config, p.GetValue(Defaults));
+        foreach (var p in typeof(Configuration).GetProperties())
+        {
+            if (p.CanWrite && p.Name != nameof(Configuration.FurTexturePaths))
+                p.SetValue(config, p.GetValue(Defaults));
+        }
+            
     }
 
     private static readonly Configuration Defaults = new();
@@ -848,6 +891,14 @@ public sealed unsafe class Plugin : IDalamudPlugin
         var changed = ImGui.Checkbox(label, ref v);
         if (changed) set(v);
         return HelpAndReset(label, help, initial ? "on" : "off", () => set(initial)) | changed;
+    }
+
+    private static bool InputText(string label, Func<string> get, Action<string> set)
+    {
+        var v = get();
+        var changed = ImGui.InputText(label, ref v);
+        if (changed) set(v);
+        return changed;
     }
 
     /// <summary>Shown as value x <paramref name="scale"/> with <paramref name="decimals"/> and <paramref name="unit"/>; stored unscaled.</summary>

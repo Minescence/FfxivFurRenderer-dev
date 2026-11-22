@@ -6,7 +6,7 @@ namespace FurRenderer;
 [Serializable]
 public sealed class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 11;
+    public int Version { get; set; } = 12;
 
     public bool Enabled { get; set; } = true;
     public bool OnlyInGpose { get; set; }
@@ -96,4 +96,6 @@ public sealed class Configuration : IPluginConfiguration
     public bool TemporalDither { get; set; }
     /// <summary>Draw strands opaque magenta, ignoring opacity, to check placement.</summary>
     public bool DebugSolid { get; set; }
+
+    public List<string> FurTexturePaths { get; set; } = [];
 }

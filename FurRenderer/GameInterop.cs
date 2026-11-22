@@ -23,9 +23,8 @@ internal sealed unsafe class GameInterop : IDisposable
     private const ushort GlovesModelSetId = 239;
     private const ushort RingModelSetId = 122;
     private const int CutsceneObjectEnd = 440; // actors spawned in GPose (Brio, Anamnesis) sit in the cutscene range
-
     private readonly IPluginLog log;
-
+    private byte[][] FurTexPaths = [];
     // Typed depth SRV created over a typeless resource, keyed by resource pointer.
     private nint depthSrvResource;
     private ID3D11ShaderResourceView* depthSrv;
@@ -396,11 +395,25 @@ internal sealed unsafe class GameInterop : IDisposable
         return models;
     }
 
-    private static bool UsesFurTexture(FFXIVClientStructs.FFXIV.Client.System.Resource.Handle.MaterialResourceHandle* material)
+    private bool UsesFurTexture(FFXIVClientStructs.FFXIV.Client.System.Resource.Handle.MaterialResourceHandle* material)
     {
-        for (var t = 0; t < material->TextureCount; t++)
-            if (material->TexturePath(t).AsSpan().StartsWith("chara/common/texture/minamotohikari/fur_"u8))
+        for (int i = 0; i < FurTexPaths.Length; i++)
+        {
+            // If the material name matches, then its a valid material, min length to avoid matching ALL materials.
+            ReadOnlySpan<byte> mat = material->FileName.AsSpan();
+
+            if (FurTexPaths[i].Length > 6 && mat[(mat.LastIndexOf((byte)'|') + 1)..].SequenceEqual(FurTexPaths[i]))
                 return true;
+
+            // Else check if any of the materials textures are in the list
+            for (var t = 0; t < material->TextureCount; t++)
+            {
+                if (material->TexturePath(t).AsSpan().SequenceEqual(FurTexPaths[i]))
+                {
+                    return true;
+                }
+            }
+        }
         return false;
     }
 
@@ -658,6 +671,11 @@ internal sealed unsafe class GameInterop : IDisposable
 
         depthSrv = null;
         depthSrvResource = 0;
+    }
+
+    public void SetFurTexPaths(byte[][] bytes)
+    {
+        FurTexPaths = bytes;
     }
 }
 
