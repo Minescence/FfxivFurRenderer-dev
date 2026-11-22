@@ -13,5 +13,6 @@ __pycache__/
 
 # Session hand-off notes
 HANDOFF.md
-/FurRenderer
+
+# Solution File
 /FurRenderer/FurRenderer.sln
