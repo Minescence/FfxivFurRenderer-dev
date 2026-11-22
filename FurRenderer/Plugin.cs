@@ -721,7 +721,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         changed |= Check("Enabled", () => config.Enabled, v => config.Enabled = v, d.Enabled, "Turn the fur on or off.");
         changed |= Check("Other players", () => config.OtherPlayers, v => config.OtherPlayers = v, d.OtherPlayers,
             "Also grow fur on other characters around you and on GPose actors. They only wear a fur mod on your screen when a sync plugin (Lightless, Mare, Snowcloak) applies their mods. Each coat costs about as much as your own (GPU time and ~230 MB of video memory).");
-        if (ImGui.CollapsingHeader("Texture Paths/Material Names", ImGuiTreeNodeFlags.DefaultOpen))
+        if (ImGui.CollapsingHeader("Texture/Material Paths", ImGuiTreeNodeFlags.DefaultOpen))
         {
             for (int i = 0; i < config.FurTexturePaths.Count; i++)
             {
@@ -737,7 +737,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
             ImGui.InputText("##New Path", ref newPath);
             ImGui.SameLine();
-            if (ImGui.Button("Add Texture Path/Material Name") && !string.IsNullOrWhiteSpace(newPath) && !config.FurTexturePaths.Contains(newPath.Trim()))
+            if (ImGui.Button("Add Texture/Material Path") && !string.IsNullOrWhiteSpace(newPath) && !config.FurTexturePaths.Contains(newPath.Trim()))
             {
                 config.FurTexturePaths.Add(newPath.Trim());
                 newPath = "";
