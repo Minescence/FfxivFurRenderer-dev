@@ -399,13 +399,16 @@ internal sealed unsafe class GameInterop : IDisposable
 
     private bool UsesFurTexture(FFXIVClientStructs.FFXIV.Client.System.Resource.Handle.MaterialResourceHandle* material)
     {
-        for (var t = 0; t < material->TextureCount; t++)
+        for (int i = 0; i < config.FurTexturePaths.Count; i++)
         {
-            string texPath = material->TexturePath(t).ToString();
-            for (int i = 0; i < config.FurTexturePaths.Count; i++)
+            // If the material name matches, then its a valid material
+            if (material->FileName.ToString().Contains(config.FurTexturePaths[i]))
+                return true;
+
+            // Else check if any of the materials textures are in the list
+            for (var t = 0; t < material->TextureCount; t++)
             {
-                string targetPath = config.FurTexturePaths[i];
-                if (string.Equals(texPath, targetPath, StringComparison.OrdinalIgnoreCase))
+                if (material->TexturePath(t).ToString().Equals(config.FurTexturePaths[i]))
                     return true;
             }
         }
