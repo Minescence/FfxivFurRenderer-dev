@@ -172,8 +172,11 @@ public sealed unsafe class Plugin : IDalamudPlugin
     {
         drewThisFrame = false;
         lastFrameBinds = backBufferBinds;
-        lastFrameInfo = $"frame: binds {backBufferBinds}, fur draws {furDraws}, last fur target 0x{lastFurTarget:X}; {renderer?.PerfInfo}";
-        presentsWindow++; furDrawsWindow += furDraws; if (furDraws == 0) emptyPresentsWindow++;
+        // The render thread counts its draws while this runs: read and reset at once, or a draw in between went uncounted
+        // (logged as presents without fur).
+        var drawn = Interlocked.Exchange(ref furDraws, 0);
+        lastFrameInfo = $"frame: binds {backBufferBinds}, fur draws {drawn}, last fur target 0x{lastFurTarget:X}; {renderer?.PerfInfo}";
+        presentsWindow++; furDrawsWindow += drawn; if (drawn == 0) emptyPresentsWindow++;
         if (presentsWindow == 1) cadenceWatch.Restart();
         if (presentsWindow == 300)
         {
@@ -183,7 +186,6 @@ public sealed unsafe class Plugin : IDalamudPlugin
                     299 / cadenceWatch.Elapsed.TotalSeconds, furDrawsWindow, triggersWindow, emptyPresentsWindow, depthBindsWindow, uiBindsWindow, status);
             presentsWindow = furDrawsWindow = emptyPresentsWindow = triggersWindow = depthBindsWindow = uiBindsWindow = 0;
         }
-        furDraws = 0;
         backBufferBinds = 0;
         lock (diagLock)
         {
@@ -658,7 +660,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             var albedo = interop.GetSceneAlbedo();
             Diag("albedo", albedo != null ? "GBuffer 2" : "no GBuffer 2: scene light also taken from surfaces over the items");
             renderer.Draw(context, backBuffer, depth, albedo, new Vector2(dw, dh), draws, view, proj, gpose ? config.GposeChildCount : config.ChildCount, config);
-            furDraws++;
+            Interlocked.Increment(ref furDraws);
             lastFurTarget = (nint)backBuffer;
             ID3D11Resource* depthTexture = null;
             if (depth != null) depth->GetResource(&depthTexture);

@@ -18,6 +18,9 @@ namespace FurRenderer;
 /// "atPresent": true grabs the presented frame instead, including whatever the game draws after the fur.
 /// "alpha": true saves the frame's alpha channel as grey (ReShade's KeepUI reads it as a UI mask).
 /// "depth": true saves the game's scene depth after the fur draw instead (grey = sqrt of the stored depth, 24-bit depth only).
+/// "burst": n saves n consecutive frames as captures/name_00.png ... (for flicker; each frame is a staging copy, so crop).
+/// "path": [[yaw, pitch, distance], ...] moves the camera through these keyframes (as "camera"), spread evenly over the burst's
+/// frames: a moving-camera flicker test. The camera starts at the first one while "frames" pass.
 /// </summary>
 internal sealed unsafe class DebugCapture
 {
@@ -37,7 +40,12 @@ internal sealed unsafe class DebugCapture
     // Render-thread capture: armed at Present, filled by the render thread right after the fur draw, saved at the next Present.
     private volatile bool armed;
     private int armedFrames;
-    private volatile byte[]? grabbed;
+    private readonly List<byte[]> shots = new(); // the render thread adds while armed; Tick reads once armed is cleared
+    private int burst = 1;
+    private readonly List<nint> pending = new(); // a burst's staging copies, read after its last frame
+    private float[][]? path; // camera keyframes over the burst: yaw, pitch, distance
+    private int readX, readY, readW, readH; // the region of the staging copies to read
+    private bool readBgra, readD24;
     private int grabbedWidth, grabbedHeight;
     private string? grabError;
 
@@ -54,7 +62,7 @@ internal sealed unsafe class DebugCapture
     /// <summary>Call once per frame at Present. Returns a status line when a request completed.</summary>
     public string? Tick(Func<(nint Ctx, nint BackBuffer)?> acquire, Action<nint> release, Func<string> frameInfo)
     {
-        if (waitFrames < 0 && !armed && grabbed == null && grabError == null)
+        if (waitFrames < 0 && !armed && shots.Count == 0 && grabError == null)
         {
             if (++pollFrame % 30 != 0 || !File.Exists(RequestPath)) return null;
             Begin();
@@ -69,7 +77,11 @@ internal sealed unsafe class DebugCapture
             armed = true;
             return null;
         }
-        if (armed && ++armedFrames < 60) return null; // the render thread hasn't drawn fur yet
+        if (armed)
+        {
+            if (path != null) MoveCamera(armedFrames);
+            if (++armedFrames < 60 + burst) return null; // the render thread hasn't drawn fur yet
+        }
         waitFrames = -1;
         var result = $"applied: {string.Join(", ", applied)}; {frameInfo()}";
         if (captureName != null)
@@ -88,12 +100,13 @@ internal sealed unsafe class DebugCapture
                     finally { release(target.Value.BackBuffer); }
                 }
             }
-            if (grabbed is { } rgb)
+            if (shots.Count > 0)
             {
                 try
                 {
-                    File.WriteAllBytes(path, Png(rgb, grabbedWidth, grabbedHeight));
-                    result += "; captured " + path;
+                    for (var i = 0; i < shots.Count; i++)
+                        File.WriteAllBytes(burst > 1 ? $"{path[..^4]}_{i:D2}.png" : path, Png(shots[i], grabbedWidth, grabbedHeight));
+                    result += burst > 1 ? $"; captured {shots.Count} frames as {path[..^4]}_NN.png" : "; captured " + path;
                 }
                 catch (IOException ex)
                 {
@@ -104,7 +117,7 @@ internal sealed unsafe class DebugCapture
             {
                 result += "; capture failed: " + (grabError ?? "no back buffer");
             }
-            grabbed = null;
+            shots.Clear();
             grabError = null;
             captureName = null;
         }
@@ -116,31 +129,50 @@ internal sealed unsafe class DebugCapture
     public void OnFurDrawn(ID3D11DeviceContext* ctx, ID3D11Texture2D* target, ID3D11Texture2D* sceneDepth)
     {
         if (!armed) return;
-        Grab(ctx, depth && sceneDepth != null ? sceneDepth : target);
-        armed = false;
+        // A burst copies each frame on the GPU and reads them all after the last one: reading every frame stalled the GPU each
+        // time, which changes the frame timing a flicker may depend on.
+        Grab(ctx, depth && sceneDepth != null ? sceneDepth : target, pending.Count + 1 >= burst);
+        if (shots.Count >= burst || grabError != null) armed = false;
     }
 
-    private void Grab(ID3D11DeviceContext* ctx, ID3D11Texture2D* backBuffer)
+    private void Grab(ID3D11DeviceContext* ctx, ID3D11Texture2D* source, bool read = true)
     {
         try
         {
-            Save(ctx, backBuffer);
+            Copy(ctx, source);
+            if (read) ReadPending(ctx);
         }
         catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException)
         {
             grabError = ex.Message;
         }
+        finally
+        {
+            if (read || grabError != null) ReleasePending();
+        }
+    }
+
+    // Frame i of the burst: between the keyframes it falls between (the last one after the burst's last frame).
+    private void MoveCamera(int i)
+    {
+        var u = Math.Min(i, burst - 1) / (float)Math.Max(burst - 1, 1) * (path!.Length - 1);
+        var k = Math.Min((int)u, path.Length - 2);
+        var f = u - k;
+        float At(int c) => path[k][c] + (path[k + 1][c] - path[k][c]) * f;
+        setCamera(At(0), At(1), At(2));
     }
 
     private void Begin()
     {
         applied.Clear();
+        path = null;
         captureName = null;
         crop = null;
         atPresent = false;
         alpha = false;
         depth = false;
         scale = 2;
+        burst = 1;
         var frames = 10;
         try
         {
@@ -171,6 +203,14 @@ internal sealed unsafe class DebugCapture
             if (root.TryGetProperty("atPresent", out var ap)) atPresent = ap.GetBoolean();
             if (root.TryGetProperty("alpha", out var al)) alpha = al.GetBoolean();
             if (root.TryGetProperty("depth", out var dp)) depth = dp.GetBoolean();
+            if (root.TryGetProperty("burst", out var b)) burst = Math.Clamp(b.GetInt32(), 1, 240);
+            if (root.TryGetProperty("path", out var pa))
+            {
+                var keys = pa.EnumerateArray().Select(k => k.EnumerateArray().Select(v => v.GetSingle()).ToArray()).ToArray();
+                if (keys.Length < 2 || keys.Any(k => k.Length != 3)) throw new FormatException("path needs 2+ keyframes of [yaw, pitch, distance]");
+                path = keys;
+                applied.Add(setCamera(keys[0][0], keys[0][1], keys[0][2]));
+            }
         }
         catch (Exception ex)
         {
@@ -180,16 +220,25 @@ internal sealed unsafe class DebugCapture
         waitFrames = frames;
     }
 
-    private void Save(ID3D11DeviceContext* ctx, ID3D11Texture2D* backBuffer)
+    // Copies the crop into a new staging texture (all of it for depth: depth-stencil resources only copy whole).
+    private void Copy(ID3D11DeviceContext* ctx, ID3D11Texture2D* source)
     {
         D3D11_TEXTURE2D_DESC desc;
-        backBuffer->GetDesc(&desc);
+        source->GetDesc(&desc);
         var bgra = desc.Format is DXGI_FORMAT_B8G8R8A8_UNORM or DXGI_FORMAT_B8G8R8A8_UNORM_SRGB or DXGI_FORMAT_B8G8R8A8_TYPELESS;
         var rgba = desc.Format is DXGI_FORMAT_R8G8B8A8_UNORM or DXGI_FORMAT_R8G8B8A8_UNORM_SRGB or DXGI_FORMAT_R8G8B8A8_TYPELESS;
         var d24 = desc.Format == DXGI_FORMAT_R24G8_TYPELESS;
         if (!bgra && !rgba && !d24) throw new NotSupportedException($"back buffer format {desc.Format}");
+        int x0 = 0, y0 = 0, w = (int)desc.Width, h = (int)desc.Height;
+        if (crop is { Length: 4 })
+        {
+            x0 = Math.Clamp(crop[0], 0, w - 1); y0 = Math.Clamp(crop[1], 0, h - 1);
+            w = Math.Clamp(crop[2], 1, w - x0); h = Math.Clamp(crop[3], 1, h - y0);
+        }
 
         var stagingDesc = desc;
+        if (!d24) (stagingDesc.Width, stagingDesc.Height) = ((uint)w, (uint)h);
+        stagingDesc.MipLevels = 1;
         stagingDesc.Usage = D3D11_USAGE_STAGING;
         stagingDesc.BindFlags = 0;
         stagingDesc.CPUAccessFlags = (uint)D3D11_CPU_ACCESS_READ;
@@ -197,48 +246,59 @@ internal sealed unsafe class DebugCapture
         ID3D11Device* device;
         ctx->GetDevice(&device);
         ID3D11Texture2D* staging = null;
-        try
+        var hr = device->CreateTexture2D(&stagingDesc, null, &staging);
+        device->Release();
+        if (hr.FAILED) throw new InvalidOperationException($"CreateTexture2D(staging) 0x{hr.Value:X8}");
+        if (d24)
         {
-            var hr = device->CreateTexture2D(&stagingDesc, null, &staging);
-            if (hr.FAILED) throw new InvalidOperationException($"CreateTexture2D(staging) 0x{hr.Value:X8}");
-            ctx->CopyResource((ID3D11Resource*)staging, (ID3D11Resource*)backBuffer);
+            ctx->CopyResource((ID3D11Resource*)staging, (ID3D11Resource*)source);
+        }
+        else
+        {
+            var box = new D3D11_BOX { left = (uint)x0, top = (uint)y0, front = 0, right = (uint)(x0 + w), bottom = (uint)(y0 + h), back = 1 };
+            ctx->CopySubresourceRegion((ID3D11Resource*)staging, 0, 0, 0, 0, (ID3D11Resource*)source, 0, &box);
+        }
+        pending.Add((nint)staging);
+        (readX, readY, readW, readH, readBgra, readD24) = d24 ? (x0, y0, w, h, false, true) : (0, 0, w, h, bgra, false);
+    }
+
+    private void ReadPending(ID3D11DeviceContext* ctx)
+    {
+        int ow = readW / scale, oh = readH / scale;
+        foreach (var t in pending)
+        {
+            var staging = (ID3D11Resource*)t;
             D3D11_MAPPED_SUBRESOURCE mapped;
-            hr = ctx->Map((ID3D11Resource*)staging, 0, D3D11_MAP_READ, 0, &mapped);
+            var hr = ctx->Map(staging, 0, D3D11_MAP_READ, 0, &mapped);
             if (hr.FAILED) throw new InvalidOperationException($"Map 0x{hr.Value:X8}");
-            int x0 = 0, y0 = 0, w = (int)desc.Width, h = (int)desc.Height;
-            if (crop is { Length: 4 })
-            {
-                x0 = Math.Clamp(crop[0], 0, w - 1); y0 = Math.Clamp(crop[1], 0, h - 1);
-                w = Math.Clamp(crop[2], 1, w - x0); h = Math.Clamp(crop[3], 1, h - y0);
-            }
-            int ow = w / scale, oh = h / scale;
             var rgb = new byte[ow * oh * 3];
             for (var y = 0; y < oh; y++)
             {
-                var row = (byte*)mapped.pData + (y0 + y * scale) * mapped.RowPitch;
+                var row = (byte*)mapped.pData + (readY + y * scale) * mapped.RowPitch;
                 for (var x = 0; x < ow; x++)
                 {
-                    var p = row + (x0 + x * scale) * 4;
+                    var p = row + (readX + x * scale) * 4;
                     var o = (y * ow + x) * 3;
-                    if (d24)
+                    if (readD24)
                     {
                         rgb[o] = rgb[o + 1] = rgb[o + 2] = (byte)(255 * Math.Sqrt((p[0] | p[1] << 8 | p[2] << 16) / 16777215.0));
                         continue;
                     }
-                    rgb[o] = alpha ? p[3] : bgra ? p[2] : p[0];
+                    rgb[o] = alpha ? p[3] : readBgra ? p[2] : p[0];
                     rgb[o + 1] = alpha ? p[3] : p[1];
-                    rgb[o + 2] = alpha ? p[3] : bgra ? p[0] : p[2];
+                    rgb[o + 2] = alpha ? p[3] : readBgra ? p[0] : p[2];
                 }
             }
-            ctx->Unmap((ID3D11Resource*)staging, 0);
-            (grabbedWidth, grabbedHeight) = (ow, oh);
-            grabbed = rgb;
+            ctx->Unmap(staging, 0);
+            shots.Add(rgb);
         }
-        finally
-        {
-            if (staging != null) staging->Release();
-            device->Release();
-        }
+        (grabbedWidth, grabbedHeight) = (ow, oh);
+    }
+
+    private void ReleasePending()
+    {
+        foreach (var t in pending) ((ID3D11Texture2D*)t)->Release();
+        pending.Clear();
     }
 
     private static byte[] Png(byte[] rgb, int w, int h)

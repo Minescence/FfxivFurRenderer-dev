@@ -34,7 +34,7 @@ struct StrandMatrix
 };
 StructuredBuffer<StrandMatrix> StrandMatrices : register(t9);
 RWStructuredBuffer<StrandMatrix> StrandMatricesOut : register(u0);
-Texture2D<float4> SurfaceLight : register(t11);       // 1/8 size with mips: the fur surface's luminance x coverage, coverage, luminance x LightTint x coverage
+Texture2D<float4> SurfaceLight : register(t11);       // the back buffer's size rounded down to powers of two (SurfaceLightSize), with mips: the fur surface's luminance x coverage, coverage, luminance x LightTint x coverage
 SamplerState LinearClamp : register(s0);
 Texture2D<float4> SceneColor : register(t10);         // copy of the lit frame (display-encoded) taken just before drawing
 Texture2D<float4> FurHistory : register(t30);         // PSTemporal's output last frame
@@ -101,7 +101,7 @@ cbuffer Frame : register(b0)
     uint2 HiZSize;         uint HiZLevels;     uint ArgsOffset;   // CullFlags: 1 = outside the view, 2 = behind the scene (Hi-Z), 4 = seen feedback
     uint RecolorUndyed;    float TemporalBlend; uint HideBuried; float Padding;   // RecolorUndyed: items in Hikari's undyed colour take BaseColor; TemporalBlend: PSTemporal's weight of this frame (1 = no history); HideBuried: see VSMain
     row_major float4x4 LastViewProj;
-    uint SeenBase;         uint SeenDrawn;     uint2 Padding2;    // seen-strand feedback: see LastSeen
+    uint SeenBase;         uint SeenDrawn;     uint2 SurfaceLightSize;   // seen-strand feedback: see LastSeen; SurfaceLight's size
 };
 
 struct VsOut
@@ -164,7 +164,7 @@ float3 TableRow(Texture2D<float4> table, uint row)
 
 // See SurfaceColor. 'mask' bits: 1 = the table is bound, 16 = the index map, 256 = the diffuse map.
 float4 MaterialColor(Texture2D<float4> table, Texture2D<float4> index, Texture2D<float4> diffuse, uint mask, bool mapped, float2 uv, float2 dx, float2 dy,
-                     out float brightest)
+                     out float brightest, out float3 albedo)
 {
     // As the game's character shaders: the index map's red picks a pair of table rows and its green blends them (row 0 without
     // one; every installed fur material's fur_id selects row 0 on all texels), times the diffuse map squared.
@@ -184,6 +184,7 @@ float4 MaterialColor(Texture2D<float4> table, Texture2D<float4> index, Texture2D
         row = lerp(TableRow(table, pair * 2), TableRow(table, pair * 2 + 1), blend);
     }
     float3 tint = 1;
+    albedo = mask & 1 ? row : 0; // as GBuffer 2 holds it (squared): the table row times the diffuse map squared; 0 = unknown
     if (mapped && (mask & 256))
     {
         uint w, h, levels;
@@ -197,6 +198,7 @@ float4 MaterialColor(Texture2D<float4> table, Texture2D<float4> index, Texture2D
             mean += diffuse.SampleLevel(LinearWrap, float2(k & 1 ? 0.75 : 0.25, k & 2 ? 0.75 : 0.25), level).rgb / 4;
         // Over the map's mean, so it varies the colour without changing its average.
         tint = d * d / max(dot(mean * mean, Luminance), 1e-3);
+        albedo *= d * d;
     }
     float3 game = row * tint; // what the game draws there
     brightest = mask & 1 ? dot(row, Luminance) : 1e9; // without the table the game's colour is unknown
@@ -212,7 +214,7 @@ float4 MaterialColor(Texture2D<float4> table, Texture2D<float4> index, Texture2D
 // its contrast. Capped because a near-black item's pixels are mostly sheen, which no dye darkens. dx, dy: uv's screen
 // derivatives (0 = the finest mip). 'brightest': the luminance of its colour table row, which its diffuse colour in GBuffer 2
 // never exceeds (the diffuse map is at most 1), so SceneLit can leave out other surfaces.
-float4 SurfaceColor(uint material, float2 uv, float2 dx, float2 dy, out float brightest)
+float4 SurfaceColor(uint material, float2 uv, float2 dx, float2 dy, out float brightest, out float3 albedo)
 {
     bool mapped = (material & 0x10000) != 0;
     material = min(material & 0xFFFF, 3u); // an item's fifth fur material and up share the fourth's textures
@@ -220,12 +222,18 @@ float4 SurfaceColor(uint material, float2 uv, float2 dx, float2 dy, out float br
     float4 result = 0;
     switch (material)
     {
-        case 0: result = MaterialColor(ColorTable0, IndexMap0, DiffuseMap0, mask, mapped, uv, dx, dy, brightest); break;
-        case 1: result = MaterialColor(ColorTable1, IndexMap1, DiffuseMap1, mask, mapped, uv, dx, dy, brightest); break;
-        case 2: result = MaterialColor(ColorTable2, IndexMap2, DiffuseMap2, mask, mapped, uv, dx, dy, brightest); break;
-        default: result = MaterialColor(ColorTable3, IndexMap3, DiffuseMap3, mask, mapped, uv, dx, dy, brightest); break;
+        case 0: result = MaterialColor(ColorTable0, IndexMap0, DiffuseMap0, mask, mapped, uv, dx, dy, brightest, albedo); break;
+        case 1: result = MaterialColor(ColorTable1, IndexMap1, DiffuseMap1, mask, mapped, uv, dx, dy, brightest, albedo); break;
+        case 2: result = MaterialColor(ColorTable2, IndexMap2, DiffuseMap2, mask, mapped, uv, dx, dy, brightest, albedo); break;
+        default: result = MaterialColor(ColorTable3, IndexMap3, DiffuseMap3, mask, mapped, uv, dx, dy, brightest, albedo); break;
     }
     return result;
+}
+
+float4 SurfaceColor(uint material, float2 uv, float2 dx, float2 dy, out float brightest)
+{
+    float3 albedo;
+    return SurfaceColor(material, uv, dx, dy, brightest, albedo);
 }
 
 float2 UnpackUv(uint packed)
@@ -547,6 +555,19 @@ bool BrighterThanItem(int2 p, float brightest)
     return dot(g * g, Luminance) > brightest * 1.5;
 }
 
+// Whether back-buffer pixel p shows a surface of another hue than 'albedo' (SurfaceColor's): GBuffer 2's diffuse colour there
+// is more than about 14 degrees off it. Another object can lie within OwnSurface of the item and pass the depth test: a
+// retainer standing against the coat put its axe and jacket into SurfaceLight, darker than the dye so BrighterThanItem kept
+// them, and with the red dye's gain the strands lit from there came out 7x too bright, flickering as it moved (measured).
+// Can't tell surfaces of the same hue apart (a hand on a pale trim). Always false without GBuffer 2 or without the item's
+// colour table.
+bool OtherHue(int2 p, float3 albedo)
+{
+    float3 g = SceneAlbedo.Load(int3(float2(p) * DepthUvScale, 0)).rgb;
+    g *= g;
+    return dot(albedo, 1) > 0 && dot(g, 1) > 0 && dot(g, albedo) < 0.97 * length(g) * length(albedo);
+}
+
 // Scales by how brightly the game lit its coat at pixel 'at', and tints by the colour of that light (LightTint), so the fur
 // follows the scene's sun, lamps and shadows. Not the coat texture's colour; averaged over a few taps so texture detail doesn't
 // streak along strands.
@@ -566,7 +587,8 @@ float3 SceneLit(float3 color, float2 at, float depth, float gain, float brightes
     {
         int2 p = int2(at) + taps[k];
         float4 s = SceneLuma.Load(int3(p, 0));
-        // s.y is 0 only off-screen (out-of-bounds read), where there is no scene to take light from.
+        // s.y is 0 off-screen (out-of-bounds read) and where the frame shows something GBuffer 2 doesn't hold (Unexplained):
+        // no scene to take light from.
         if (UseSceneDepth != 0 && (s.y == 0 || abs(s.y - depth) > OwnSurface) || BrighterThanItem(p, brightest))
             continue;
         luma += s.x;
@@ -575,13 +597,20 @@ float3 SceneLit(float3 color, float2 at, float depth, float gain, float brightes
     }
     // No surface here: a strand past the silhouette whose root is off-screen or hidden, up close hundreds of pixels from the
     // surface it grows from. Unscaled it would glow in any scene darker than daylight. Each coarser level of the surface's light
-    // fills in what the finer ones lack.
+    // fills in what the finer ones lack, by its coverage, and less where its texel holds fewer than SurfaceSamples of the
+    // surface's pixels: with a retainer in front of the coat only a sliver showed, the two finer levels held 0.5 and 4 pixels
+    // whose light jumped 0.14 to 0.72 between frames, and at a third of the weight that flashed the strands there (measured).
     if (count == 0)
     {
-        static const float levels[4] = { 1, 3, 5, 8 };
+        static const float sides[4] = { 7, 5, 3, 0 }; // log2 of the level's longer side: 128, 32, 8 and 1 texels
+        static const float SurfaceSamples = 32; // pixels; 16 still left a third of those flashes, 32 a ninth
+        float top = log2(max(SurfaceLightSize.x, SurfaceLightSize.y));
         [unroll] for (int k = 0; k < 4; k++)
         {
-            float4 s = SurfaceLight.SampleLevel(LinearClamp, at / ViewportSize, levels[k]);
+            uint level = (uint)max(top - sides[k], 0);
+            float4 s = SurfaceLight.SampleLevel(LinearClamp, at / ViewportSize, level);
+            float2 texel = (float2)SurfaceLightSize / max(SurfaceLightSize >> level, 1); // SurfaceLight pixels per texel side
+            s *= saturate(s.y * texel.x * texel.y / SurfaceSamples);
             luma += (1 - count) * s.x;
             tinted += (1 - count) * s.zw;
             count += (1 - count) * s.y;
@@ -608,13 +637,35 @@ float2 LightTint(float3 scene, float3 albedo)
     return l > 1e-6 ? clamp(light.rb / l, 0, 3) : 1;
 }
 
+// Whether the frame (linear) shows something other than the surface whose diffuse colour 'albedo' GBuffer 2 holds: the soft
+// edges of hair and tails, which the game draws after its lighting, into neither GBuffer 2 nor depth. Over a red dye, white hair
+// there read as light on the coat, and the dye's gain made the strands around it glow. Over 15% of the frame's luminance is
+// then in channels the colour lacks, beyond what a light tinted up to LightTint's clamp puts there. At half, as before, a few
+// percent of white hair over a red dye in shade still passed and read as 2-3x the light (p90 of the coat within 7 px of hair
+// and tail 2.9x the coat's median, 1.2x now, 1.4x elsewhere): a bright strip under the collar and an arc round the tail, seen
+// from behind. 0.02% of the coat elsewhere is caught (measured). Never true for a colour lacking no channel (white, grey,
+// black) or without GBuffer 2.
+bool Unexplained(float3 scene, float3 albedo)
+{
+    float3 trusted = albedo >= 0.05;
+    float n = dot(trusted, 1);
+    if (n == 0)
+        return false;
+    float light = dot(scene / max(albedo, 0.05) * trusted, 1) / n;
+    float excess = dot(max(scene - albedo * 3 * light, 0), Luminance);
+    return excess > 0.002 && excess > 0.15 * dot(scene, Luminance);
+}
+
 // What SceneLit reads, once per pixel instead of per tap and fragment.
 float4 PSSceneLuma(float4 pos : SV_Position) : SV_Target
 {
     int2 p = int2(pos.xy);
     float3 scene = pow(saturate(SceneColor.Load(int3(p, 0)).rgb), OutputGamma);
     float3 albedo = SceneAlbedo.Load(int3(float2(p) * DepthUvScale, 0)).rgb;
-    return float4(dot(scene, Luminance), LinearDepth(SceneDepth.Load(int3(float2(p) * DepthUvScale, 0))), LightTint(scene, albedo * albedo));
+    albedo *= albedo;
+    // Depth 0 (as off-screen) keeps SceneLit and PSSurfaceLight from taking light there.
+    float depth = Unexplained(scene, albedo) ? 0 : LinearDepth(SceneDepth.Load(int3(float2(p) * DepthUvScale, 0)));
+    return float4(dot(scene, Luminance), depth, LightTint(scene, albedo));
 }
 
 float4 Output(float3 color)
@@ -691,11 +742,12 @@ float4 PSUnder(UnderOut i, out float2 motion : SV_Target1, out uint strandId : S
 // Into SurfaceLight, with VSUnder: what the game lit where its surface is the one this mesh draws (not what is in front of it).
 float4 PSSurfaceLight(UnderOut i) : SV_Target
 {
-    int2 p = int2(i.pos.xy * 8);
+    int2 p = int2(i.pos.xy * ViewportSize / SurfaceLightSize);
     float4 s = SceneLuma.Load(int3(p, 0));
     float brightest;
-    SurfaceColor(i.material, i.uv, ddx(i.uv), ddy(i.uv), brightest);
-    if (abs(s.y - LinearDepth(i.pos.z)) > OwnSurface || BrighterThanItem(p, brightest))
+    float3 albedo;
+    SurfaceColor(i.material, i.uv, ddx(i.uv), ddy(i.uv), brightest, albedo);
+    if (abs(s.y - LinearDepth(i.pos.z)) > OwnSurface || BrighterThanItem(p, brightest) || OtherHue(p, albedo))
         discard;
     return float4(s.x, 1, s.x * s.zw);
 }

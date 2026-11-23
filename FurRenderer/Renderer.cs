@@ -40,7 +40,7 @@ internal struct FrameConstants
     public uint HiZWidth, HiZHeight, HiZLevels, ArgsOffset;
     public uint RecolorUndyed; public float TemporalBlend; public uint HideBuried; public float Padding;
     public Matrix4x4 LastViewProj;
-    public uint SeenBase, SeenDrawn, Padding1, Padding2;
+    public uint SeenBase, SeenDrawn, SurfaceLightWidth, SurfaceLightHeight;
 }
 
 /// <summary>
@@ -137,7 +137,11 @@ internal sealed unsafe class Renderer : IDisposable
     private ID3D11Texture2D* sceneLuma;
     private ID3D11RenderTargetView* sceneLumaRtv;
     private ID3D11ShaderResourceView* sceneLumaSrv;
-    private const uint SurfaceLightDivisor = 8; // also in PSSurfaceLight
+    // The back buffer's size rounded down to powers of two: GenerateMips then halves exactly and the 1x1 level averages the whole
+    // screen (at 320x180 it lost what the 5x2 level held, and strands beside a retainer in front of the coat got no light at all),
+    // and each level averages every pixel under it. At 1/8 size each texel took one pixel, and strands lit from it flickered as
+    // the coat moved under that pixel (measured with a burst of consecutive frames).
+    private static uint SurfaceLightSide(uint backBuffer) => 1u << BitOperations.Log2(Math.Max(backBuffer, 1));
     private ID3D11Texture2D* surfaceLight;
     private ID3D11RenderTargetView* surfaceLightRtv;
     private ID3D11ShaderResourceView* surfaceLightSrv;
@@ -601,6 +605,8 @@ internal sealed unsafe class Renderer : IDisposable
             CameraPos = invView.Translation,
             MinPixelWidth = cfg.MinPixelWidth,
             ViewportSize = new Vector2(bbDesc.Width, bbDesc.Height),
+            SurfaceLightWidth = SurfaceLightSide(bbDesc.Width),
+            SurfaceLightHeight = SurfaceLightSide(bbDesc.Height),
             DepthUvScale = cfg.DepthUvScaleOverride > 0 ? new Vector2(cfg.DepthUvScaleOverride) : autoUv,
             LightDir = light,
             LightIntensity = cfg.LightIntensity,
@@ -697,8 +703,8 @@ internal sealed unsafe class Renderer : IDisposable
                 ctx->OMSetRenderTargets(1, &lightRtv, null);
                 ctx->ClearRenderTargetView(lightRtv, transparent);
                 var lightViewport = viewport;
-                lightViewport.Width = Math.Max(bbDesc.Width / SurfaceLightDivisor, 1);
-                lightViewport.Height = Math.Max(bbDesc.Height / SurfaceLightDivisor, 1);
+                lightViewport.Width = fc.SurfaceLightWidth;
+                lightViewport.Height = fc.SurfaceLightHeight;
                 ctx->RSSetViewports(1, &lightViewport);
                 ctx->VSSetShader(vsUnder, null, 0);
                 ctx->PSSetShader(psSurfaceLight, null, 0);
@@ -1004,8 +1010,8 @@ internal sealed unsafe class Renderer : IDisposable
         fixed (ID3D11Texture2D** out_ = &sceneLuma) created = device->CreateTexture2D(&desc, null, out_).SUCCEEDED;
         if (created) fixed (ID3D11RenderTargetView** out_ = &sceneLumaRtv) created = device->CreateRenderTargetView((ID3D11Resource*)sceneLuma, null, out_).SUCCEEDED;
         if (created) fixed (ID3D11ShaderResourceView** out_ = &sceneLumaSrv) created = device->CreateShaderResourceView((ID3D11Resource*)sceneLuma, null, out_).SUCCEEDED;
-        desc.Width = Math.Max(bb.Width / SurfaceLightDivisor, 1);
-        desc.Height = Math.Max(bb.Height / SurfaceLightDivisor, 1);
+        desc.Width = SurfaceLightSide(bb.Width);
+        desc.Height = SurfaceLightSide(bb.Height);
         desc.MipLevels = 0;
         desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         desc.MiscFlags = (uint)D3D11_RESOURCE_MISC_GENERATE_MIPS;
