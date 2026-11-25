@@ -615,7 +615,13 @@ float3 SceneLit(float3 color, float2 at, float depth, float gain, float brightes
         {
             // Without taps, trusted by how many of the surface's pixels the texel holds (4^lod), as the fallback's levels are;
             // the fallback fills in the rest instead of the light falling towards 0.
-            float w = count > 0 ? SceneSmoothing : saturate(s.y * exp2(2 * lod) / SurfaceSamples);
+            // Where something lies over the item (a tail on the coat) the game shades the surface beside it dark and hides the
+            // rest of this texel: the taps and the texel's average both held only that dark rim, and the fur around the tail
+            // drew its outline (gone at SceneSmoothing 1, measured by eye). So the taps give way to the average by the hidden
+            // share, and that share is filled from 4 x as far around, as the fallback's levels fill each other.
+            float hidden = 1 - s.y;
+            float w = count > 0 ? lerp(SceneSmoothing, 1, saturate(hidden * 4)) : saturate(s.y * exp2(2 * lod) / SurfaceSamples);
+            s += hidden * SurfaceLight.SampleLevel(LinearClamp, at / ViewportSize, lod + 2);
             luma = lerp(count > 0 ? luma / count : 0, s.x / s.y, w);
             tinted = lerp(count > 0 ? tinted / count : 0, s.zw / s.y, w);
             count = count > 0 ? 1 : w;
