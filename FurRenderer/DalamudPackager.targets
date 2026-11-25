@@ -1,10 +1,13 @@
 <Project>
-  <!-- The baked assets hold the mod's mesh, so they must never reach a zip. Development loads them from the output folder. -->
+  <!-- The baked assets hold the mod's mesh, so they must never reach a zip: a zip is made only by a Release build from a clean clone (no DevTools.flag). -->
+  <Target Name="GuardAssets" BeforeTargets="PackagePlugin" Condition="'$(DevToolsFlag)' != 'true'">
+    <Error Condition="Exists('$(MSBuildProjectDirectory)\Assets') Or Exists('$(OutDir)Assets')"
+           Text="An Assets folder exists in the project or the output folder, so a build without DevTools.flag could ship the mod-derived .furasset files. Build releases only from a clean clone (no FurRenderer/Assets, delete bin/ and obj/ first); for development create FurRenderer/DevTools.flag." />
+  </Target>
   <Target Name="PackagePlugin" AfterTargets="Build">
     <DalamudPackager ProjectDir="$(ProjectDir)"
                      OutputPath="$(OutputPath)"
                      AssemblyName="$(AssemblyName)"
-                     MakeZip="$(Configuration.Equals('Release'))"
-                     Exclude="Assets\coat_glv_f.furasset;Assets\coat_glv_m.furasset;Assets\coat_ril_f.furasset;Assets\coat_ril_m.furasset" />
+                     MakeZip="$([System.String]::Equals('$(Configuration)|$(DevToolsFlag)', 'Release|'))" />
   </Target>
 </Project>

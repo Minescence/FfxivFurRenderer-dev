@@ -21,6 +21,8 @@ internal sealed class FurAsset
 
     public required string[] BoneNames { get; init; }
     public required int StrandCount { get; init; }
+    /// <summary>Strands grown / strands the item's area wanted: below 1 when the strand cap thinned it, and the renderer widens them to match.</summary>
+    public float DensityScale { get; init; } = 1f;
     public required StrandPoint[] Points { get; init; }
     public required StrandSkin[] Skins { get; init; }
     /// <summary>Per strand, where on the item's surface it is rooted; baked assets hold no UVs and use the first fur material.</summary>

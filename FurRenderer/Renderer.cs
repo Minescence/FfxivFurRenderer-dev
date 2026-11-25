@@ -38,7 +38,7 @@ internal struct FrameConstants
     public float Absorption, FacingDepth, CoverageScale; public uint SampleCount;
     public float UndercoatDarken; public uint TableMask, DrawnStrands, CullFlags;
     public uint HiZWidth, HiZHeight, HiZLevels, ArgsOffset;
-    public uint RecolorUndyed; public float TemporalBlend; public uint HideBuried; public float Padding;
+    public uint RecolorUndyed; public float TemporalBlend; public uint HideBuried; public float SceneSmoothing;
     public Matrix4x4 LastViewProj;
     public uint SeenBase, SeenDrawn, SurfaceLightWidth, SurfaceLightHeight;
 }
@@ -163,12 +163,13 @@ internal sealed unsafe class Renderer : IDisposable
     public const int MaterialTextures = 3 * MaxMaterials;
     private const float AssetDensityFraction = 0.10f; // tools/grow_coat_fur.py AMOUNT used for the baked assets, and FurGrower's density
 
-    public Renderer(ID3D11Device* device, string shaderPath, byte[] source)
+    /// <param name="code">Bytecode per entry point, from <see cref="CompileShaders"/>.</param>
+    public Renderer(ID3D11Device* device, IReadOnlyDictionary<string, byte[]> code)
     {
         this.device = device;
         device->AddRef();
-        // A shader that fails to compile would otherwise leak the device and everything created before it.
-        try { Create(shaderPath, source); }
+        // A failing Create call would otherwise leak the device and everything created before it.
+        try { Create(code); }
         catch
         {
             Dispose();
@@ -176,28 +177,18 @@ internal sealed unsafe class Renderer : IDisposable
         }
     }
 
-    private void Create(string shaderPath, byte[] source)
+    private void Create(IReadOnlyDictionary<string, byte[]> code)
     {
-        using (var vsBlob = Compile(source, shaderPath, "VSMain", "vs_5_0"))
-            fixed (ID3D11VertexShader** out_ = &vs) Check(device->CreateVertexShader(vsBlob.Pointer, vsBlob.Size, null, out_), "CreateVertexShader");
-        using (var psBlob = Compile(source, shaderPath, "PSMain", "ps_5_0"))
-            fixed (ID3D11PixelShader** out_ = &ps) Check(device->CreatePixelShader(psBlob.Pointer, psBlob.Size, null, out_), "CreatePixelShader");
-        using (var blob = Compile(source, shaderPath, "VSUnder", "vs_5_0"))
-            fixed (ID3D11VertexShader** out_ = &vsUnder) Check(device->CreateVertexShader(blob.Pointer, blob.Size, null, out_), "CreateVertexShader(under)");
-        using (var blob = Compile(source, shaderPath, "PSUnder", "ps_5_0"))
-            fixed (ID3D11PixelShader** out_ = &psUnder) Check(device->CreatePixelShader(blob.Pointer, blob.Size, null, out_), "CreatePixelShader(under)");
-        using (var blob = Compile(source, shaderPath, "VSComposite", "vs_5_0"))
-            fixed (ID3D11VertexShader** out_ = &vsComposite) Check(device->CreateVertexShader(blob.Pointer, blob.Size, null, out_), "CreateVertexShader(composite)");
-        using (var blob = Compile(source, shaderPath, "PSComposite", "ps_5_0"))
-            fixed (ID3D11PixelShader** out_ = &psComposite) Check(device->CreatePixelShader(blob.Pointer, blob.Size, null, out_), "CreatePixelShader(composite)");
-        using (var blob = Compile(source, shaderPath, "PSTemporal", "ps_5_0"))
-            fixed (ID3D11PixelShader** out_ = &psTemporal) Check(device->CreatePixelShader(blob.Pointer, blob.Size, null, out_), "CreatePixelShader(temporal)");
-        using (var blob = Compile(source, shaderPath, "PSDepth", "ps_5_0"))
-            fixed (ID3D11PixelShader** out_ = &psDepth) Check(device->CreatePixelShader(blob.Pointer, blob.Size, null, out_), "CreatePixelShader(depth)");
-        using (var blob = Compile(source, shaderPath, "PSSceneLuma", "ps_5_0"))
-            fixed (ID3D11PixelShader** out_ = &psSceneLuma) Check(device->CreatePixelShader(blob.Pointer, blob.Size, null, out_), "CreatePixelShader(scene luma)");
-        using (var blob = Compile(source, shaderPath, "PSSurfaceLight", "ps_5_0"))
-            fixed (ID3D11PixelShader** out_ = &psSurfaceLight) Check(device->CreatePixelShader(blob.Pointer, blob.Size, null, out_), "CreatePixelShader(surface light)");
+        Vertex(code, "VSMain", ref vs);
+        Pixel(code, "PSMain", ref ps);
+        Vertex(code, "VSUnder", ref vsUnder);
+        Pixel(code, "PSUnder", ref psUnder);
+        Vertex(code, "VSComposite", ref vsComposite);
+        Pixel(code, "PSComposite", ref psComposite);
+        Pixel(code, "PSTemporal", ref psTemporal);
+        Pixel(code, "PSDepth", ref psDepth);
+        Pixel(code, "PSSceneLuma", ref psSceneLuma);
+        Pixel(code, "PSSurfaceLight", ref psSurfaceLight);
         var samplerDesc = new D3D11_SAMPLER_DESC
         {
             Filter = D3D11_FILTER.D3D11_FILTER_MIN_MAG_MIP_LINEAR,
@@ -207,19 +198,13 @@ internal sealed unsafe class Renderer : IDisposable
         fixed (ID3D11SamplerState** out_ = &linearClamp) Check(device->CreateSamplerState(&samplerDesc, out_), "CreateSamplerState");
         samplerDesc.AddressU = samplerDesc.AddressV = samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_WRAP; // material UVs can lie outside 0..1
         fixed (ID3D11SamplerState** out_ = &linearWrap) Check(device->CreateSamplerState(&samplerDesc, out_), "CreateSamplerState(wrap)");
-        using (var blob = Compile(source, shaderPath, "CSStrandMatrices", "cs_5_0"))
-            fixed (ID3D11ComputeShader** out_ = &csStrandMatrices) Check(device->CreateComputeShader(blob.Pointer, blob.Size, null, out_), "CreateComputeShader");
-        using (var blob = Compile(source, shaderPath, "CSBucketOffsets", "cs_5_0"))
-            fixed (ID3D11ComputeShader** out_ = &csBucketOffsets) Check(device->CreateComputeShader(blob.Pointer, blob.Size, null, out_), "CreateComputeShader(bucket offsets)");
-        using (var blob = Compile(source, shaderPath, "CSScatter", "cs_5_0"))
-            fixed (ID3D11ComputeShader** out_ = &csScatter) Check(device->CreateComputeShader(blob.Pointer, blob.Size, null, out_), "CreateComputeShader(scatter)");
+        Compute(code, "CSStrandMatrices", ref csStrandMatrices);
+        Compute(code, "CSBucketOffsets", ref csBucketOffsets);
+        Compute(code, "CSScatter", ref csScatter);
         CreateUavBuffer(2 * 256, ref buckets, ref bucketsUav); // Fur.hlsl DepthBuckets
-        using (var blob = Compile(source, shaderPath, "CSHiZFirst", "cs_5_0"))
-            fixed (ID3D11ComputeShader** out_ = &csHiZFirst) Check(device->CreateComputeShader(blob.Pointer, blob.Size, null, out_), "CreateComputeShader(Hi-Z)");
-        using (var blob = Compile(source, shaderPath, "CSSeen", "cs_5_0"))
-            fixed (ID3D11ComputeShader** out_ = &csSeen) Check(device->CreateComputeShader(blob.Pointer, blob.Size, null, out_), "CreateComputeShader(seen)");
-        using (var blob = Compile(source, shaderPath, "CSHiZDown", "cs_5_0"))
-            fixed (ID3D11ComputeShader** out_ = &csHiZDown) Check(device->CreateComputeShader(blob.Pointer, blob.Size, null, out_), "CreateComputeShader(Hi-Z down)");
+        Compute(code, "CSHiZFirst", ref csHiZFirst);
+        Compute(code, "CSSeen", ref csSeen);
+        Compute(code, "CSHiZDown", ref csHiZDown);
         // 4x is guaranteed for these formats at feature level 11; 8x where the GPU has it.
         uint colorLevels, depthLevels;
         sampleCount = device->CheckMultisampleQualityLevels(DXGI_FORMAT_R8G8B8A8_UNORM, 8, &colorLevels).SUCCEEDED && colorLevels > 0
@@ -417,6 +402,7 @@ internal sealed unsafe class Renderer : IDisposable
         public uint SeenDrawn; // the strands drawn then (DrawnStrands): the rest weren't tested
         public int StrandCount;
         public uint MeshIndexCount;
+        public float DensityScale = 1f; // FurAsset.DensityScale: strands grown / strands the item's area wanted
 
         public void Dispose()
         {
@@ -436,7 +422,7 @@ internal sealed unsafe class Renderer : IDisposable
 
     public FurBuffers CreateBuffers(FurAsset asset)
     {
-        var b = new FurBuffers { StrandCount = asset.StrandCount, MeshIndexCount = (uint)asset.MeshIndices.Length };
+        var b = new FurBuffers { StrandCount = asset.StrandCount, MeshIndexCount = (uint)asset.MeshIndices.Length, DensityScale = asset.DensityScale };
         try
         {
             fixed (StrandPoint* p = asset.Points)
@@ -587,7 +573,7 @@ internal sealed unsafe class Renderer : IDisposable
         // 4x by default: it looked the same as 8x in the user's A/B recording, for 1.2 ms less at 1440p.
         var samples = cfg.Msaa8 ? maxSampleCount : 4u;
         if (samples != sampleCount) (sampleCount, ownDepthW) = (samples, 0); // remakes the fur targets
-        EnsureTargets(backBuffer, bbDesc);
+        EnsureTargets(bbDesc);
         var reverse = IsReverseZ(proj);
         EnsureDepthState(reverse);
         if (cfg.SceneLighting > 0 && EnsureSceneCopy(bbDesc))
@@ -627,6 +613,7 @@ internal sealed unsafe class Renderer : IDisposable
             FrameIndex = frameIndex++,
             UseSceneDepth = cfg.UseSceneDepth && sceneDepth != null ? 1u : 0u,
             HideBuried = cfg.HideBuriedStrands ? 1u : 0u,
+            SceneSmoothing = Math.Clamp(cfg.SceneSmoothing, 0f, 1f),
             TemporalDither = cfg.TemporalDither ? 1u : 0u,
             DebugSolid = cfg.DebugSolid ? 1u : 0u,
             Gravity = cfg.Gravity,
@@ -676,6 +663,9 @@ internal sealed unsafe class Renderer : IDisposable
         ctx->OMSetBlendState(blend, blendFactor, 0xFFFFFFFF);
         ctx->OMSetDepthStencilState(depthState, 0);
         ctx->IASetInputLayout(null);
+        ctx->GSSetShader(null, null, 0); // a geometry or tessellation stage left bound would run on the fur draws
+        ctx->HSSetShader(null, null, 0);
+        ctx->DSSetShader(null, null, 0);
         var cb = constants;
         ctx->VSSetConstantBuffers(0, 1, &cb);
         ctx->PSSetConstantBuffers(0, 1, &cb);
@@ -774,8 +764,9 @@ internal sealed unsafe class Renderer : IDisposable
             strandInstances += drawn * fc.ChildCount;
             BindMaterials(ctx, draw, ref fc);
             // Assets hold 10% of the reference strand density (Interpolate amount 0.10); thicken coverage by the shortfall so
-            // silhouettes stay as solid as the reference instead of showing the background between strands.
-            fc.CoverageScale = Math.Max(1f, item.StrandCount / (AssetDensityFraction * drawn * fc.ChildCount));
+            // silhouettes stay as solid as the reference instead of showing the background between strands. An item thinned to
+            // the strand cap (DensityScale < 1) is short by that much more.
+            fc.CoverageScale = Math.Max(1f, item.StrandCount / (AssetDensityFraction * drawn * item.DensityScale * fc.ChildCount));
             Upload(ctx, (ID3D11Resource*)constants, &fc, sizeof(FrameConstants));
             UploadBones(ctx, draw);
 
@@ -881,6 +872,9 @@ internal sealed unsafe class Renderer : IDisposable
         var clampSampler = linearClamp;
         ctx->PSSetSamplers(0, 1, &clampSampler);
         ctx->Draw(3, 0);
+        // The back buffer's view, made this late so a throw earlier in Draw can't keep it (released at the end).
+        Release(ref rtv); // left over only if the last draw threw below
+        fixed (ID3D11RenderTargetView** out_ = &rtv) Check(device->CreateRenderTargetView((ID3D11Resource*)backBuffer, null, out_), "CreateRenderTargetView");
         var target = rtv;
         ctx->OMSetRenderTargets(1, &target, null);
         ctx->OMSetBlendState(compositeBlend, blendFactor, 0xFFFFFFFF);
@@ -984,8 +978,6 @@ internal sealed unsafe class Renderer : IDisposable
         }
     }
 
-    private ID3D11Texture2D* readback;
-
     private bool EnsureSceneCopy(D3D11_TEXTURE2D_DESC bb)
     {
         if (sceneCopy != null)
@@ -1029,41 +1021,8 @@ internal sealed unsafe class Renderer : IDisposable
         Release(ref surfaceLightSrv); Release(ref surfaceLightRtv); Release(ref surfaceLight);
     }
 
-    /// <summary>Self-test: counts pure magenta (debug-solid) pixels in the back buffer, sampling every 4th pixel.</summary>
-    public int CountMagenta(ID3D11DeviceContext* ctx, ID3D11Texture2D* backBuffer)
+    private void EnsureTargets(D3D11_TEXTURE2D_DESC bbDesc)
     {
-        D3D11_TEXTURE2D_DESC bb;
-        backBuffer->GetDesc(&bb);
-        if (readback == null)
-        {
-            var desc = bb;
-            desc.Usage = D3D11_USAGE_STAGING;
-            desc.BindFlags = 0;
-            desc.CPUAccessFlags = (uint)D3D11_CPU_ACCESS_READ;
-            desc.MiscFlags = 0;
-            fixed (ID3D11Texture2D** out_ = &readback) Check(device->CreateTexture2D(&desc, null, out_), "CreateTexture2D(readback)");
-        }
-        ctx->CopyResource((ID3D11Resource*)readback, (ID3D11Resource*)backBuffer);
-        D3D11_MAPPED_SUBRESOURCE mapped;
-        Check(ctx->Map((ID3D11Resource*)readback, 0, D3D11_MAP_READ, 0, &mapped), "Map(readback)");
-        var count = 0;
-        for (uint y = 0; y < bb.Height; y += 4)
-        {
-            var row = (byte*)mapped.pData + y * mapped.RowPitch;
-            for (uint x = 0; x < bb.Width; x += 4)
-            {
-                var p = row + x * 4; // RGBA8 / BGRA8: magenta is 255,0,255 either way
-                if (p[0] == 255 && p[1] == 0 && p[2] == 255) count++;
-            }
-        }
-        ctx->Unmap((ID3D11Resource*)readback, 0);
-        return count;
-    }
-
-    private void EnsureTargets(ID3D11Texture2D* backBuffer, D3D11_TEXTURE2D_DESC bbDesc)
-    {
-        Release(ref rtv); // left over if the last draw threw
-        fixed (ID3D11RenderTargetView** out_ = &rtv) Check(device->CreateRenderTargetView((ID3D11Resource*)backBuffer, null, out_), "CreateRenderTargetView");
         if (ownDepth != null && ownDepthW == bbDesc.Width && ownDepthH == bbDesc.Height) return;
         Release(ref ownDepthSrv); Release(ref ownDepthDsv); Release(ref ownDepth);
         Release(ref furColorRtv); Release(ref furColor);
@@ -1221,7 +1180,37 @@ internal sealed unsafe class Renderer : IDisposable
         ctx->Unmap(resource, 0);
     }
 
-    private static Blob Compile(byte[] source, string path, string entry, string target)
+    // Every shader entry point in Fur.hlsl; the prefix picks the profile (vs_5_0, ps_5_0, cs_5_0).
+    private static readonly string[] Entries =
+    [
+        "VSMain", "PSMain", "VSUnder", "PSUnder", "VSComposite", "PSComposite", "PSTemporal", "PSDepth", "PSSceneLuma", "PSSurfaceLight",
+        "CSStrandMatrices", "CSBucketOffsets", "CSScatter", "CSHiZFirst", "CSSeen", "CSHiZDown",
+    ];
+
+    /// <summary>Compiles every entry point to bytecode. CPU only (no device), so the plugin runs it on a worker thread at load:
+    /// D3DCompile takes about a second, which froze the game when it ran on the render thread at the first draw.</summary>
+    public static Dictionary<string, byte[]> CompileShaders(byte[] source, string path)
+        => Entries.ToDictionary(e => e, e => Compile(source, path, e, e[..2].ToLowerInvariant() + "_5_0"));
+
+    private void Vertex(IReadOnlyDictionary<string, byte[]> code, string entry, ref ID3D11VertexShader* shader)
+    {
+        fixed (byte* b = code[entry]) fixed (ID3D11VertexShader** out_ = &shader)
+            Check(device->CreateVertexShader(b, (nuint)code[entry].Length, null, out_), $"CreateVertexShader({entry})");
+    }
+
+    private void Pixel(IReadOnlyDictionary<string, byte[]> code, string entry, ref ID3D11PixelShader* shader)
+    {
+        fixed (byte* b = code[entry]) fixed (ID3D11PixelShader** out_ = &shader)
+            Check(device->CreatePixelShader(b, (nuint)code[entry].Length, null, out_), $"CreatePixelShader({entry})");
+    }
+
+    private void Compute(IReadOnlyDictionary<string, byte[]> code, string entry, ref ID3D11ComputeShader* shader)
+    {
+        fixed (byte* b = code[entry]) fixed (ID3D11ComputeShader** out_ = &shader)
+            Check(device->CreateComputeShader(b, (nuint)code[entry].Length, null, out_), $"CreateComputeShader({entry})");
+    }
+
+    private static byte[] Compile(byte[] source, string path, string entry, string target)
     {
         ID3DBlob* code = null;
         ID3DBlob* errors = null;
@@ -1242,7 +1231,8 @@ internal sealed unsafe class Renderer : IDisposable
             errors->Release();
         }
         if (hr.FAILED) throw new InvalidOperationException($"Shader compile {entry} failed: {message}");
-        return new Blob(code);
+        try { return new Span<byte>(code->GetBufferPointer(), checked((int)code->GetBufferSize())).ToArray(); }
+        finally { code->Release(); }
     }
 
     private static void Check(HRESULT hr, string what)
@@ -1274,7 +1264,6 @@ internal sealed unsafe class Renderer : IDisposable
         Release(ref motionSrv); Release(ref motionRtv); Release(ref motion);
         ReleaseHistory();
         Release(ref rtv);
-        Release(ref readback);
         foreach (var (staging, _) in tableReads) ((ID3D11Texture2D*)staging)->Release();
         tableReads.Clear();
         ReleaseSceneCopy();
@@ -1285,18 +1274,11 @@ internal sealed unsafe class Renderer : IDisposable
         device->Release();
     }
 
-    private readonly struct Blob(ID3DBlob* blob) : IDisposable
-    {
-        public void* Pointer => blob->GetBufferPointer();
-        public nuint Size => blob->GetBufferSize();
-        public void Dispose() => blob->Release();
-    }
-
     /// <summary>Captures and restores the pipeline state this renderer touches so Dalamud/game rendering is unaffected.</summary>
     private readonly struct SavedState : IDisposable
     {
         private readonly ID3D11DeviceContext* ctx;
-        private readonly ID3D11RenderTargetView* rtv;
+        private readonly ID3D11RenderTargetView*[] rtvs = new ID3D11RenderTargetView*[8]; // D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT
         private readonly ID3D11DepthStencilView* dsv;
         private readonly ID3D11RasterizerState* raster;
         private readonly ID3D11BlendState* blend;
@@ -1308,6 +1290,9 @@ internal sealed unsafe class Renderer : IDisposable
         private readonly D3D_PRIMITIVE_TOPOLOGY topology;
         private readonly ID3D11VertexShader* vs;
         private readonly ID3D11PixelShader* ps;
+        private readonly ID3D11GeometryShader* geometry; // GS/HS/DS: Draw nulls them
+        private readonly ID3D11HullShader* hull;
+        private readonly ID3D11DomainShader* domain;
         private readonly ID3D11Buffer* vsCb, psCb, csCb;
         private readonly ID3D11ShaderResourceView*[] vsSrvs = new ID3D11ShaderResourceView*[30]; // t0..t29
         private readonly ID3D11ShaderResourceView*[] psSrvs = new ID3D11ShaderResourceView*[29]; // t3..t31
@@ -1315,8 +1300,8 @@ internal sealed unsafe class Renderer : IDisposable
         private readonly ID3D11SamplerState* csSampler; // s1
         private readonly ID3D11SamplerState* vsSampler; // s0
         private readonly ID3D11ComputeShader* cs;
-        private readonly ID3D11ShaderResourceView*[] csSrvs = new ID3D11ShaderResourceView*[29]; // t0..t28
-        private readonly ID3D11UnorderedAccessView*[] csUavs = new ID3D11UnorderedAccessView*[7]; // u0..u6
+        private readonly ID3D11ShaderResourceView*[] csSrvs = new ID3D11ShaderResourceView*[36]; // t0..t35
+        private readonly ID3D11UnorderedAccessView*[] csUavs = new ID3D11UnorderedAccessView*[8]; // u0..u7
         private readonly ID3D11Buffer* indexBuffer;
         private readonly DXGI_FORMAT indexFormat;
         private readonly uint indexOffset;
@@ -1324,8 +1309,9 @@ internal sealed unsafe class Renderer : IDisposable
         public SavedState(ID3D11DeviceContext* ctx)
         {
             this.ctx = ctx;
-            ID3D11RenderTargetView* r; ID3D11DepthStencilView* d;
-            ctx->OMGetRenderTargets(1, &r, &d); rtv = r; dsv = d;
+            ID3D11DepthStencilView* d;
+            fixed (ID3D11RenderTargetView** r = rtvs) ctx->OMGetRenderTargets((uint)rtvs.Length, r, &d);
+            dsv = d;
             ID3D11RasterizerState* rs; ctx->RSGetState(&rs); raster = rs;
             ID3D11BlendState* bs; Vector4 bf; uint sm;
             ctx->OMGetBlendState(&bs, (float*)&bf, &sm); blend = bs; blendFactor = bf; sampleMask = sm;
@@ -1335,6 +1321,9 @@ internal sealed unsafe class Renderer : IDisposable
             D3D_PRIMITIVE_TOPOLOGY tp; ctx->IAGetPrimitiveTopology(&tp); topology = tp;
             ID3D11VertexShader* v; ctx->VSGetShader(&v, null, null); vs = v;
             ID3D11PixelShader* p; ctx->PSGetShader(&p, null, null); ps = p;
+            ID3D11GeometryShader* g; ctx->GSGetShader(&g, null, null); geometry = g;
+            ID3D11HullShader* h; ctx->HSGetShader(&h, null, null); hull = h;
+            ID3D11DomainShader* dm; ctx->DSGetShader(&dm, null, null); domain = dm;
             ID3D11Buffer* c0; ctx->VSGetConstantBuffers(0, 1, &c0); vsCb = c0;
             ID3D11Buffer* c1; ctx->PSGetConstantBuffers(0, 1, &c1); psCb = c1;
             ID3D11Buffer* c2; ctx->CSGetConstantBuffers(0, 1, &c2); csCb = c2;
@@ -1351,8 +1340,9 @@ internal sealed unsafe class Renderer : IDisposable
 
         public void Dispose()
         {
-            var r = rtv;
-            ctx->OMSetRenderTargets(1, &r, dsv);
+            var n = rtvs.Length; // only up to the last bound slot: more would also clear output-merger UAVs in those slots
+            while (n > 0 && rtvs[n - 1] == null) n--;
+            fixed (ID3D11RenderTargetView** r = rtvs) ctx->OMSetRenderTargets((uint)n, r, dsv);
             ctx->RSSetState(raster);
             var bf = blendFactor;
             ctx->OMSetBlendState(blend, (float*)&bf, sampleMask);
@@ -1362,6 +1352,9 @@ internal sealed unsafe class Renderer : IDisposable
             ctx->IASetPrimitiveTopology(topology);
             ctx->VSSetShader(vs, null, 0);
             ctx->PSSetShader(ps, null, 0);
+            ctx->GSSetShader(geometry, null, 0);
+            ctx->HSSetShader(hull, null, 0);
+            ctx->DSSetShader(domain, null, 0);
             var c0 = vsCb; ctx->VSSetConstantBuffers(0, 1, &c0);
             var c1 = psCb; ctx->PSSetConstantBuffers(0, 1, &c1);
             var c2 = csCb; ctx->CSSetConstantBuffers(0, 1, &c2);
@@ -1372,7 +1365,7 @@ internal sealed unsafe class Renderer : IDisposable
             var vss = vsSampler; ctx->VSSetSamplers(0, 1, &vss);
             ctx->CSSetShader(cs, null, 0);
             fixed (ID3D11ShaderResourceView** c = csSrvs) ctx->CSSetShaderResources(0, (uint)csSrvs.Length, c);
-            var keepCounts = stackalloc uint[7] { uint.MaxValue, uint.MaxValue, uint.MaxValue, uint.MaxValue, uint.MaxValue, uint.MaxValue, uint.MaxValue }; // leave append/counter UAVs' hidden counts as they were
+            var keepCounts = stackalloc uint[8] { uint.MaxValue, uint.MaxValue, uint.MaxValue, uint.MaxValue, uint.MaxValue, uint.MaxValue, uint.MaxValue, uint.MaxValue }; // leave append/counter UAVs' hidden counts as they were
             fixed (ID3D11UnorderedAccessView** u = csUavs) ctx->CSSetUnorderedAccessViews(0, (uint)csUavs.Length, u, keepCounts);
             ctx->IASetIndexBuffer(indexBuffer, indexFormat, indexOffset);
             ReleaseAll();
@@ -1380,7 +1373,8 @@ internal sealed unsafe class Renderer : IDisposable
 
         private void ReleaseAll()
         {
-            Rel(rtv); Rel(dsv); Rel(raster); Rel(blend); Rel(depth); Rel(layout); Rel(vs); Rel(ps);
+            for (var i = 0; i < rtvs.Length; i++) Rel(rtvs[i]);
+            Rel(dsv); Rel(raster); Rel(blend); Rel(depth); Rel(layout); Rel(vs); Rel(ps); Rel(geometry); Rel(hull); Rel(domain);
             Rel(vsCb); Rel(psCb); Rel(csCb); Rel(indexBuffer);
             for (var i = 0; i < vsSrvs.Length; i++) Rel(vsSrvs[i]);
             for (var i = 0; i < psSrvs.Length; i++) Rel(psSrvs[i]);

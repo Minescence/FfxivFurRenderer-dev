@@ -20,6 +20,9 @@ public sealed class Configuration : IPluginConfiguration
     public int ChildCount { get; set; } = 3;
     public int GposeChildCount { get; set; } = 6;
     public float ChildSpread { get; set; } = 0.01f;
+    /// <summary>Most strands grown per item: a larger one (4 million is 26 m2 of fur, 432 MB in its largest buffer) grows thinned to it, with a warning. Off: FurGrower.MaxStrands.</summary>
+    public bool StrandCapEnabled { get; set; } = true;
+    public int StrandCap { get; set; } = 4_000_000;
     /// <summary>
     /// Fewer strands on items far from the camera: full density within LodDistance (m from the item's feet, at the normal field
     /// of view), then (LodDistance / distance)^LodBias of it, down to LodMinDensity. Strands are drawn at least MinPixelWidth
@@ -84,6 +87,10 @@ public sealed class Configuration : IPluginConfiguration
     public bool CullHiddenStrands { get; set; } = true;
     /// <summary>Leave out strands rooted under something resting on the item within the fur's reach (hair, a tail), which then lies on the fur.</summary>
     public bool HideBuriedStrands { get; set; } = true;
+    /// <summary>How far the game's light on the fur is averaged over about a strand's length on screen (0 = light from the few
+    /// pixels around each root, 1 = only the average): the game's shading of the mesh finer than the fur shows as blotches.
+    /// Above 0, strands whose root something hides (a hand under a cuff) take the light around their root too.</summary>
+    public float SceneSmoothing { get; set; } = 0.5f; // 1 lit red fur beside a pale trim 1.85x, past the collar's shadow
     /// <summary>
     /// Where to draw in the game's render commands: -1 = auto (just before the first back-buffer bind without depth that follows
     /// the scene-depth binds: after the scene is composited, before nameplates/UI), N = right after the Nth back-buffer bind,

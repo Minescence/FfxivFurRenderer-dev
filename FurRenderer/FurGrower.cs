@@ -14,6 +14,9 @@ internal static class FurGrower
     private const int MaxVertices = 2_000_000, MaxIndices = 6_000_000;
 
     internal const float StrandsPerM2 = 152_525f; // the baked assets: 980,124 strands on coat_ril_f's 6.426 m2
+    // With the strand cap off. Renderer.CreateBuffers' largest buffer takes 108 bytes per strand: 1,728,000,000 here, under
+    // int.MaxValue (its size is an int product) and under the 2,048 MB the largest D3D11 resource can be.
+    internal const int MaxStrands = 16_000_000, MinStrandCap = 100_000;
     private const float MaxLength = 0.05f, RandomTrim = 0.025f;
     private static readonly float[] Radii = [0.0003f, 0.0002535f, 0.0001902f, 0f]; // Set Hair Curve Profile, as baked
     // Clump Hair Curves: guides merged at 2.5 mm, each with a random sideways tip offset of up to 1.5 cm per axis, mixed in at
@@ -25,7 +28,8 @@ internal static class FurGrower
     /// <summary>Null when there is no fur surface.</summary>
     /// <param name="furMaterials">Bit per model material: the ones whose meshes grow fur.</param>
     /// <param name="enabledAttributes">Model.EnabledAttributeIndexMask: the game keeps a submesh if all its attribute bits are enabled.</param>
-    public static FurAsset? Grow(byte[] file, uint furMaterials, uint enabledAttributes)
+    /// <param name="strandCap">An item whose area wants more strands grows this many, evenly thinned; null: it throws above <see cref="MaxStrands"/>.</param>
+    public static FurAsset? Grow(byte[] file, uint furMaterials, uint enabledAttributes, int? strandCap)
     {
         var surface = Surface.Read(file, furMaterials, enabledAttributes);
         var triangles = surface.Triangles;
@@ -38,8 +42,12 @@ internal static class FurGrower
             area += 0.5 * Vector3.Cross(surface.Positions[triangles[t * 3 + 1]] - a, surface.Positions[triangles[t * 3 + 2]] - a).Length();
             cumulative[t] = area;
         }
-        var strands = (int)Math.Round(area * StrandsPerM2);
-        if (strands == 0) return null;
+        var wanted = Math.Round(area * StrandsPerM2); // a double: a huge mesh passes int's range
+        if (wanted == 0) return null;
+        var limit = strandCap is { } cap ? Math.Clamp(cap, MinStrandCap, MaxStrands) : MaxStrands;
+        if (strandCap == null && wanted > limit)
+            throw new InvalidDataException($"{area:N1} m2 of fur is {wanted:N0} strands; max {MaxStrands:N0} with the strand cap off");
+        var strands = (int)Math.Min(wanted, limit);
 
         var border = surface.BorderSamples();
         var rng = new Random(246);
@@ -97,7 +105,7 @@ internal static class FurGrower
         }
         return new FurAsset
         {
-            BoneNames = surface.BoneNames.ToArray(), StrandCount = strands, Points = points, Skins = skins, StrandSurfaces = surfaces,
+            BoneNames = surface.BoneNames.ToArray(), StrandCount = strands, DensityScale = (float)(strands / wanted), Points = points, Skins = skins, StrandSurfaces = surfaces,
             MeshVertices = meshVertices.ToArray(), MeshSurfaces = meshSurfaces.ToArray(), MeshSkins = meshSkins.ToArray(), MeshIndices = meshIndices,
         };
     }

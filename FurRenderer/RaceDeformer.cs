@@ -25,7 +25,7 @@ internal static class RaceDeformer
             while (h < count && BitConverter.ToUInt16(pbd, Header(h)) != current) h++;
             if (h == count) return null;
             var offset = BitConverter.ToInt32(pbd, Header(h) + 4);
-            if (offset <= 0) return null;
+            if (offset <= 0 || chain.Count == count) return null; // more steps than races: the links of a broken file go round
             chain.Add(ReadDeformer(pbd, offset));
             var parentLink = BitConverter.ToUInt16(pbd, Link(BitConverter.ToUInt16(pbd, Header(h) + 2)));
             if (parentLink == ushort.MaxValue) return null;

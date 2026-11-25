@@ -258,6 +258,7 @@ internal sealed unsafe class GameInterop : IDisposable
         return manager->Objects.IndexSorted[index].Value;
     }
 
+#if DEV_TOOLS // the debug channel's "camera"
     /// <summary>
     /// Orbits the active game camera (Game.Camera DirH/DirV/Distance, radians and yalms) around the target character.
     /// Yaw is relative to the character's facing, in degrees. Null leaves a value unchanged. Main thread only.
@@ -275,9 +276,14 @@ internal sealed unsafe class GameInterop : IDisposable
             camera->DirV = Math.Clamp(pitch * MathF.PI / 180f, camera->DirVMin, camera->DirVMax);
         if (distance is { } d)
             camera->Distance = camera->InterpDistance = Math.Clamp(d, camera->MinDistance, camera->MaxDistance);
+        // The inverse of the writes above, in the units "camera" takes (invariant culture, so it can be fed back as is).
+        var readYaw = MathF.IEEERemainder(camera->DirH - target->Rotation, 2f * MathF.PI) * 180f / MathF.PI;
+        var readPitch = camera->DirV * 180f / MathF.PI;
         return $"camera: DirH {camera->DirH:F3} DirV {camera->DirV:F3} (range {camera->DirVMin:F2}..{camera->DirVMax:F2}) "
-             + $"dist {camera->Distance:F2} (range {camera->MinDistance:F1}..{camera->MaxDistance:F1}) charRot {target->Rotation:F3}";
+             + $"dist {camera->Distance:F2} (range {camera->MinDistance:F1}..{camera->MaxDistance:F1}) charRot {target->Rotation:F3} "
+             + FormattableString.Invariant($"camera yaw={readYaw:F4} pitch={readPitch:F4} distance={camera->Distance:F4}");
     }
+#endif
 
     /// <summary>
     /// For each requested bone name, writes the skinning matrix (model bind space -> world space):

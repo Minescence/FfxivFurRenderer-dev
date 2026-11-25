@@ -13,7 +13,17 @@
     <DalamudLibPath>$(APPDATA)\XIVLauncher\addon\Hooks\dev\</DalamudLibPath>
     <Version>0.5.5</Version>
     <RootNamespace>FurRenderer</RootNamespace>
+    <!-- Untracked marker: a dev checkout has it, a clean clone (the release build) doesn't. -->
+    <DevToolsFlag Condition="Exists('$(MSBuildProjectDirectory)\DevTools.flag')">true</DevToolsFlag>
   </PropertyGroup>
+
+  <PropertyGroup Condition="'$(DevToolsFlag)' == 'true'">
+    <DefineConstants>$(DefineConstants);DEV_TOOLS</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(DevToolsFlag)' != 'true'">
+    <Compile Remove="DebugCapture.cs" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="DalamudPackager" Version="13.0.0" />

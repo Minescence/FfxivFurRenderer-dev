@@ -4,6 +4,7 @@ using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Game.Command;
 using Dalamud.Hooking;
+using Dalamud.Interface.ImGuiNotification;
 using FFXIVClientStructs.FFXIV.Client.Graphics.Kernel;
 using FFXIVClientStructs.FFXIV.Client.Graphics.Render;
 using Dalamud.Plugin;
@@ -22,9 +23,14 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private readonly IPluginLog log;
     private readonly Configuration config;
     private readonly GameInterop interop;
-    private readonly DebugCapture debugCapture;
+    private readonly INotificationManager notifications;
+#if DEV_TOOLS
+    private readonly DebugCapture? debugCapture; // dev installs only
+#endif
     private Renderer? renderer;
     private string? rendererError;
+    // Shader bytecode, compiled on a worker thread at load so the render thread doesn't freeze for it (about 1 s).
+    private readonly Task<Dictionary<string, byte[]>> shaderCode = Task.Run(() => Renderer.CompileShaders(ReadShader("Shaders.Fur.hlsl"), "Fur.hlsl"));
     private readonly IDataManager dataManager;
     private readonly bool[] found = new bool[Renderer.MaxBones];
     private readonly Dictionary<string, bool> bakedAssets = []; // asset file name -> exists; releases ship none, so not checked per frame
@@ -35,10 +41,14 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private readonly List<nint> replacedTextures = [];
     private readonly ConcurrentQueue<nint> releasedTextures = new(); // material textures the render thread releases, like retiredItems
     private bool reloadItems;
+    private (bool, int) grownCap; // the strand cap the items grew with: a change (settings, reset, debug channel) regrows them
+    private readonly HashSet<string> capWarned = new(); // items the strand-cap toast named, until the cap changes
     private int frame;
     private float lodFocal; // render thread: the projection's vertical focal length outside GPose
 
-    private const int RetireAfterFrames = 300;
+    // Unused for both: 300 frames alone is 2 s at 144 fps (a long load regrew the coat), and time alone retires everything
+    // after a hitch, as the check runs before AddDraw refreshes the items.
+    private const int RetireAfterFrames = 300, RetireAfterMs = 15_000;
     private const uint SamplerIndex = 0x565F8FD8, SamplerDiffuse = 0x115306BE; // CRC32 of the shader names g_SamplerIndex, g_SamplerDiffuse
 
     /// <summary>A fur-bearing model: growing, or ready to draw.</summary>
@@ -49,7 +59,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
         public Matrix4x4[]? Deform; // race deformer per bone; set by the growth task
         public string[] BoneNames = [];
         public readonly BoneLookup Lookup = new();
-        public int LastUsed;
+        public int LastUsed; // frame
+        public long LastUsedMs = Environment.TickCount64;
         public bool Recolor = true; // 'Recolour undyed items' applies: the player's own items, not others' (they look as the game colours them)
         // The fur materials' live colour tables, index and diffuse maps (SRVs, laid out as FurDraw.Textures), AddRef'd so a
         // replaced one's address can't be reused while it is held: a pointer change is always a new texture. Main thread; the
@@ -88,27 +99,28 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private readonly DoSetTargetDelegate? originalSetTarget;
     private volatile bool disposing;
     private int detoursRunning;
-    private int backBufferBinds, lastFrameBinds;
+    private int backBufferBinds;
     private int furDraws;
     private readonly System.Diagnostics.Stopwatch cadenceWatch = new();
     private int presentsWindow, furDrawsWindow, emptyPresentsWindow, triggersWindow, depthBindsWindow, uiBindsWindow;
     private string lastFrameInfo = "";
     private nint lastFurTarget;
+#if DEV_TOOLS
     private bool traceRequested;
     private List<string>? trace;
+#endif
 
-    // Self-test: draws debug magenta at each injection point (with/without scene depth) and counts what survives to Present.
-    private List<(int Bind, bool Depth)>? testCases;
-    private readonly List<string> testResults = new();
-    private int testCase, testFrame;
-    private (int Bind, bool Depth, bool Solid, bool Enabled) testSaved;
-
-    public Plugin(IDalamudPluginInterface pluginInterface, ICommandManager commandManager, IGameInteropProvider hooks, IPluginLog log, IDataManager dataManager)
+    public Plugin(IDalamudPluginInterface pluginInterface, ICommandManager commandManager, IGameInteropProvider hooks, IPluginLog log, IDataManager dataManager, IGameConfig gameConfig, INotificationManager notifications
+#if DEV_TOOLS
+        , IObjectTable objectTable
+#endif
+        )
     {
         this.pluginInterface = pluginInterface;
         this.commandManager = commandManager;
         this.log = log;
         this.dataManager = dataManager;
+        this.notifications = notifications;
         config = pluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
         // Each step resets what changed meaning or tuning in that version, leaving out what a later step resets again.
         if (config.Version < 2) { config.BackBufferBind = -1; config.Version = 2; } // v1 defaults drew over the UI
@@ -135,8 +147,14 @@ public sealed unsafe class Plugin : IDalamudPlugin
         // 6 (the reference fit) turned every camera-facing stretch of fur into deep crimson bands and spots.
         if (config.Version < 11) { config.FacingDepth = 2f; config.Version = 11; }
         if (config.Version < 12) { config.Version = 12; }
+#if !DEV_TOOLS
+        config.DebugSolid = false; // its checkbox is dev-only: one saved on by 0.5.5 would leave the fur magenta
+#endif
+        grownCap = (config.StrandCapEnabled, config.StrandCap);
         interop = new GameInterop(log);
-        debugCapture = new DebugCapture(pluginInterface.GetPluginConfigDirectory(), config, interop.SetCamera, () => traceRequested = true);
+#if DEV_TOOLS
+        debugCapture = pluginInterface.IsDev ? new DebugCapture(pluginInterface, gameConfig, objectTable, config, interop.SetCamera, () => traceRequested = true) : null;
+#endif
         try
         {
             setTargetHook = hooks.HookFromAddress<DoSetTargetDelegate>(ImmediateContext.Addresses.DoSetTargetCommand.Value, SetTargetDetour);
@@ -171,7 +189,6 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private void OnDraw()
     {
         drewThisFrame = false;
-        lastFrameBinds = backBufferBinds;
         // The render thread counts its draws while this runs: read and reset at once, or a draw in between went uncounted
         // (logged as presents without fur).
         var drawn = Interlocked.Exchange(ref furDraws, 0);
@@ -187,6 +204,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             presentsWindow = furDrawsWindow = emptyPresentsWindow = triggersWindow = depthBindsWindow = uiBindsWindow = 0;
         }
         backBufferBinds = 0;
+#if DEV_TOOLS
         lock (diagLock)
         {
             if (trace != null)
@@ -196,6 +214,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             }
             if (traceRequested) { traceRequested = false; trace = new List<string>(); }
         }
+#endif
 
         if (DrawAtPresent) SafeRenderFur(null);
         // Poses and camera for the frame the render thread draws next, taken after the game's Tick. Reading them live on the
@@ -204,9 +223,10 @@ public sealed unsafe class Plugin : IDalamudPlugin
         // of the frame before, and with the camera moving towards the coat (ground collision) the whole fur failed the depth test.
         var snap = new FrameSnapshot { Gpose = FFXIVClientStructs.FFXIV.Client.Game.GameMain.IsInGPose() };
         frame++;
+        if (grownCap != (config.StrandCapEnabled, config.StrandCap)) { grownCap = (config.StrandCapEnabled, config.StrandCap); reloadItems = true; capWarned.Clear(); }
         foreach (var (key, item) in items)
         {
-            if (!reloadItems && frame - item.LastUsed < RetireAfterFrames) continue;
+            if (!reloadItems && (frame - item.LastUsed < RetireAfterFrames || Environment.TickCount64 - item.LastUsedMs < RetireAfterMs)) continue;
             items.Remove(key);
             retiring.Add(item);
         }
@@ -226,12 +246,21 @@ public sealed unsafe class Plugin : IDalamudPlugin
         retiring.Clear();
         foreach (var texture in replacedTextures) releasedTextures.Enqueue(texture);
         replacedTextures.Clear();
-        if (testCases != null) StepSelfTest();
-        var debugResult = debugCapture.Tick(
-            () => interop.TryGetDevice(out _, out var c) && interop.TryGetBackBuffer(out var b) ? ((nint)c, (nint)b) : null,
-            b => ((ID3D11Texture2D*)b)->Release(),
-            () => lastFrameInfo);
-        if (debugResult != null) log.Info("[debug-request] {Result}", debugResult);
+#if DEV_TOOLS
+        // As with Fill: a throw here would end the draw handler.
+        try
+        {
+            var debugResult = debugCapture?.Tick(
+                () => interop.TryGetDevice(out _, out var c) && interop.TryGetBackBuffer(out var b) ? ((nint)c, (nint)b) : null,
+                b => ((ID3D11Texture2D*)b)->Release(),
+                () => lastFrameInfo);
+            if (debugResult != null) log.Info("[debug-request] {Result}", debugResult);
+        }
+        catch (Exception ex)
+        {
+            log.Error(ex, "Debug channel failed");
+        }
+#endif
         Diag("status", System.Text.RegularExpressions.Regex.Replace(status, @"^drawing [\d.,]+", "drawing"));
         if (windowOpen) DrawWindow();
     }
@@ -254,6 +283,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
     {
         try
         {
+            // Not only in RenderFur: with no draw this frame (a draw point past the frame's binds) retired items piled up.
+            if (!DrawAtPresent) ReleaseRetired();
             var rtm = RenderTargetManager.Instance();
             var rt = command->RenderTargets[0].Value;
             // Some frames are drawn into ToneAdjustSource and only copied to the back buffer at the very end (trace 2026-11-04);
@@ -286,7 +317,9 @@ public sealed unsafe class Plugin : IDalamudPlugin
             var rt = command->RenderTargets[0].Value;
             var isBackBuffer = rtm != null && rt != null && rt == rtm->SwapChainBackBuffer;
             if (isBackBuffer) backBufferBinds++;
+#if DEV_TOOLS
             if (trace != null) lock (diagLock) trace?.Add($"{trace.Count}: rt0 {Describe(rt, rtm)} depth {Describe(command->DepthBuffer, rtm)}{(isBackBuffer ? $"  <= back buffer bind {backBufferBinds}" : "")}");
+#endif
             if (isBackBuffer && !DrawAtPresent && config.BackBufferBind > 0 && backBufferBinds == config.BackBufferBind && !drewThisFrame)
             {
                 drewThisFrame = true;
@@ -299,6 +332,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         }
     }
 
+#if DEV_TOOLS
     private static string Describe(Texture* t, RenderTargetManager* rtm)
     {
         if (t == null) return "null";
@@ -307,51 +341,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         if (rtm != null && t == rtm->DepthStencil) return "DepthStencil";
         return $"0x{(nint)t:X}({t->ActualWidth}x{t->ActualHeight})";
     }
-
-    private void StartSelfTest()
-    {
-        testSaved = (config.BackBufferBind, config.UseSceneDepth, config.DebugSolid, config.Enabled);
-        testCases = new();
-        for (var bind = 0; bind <= Math.Max(lastFrameBinds, 1); bind++) { testCases.Add((bind, true)); testCases.Add((bind, false)); }
-        testResults.Clear();
-        testCase = -1;
-        traceRequested = true;
-        NextTestCase();
-    }
-
-    private void NextTestCase()
-    {
-        testCase++;
-        testFrame = 0;
-        if (testCase >= testCases!.Count)
-        {
-            (config.BackBufferBind, config.UseSceneDepth, config.DebugSolid, config.Enabled) = testSaved;
-            log.Info("[selftest] magenta samples surviving to Present: {Results}", string.Join(" | ", testResults));
-            status = "self-test done: " + string.Join(" | ", testResults);
-            testCases = null;
-            return;
-        }
-        var c = testCases[testCase];
-        config.Enabled = true;
-        config.DebugSolid = true;
-        config.BackBufferBind = c.Bind;
-        config.UseSceneDepth = c.Depth;
-    }
-
-    private void StepSelfTest()
-    {
-        if (++testFrame < 10) return; // let the setting take effect for a few frames
-        var result = "?";
-        if (renderer != null && interop.TryGetDevice(out _, out var ctx) && interop.TryGetBackBuffer(out var bb))
-        {
-            try { result = renderer.CountMagenta(ctx, bb).ToString(); }
-            catch (Exception ex) { result = "error " + ex.Message; }
-            finally { bb->Release(); }
-        }
-        var c = testCases![testCase];
-        testResults.Add($"{(c.Bind == 0 ? "Present" : $"bind {c.Bind}")} depth {(c.Depth ? "on" : "off")}: {result}");
-        NextTestCase();
-    }
+#endif
 
     // boundTarget: the D3D texture behind the game's bound kernel back buffer (hook mode), or null to use the swap chain's.
     private void SafeRenderFur(ID3D11Texture2D* boundTarget)
@@ -441,10 +431,14 @@ public sealed unsafe class Plugin : IDalamudPlugin
             if (!items.TryGetValue(key, out var item))
             {
                 var modelRace = race != 0 ? ModelRace(fur.Path, objectIndex, race) : race;
+                int? strandCap = config.StrandCapEnabled ? config.StrandCap : null;
                 items[key] = item = StartItem(character, objectIndex, modelRace, race, Path.GetFileName(fur.Path) + owner,
-                    () => FurGrower.Grow(ReadModel(fur.Path), fur.FurMaterials, fur.EnabledAttributes));
+                    () => FurGrower.Grow(ReadModel(fur.Path), fur.FurMaterials, fur.EnabledAttributes, strandCap));
                 item.Recolor = owner == "";
             }
+            // One model in two slots (the coat mod maps both rings to one file) is one item of this character (see the key): a
+            // second draw swapped its textures every frame and drew it twice.
+            else if (item.LastUsed == frame) continue;
             AddDraw(snap, character, item, fur.Slot, fur.FurMaterials);
         }
     }
@@ -489,12 +483,6 @@ public sealed unsafe class Plugin : IDalamudPlugin
             try
             {
                 var asset = build();
-                // Off the render thread: making a coat's buffers held it up to 18 ms.
-                if (asset != null && renderer is { FreeThreaded: true } r)
-                {
-                    var made = r.CreateBuffers(asset);
-                    if (Interlocked.CompareExchange(ref item.Prepared, made, null) != null) made.Dispose();
-                }
                 if (asset == null)
                 {
                     Diag("item " + name, "skipped: no fur surface");
@@ -503,8 +491,15 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 if (asset.BoneNames.Length > Renderer.MaxBones) throw new InvalidDataException($"{asset.BoneNames.Length} bones; max {Renderer.MaxBones}");
                 var chain = pbd == null ? null : RaceDeformer.Chain(pbd, modelRace, race);
                 if (chain is { Count: > 0 } && parents != null) item.Deform = RaceDeformer.PerBone(asset.BoneNames, chain, parents);
-                Diag("item " + name, $"{asset.StrandCount:N0} strands, {asset.BoneNames.Length} bones; race c{modelRace:D4} -> c{race:D4}: " +
+                var thinned = asset.DensityScale < 1f ? $" (strand cap: {asset.DensityScale:P1} of the item's full density)" : "";
+                Diag("item " + name, $"{asset.StrandCount:N0} strands{thinned}, {asset.BoneNames.Length} bones; race c{modelRace:D4} -> c{race:D4}: " +
                     (parents == null ? "none needed" : pbd == null ? "human.pbd unavailable" : chain == null ? "no deformer chain" : $"{chain.Count} deformer step(s)") + $" {pbdSource}");
+                // Off the render thread: making a coat's buffers held it up to 18 ms. Last: a throw above would keep them for nothing.
+                if (renderer is { FreeThreaded: true } r)
+                {
+                    var made = r.CreateBuffers(asset);
+                    if (Interlocked.CompareExchange(ref item.Prepared, made, null) != null) made.Dispose();
+                }
                 return asset;
             }
             catch (Exception ex)
@@ -520,12 +515,23 @@ public sealed unsafe class Plugin : IDalamudPlugin
     // Nothing while the item is growing or has nothing to draw. furMaterials: the item's fur materials in the slot's model.
     private void AddDraw(FrameSnapshot snap, nint character, FurItem item, int slot, uint furMaterials)
     {
-        item.LastUsed = frame;
+        (item.LastUsed, item.LastUsedMs) = (frame, Environment.TickCount64);
         if (item.Growth is { } growth)
         {
             if (!growth.IsCompleted) { snap.Growing++; return; }
             item.Growth = null;
-            if (growth.Result is { } asset) (item.BoneNames, item.Upload) = (asset.BoneNames, Volatile.Read(ref item.Prepared) == null ? asset : null);
+            if (growth.Result is { } asset)
+            {
+                (item.BoneNames, item.Upload) = (asset.BoneNames, Volatile.Read(ref item.Prepared) == null ? asset : null);
+                // Here, not in the growth task: once per grown item, on the UI thread.
+                // Own items only (Recolor), once each: others' items and every regrow would repeat it with nothing to do.
+                if (asset.DensityScale < 1f && item.Recolor && capWarned.Add(item.Name))
+                    notifications.AddNotification(new Notification
+                    {
+                        Title = "Fur Renderer", Type = NotificationType.Warning, Minimized = false, InitialDuration = TimeSpan.FromSeconds(15),
+                        Content = $"{item.Name} is too large for the strand cap: its fur is thinned to {asset.StrandCount:N0} strands, {asset.DensityScale:P1} of its full density. The cap is under Performance in /fur.",
+                    });
+            }
         }
         var bones = item.BoneNames.Length;
         if (bones == 0) return;
@@ -592,7 +598,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
         Diag("device", interop.DeviceInfo);
         if (renderer == null && rendererError == null)
         {
-            try { renderer = new Renderer(device, "Fur.hlsl", ReadShader("Shaders.Fur.hlsl")); Diag("renderer", "initialised"); }
+            if (!shaderCode.IsCompleted) { status = "compiling shaders"; return; }
+            try { renderer = new Renderer(device, shaderCode.GetAwaiter().GetResult()); Diag("renderer", "initialised"); }
             catch (Exception ex) { rendererError = ex.Message; log.Error(ex, "Renderer init failed"); }
         }
         if (renderer == null) { status = "renderer init failed: " + rendererError; return; }
@@ -657,15 +664,20 @@ public sealed unsafe class Plugin : IDalamudPlugin
             uint dw = 0, dh = 0;
             if (config.UseSceneDepth) interop.TryGetSceneDepth(out depth, out dw, out dh);
             Diag("depth", config.UseSceneDepth ? interop.DepthInfo : "disabled in settings");
-            var albedo = interop.GetSceneAlbedo();
-            Diag("albedo", albedo != null ? "GBuffer 2" : "no GBuffer 2: scene light also taken from surfaces over the items");
+            var albedo = depth != null ? interop.GetSceneAlbedo() : null; // read at the depth's pixels: without depth, texel (0, 0) for every pixel
+            Diag("albedo", albedo != null ? "GBuffer 2" : depth == null ? "not used without scene depth" : "no GBuffer 2: scene light also taken from surfaces over the items");
             renderer.Draw(context, backBuffer, depth, albedo, new Vector2(dw, dh), draws, view, proj, gpose ? config.GposeChildCount : config.ChildCount, config);
             Interlocked.Increment(ref furDraws);
             lastFurTarget = (nint)backBuffer;
-            ID3D11Resource* depthTexture = null;
-            if (depth != null) depth->GetResource(&depthTexture);
-            debugCapture.OnFurDrawn(context, backBuffer, (ID3D11Texture2D*)depthTexture);
-            if (depthTexture != null) depthTexture->Release();
+#if DEV_TOOLS
+            if (debugCapture != null)
+            {
+                ID3D11Resource* depthTexture = null;
+                if (depth != null) depth->GetResource(&depthTexture);
+                debugCapture.OnFurDrawn(context, backBuffer, (ID3D11Texture2D*)depthTexture);
+                if (depthTexture != null) depthTexture->Release();
+            }
+#endif
             Diag("draw", renderer.LastDrawInfo);
             status = $"drawing {drawnStrands:N0}/{strands:N0} strands in {draws.Count} item(s){(snap.Growing > 0 ? $", {snap.Growing} growing" : "")}; bones missing {snap.MissingBones}/{snap.Bones}; depth {(depth != null ? $"{dw}x{dh}" : "off")}";
         }
@@ -756,6 +768,10 @@ public sealed unsafe class Plugin : IDalamudPlugin
             ImGui.BeginDisabled();
             ImGui.TextUnformatted($"Up close: {BaseStrandsPerCm2 * config.Density * config.ChildCount:F0} strands per cm².");
             ImGui.EndDisabled();
+            changed |= Check("Strand cap", () => config.StrandCapEnabled, v => config.StrandCapEnabled = v, d.StrandCapEnabled,
+                "Limit how many strands one item grows. A larger item (a big or oddly scaled mod model) gets fewer, wider strands and a warning. Off: items grow in full, up to 16,000,000 strands, which can take gigabytes of memory. Changing it regrows the fur.");
+            changed |= InputInt("Most strands per item", () => config.StrandCap, v => config.StrandCap = v, d.StrandCap, FurGrower.MinStrandCap, FurGrower.MaxStrands,
+                "The strand cap. Higher: large items keep more of their density, costs more memory and GPU time. Lower: cheaper. Press Enter to apply; the fur then regrows.");
             changed |= Check("Fewer strands far away", () => config.DistanceLod, v => config.DistanceLod = v, d.DistanceLod,
                 "Draw fewer but wider strands on far-away characters. Looks about the same from a distance and saves a lot of GPU time with many coats around.");
             changed |= Slider("Full detail within", () => config.LodDistance, v => config.LodDistance = v, d.LodDistance, 0.5f, 20f,
@@ -814,6 +830,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 "The colour of your undyed fur items while 'Recolour undyed items' is on.");
             changed |= Slider("Game lighting", () => config.SceneLighting, v => config.SceneLighting = v, d.SceneLighting, 0f, 1f,
                 "How much the fur follows the game's lighting (sun, lamps, shadows). Higher: fits into the scene. Lower: lit evenly by the plugin's own light, the same everywhere.", 0, "%", 100f);
+            changed |= Slider("Smooth shadows", () => config.SceneSmoothing, v => config.SceneSmoothing = v, d.SceneSmoothing, 0f, 1f,
+                "Evens out the game's shadows over the length of the fur. Higher: soft shading without dark blotches. Lower: follows every small shadow the game puts on the coat underneath.", 0, "%", 100f);
             changed |= Slider("Game lighting strength", () => config.SceneGain, v => config.SceneGain = v, d.SceneGain, 0.5f, 10f,
                 "Brightness of the fur under the game's lighting. Higher: brighter. Lower: darker.", 2, "x");
             changed |= Slider("Exposure", () => config.Exposure, v => config.Exposure = v, d.Exposure, 0.1f, 8f,
@@ -857,18 +875,24 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 "When in the game's frame the fur is drawn. -1 = automatic (under the UI). 0 = last, over the UI. Change only if fur flickers or is missing with other overlay or ReShade plugins.");
             changed |= Check("Changing dither", () => config.TemporalDither, v => config.TemporalDither = v, d.TemporalDither,
                 "Change the strands' see-through pattern every frame. With 'Temporal smoothing' this averages out to softer fur; without it, it sparkles.");
+#if DEV_TOOLS
             changed |= Check("Show strands in magenta", () => config.DebugSolid, v => config.DebugSolid = v, d.DebugSolid,
                 "Draws every strand solid magenta to see where fur is placed.");
+#endif
             if (ImGui.Button("Regrow fur")) reloadItems = true;
             ImGui.SameLine();
+#if DEV_TOOLS
             if (ImGui.Button("Log one frame")) traceRequested = true;
             ImGui.SameLine();
-            if (ImGui.Button("Self-test") && testCases == null) StartSelfTest();
-            ImGui.SameLine();
+#endif
             if (ImGui.Button("Reset all settings")) { CopyDefaults(); changed = true; }
         }
         if (changed) {
+#if DEV_TOOLS
+            pluginInterface.SavePluginConfig(debugCapture?.ForSaving(config) ?? config); // without the debug channel's overrides
+#else
             pluginInterface.SavePluginConfig(config);
+#endif
             GenerateFurPaths();
         }
         ImGui.End();
@@ -922,6 +946,15 @@ public sealed unsafe class Plugin : IDalamudPlugin
         return HelpAndReset(label, help, initial.ToString(), () => set(initial)) | changed;
     }
 
+    private static bool InputInt(string label, Func<int> get, Action<int> set, int initial, int min, int max, string help)
+    {
+        var v = get();
+        // EnterReturnsTrue: each keystroke would otherwise be clamped and applied while typing.
+        var changed = ImGui.InputInt(label, ref v, flags: ImGuiInputTextFlags.EnterReturnsTrue);
+        if (changed) set(Math.Clamp(v, min, max));
+        return HelpAndReset(label, help, initial.ToString("N0"), () => set(initial)) | changed;
+    }
+
     private static bool Direction(string label, Func<Vector3> get, Action<Vector3> set, Vector3 initial, string help)
     {
         var v = get();
@@ -966,6 +999,9 @@ public sealed unsafe class Plugin : IDalamudPlugin
         Thread.MemoryBarrier(); // pairs with the detour's increment: either it sees disposing, or this sees its count
         var waited = System.Diagnostics.Stopwatch.StartNew();
         while (Volatile.Read(ref detoursRunning) > 0 && waited.ElapsedMilliseconds < 10000) Thread.Sleep(1); // the first draw compiles the shaders
+#if DEV_TOOLS
+        debugCapture?.Dispose(); // after the wait: the render thread hands it captures
+#endif
         setTargetHook?.Dispose();
         commandManager.RemoveHandler(CommandName);
         foreach (var item in items.Values.Concat(retiring)) retiredItems.Enqueue(item);
