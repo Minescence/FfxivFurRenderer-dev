@@ -363,7 +363,12 @@ internal sealed unsafe class DebugCapture
             if (root.TryGetProperty("command", out var cm)) applied.Add(Command(cm.GetString()!));
             if (root.TryGetProperty("time", out var tm)) applied.Add(Hold(tm.GetInt64()));
             if (root.TryGetProperty("freeze", out var fz)) applied.Add(Freeze(fz.GetBoolean()));
-            if (root.TryGetProperty("exitGpose", out _)) { unsafe { FFXIVClientStructs.FFXIV.Client.UI.UIModule.Instance()->ExitGPose(); } applied.Add("exit gpose"); }
+            if (root.TryGetProperty("exitGpose", out var eg) && eg.GetBoolean())
+            {
+                var ui = FFXIVClientStructs.FFXIV.Client.UI.UIModule.Instance();
+                if (ui != null) ui->ExitGPose();
+                applied.Add("exit gpose");
+            }
             if (root.TryGetProperty("trace", out var t) && t.GetBoolean())
             {
                 requestTrace(); // logs one frame's render-target commands as [trace]
