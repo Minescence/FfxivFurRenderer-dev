@@ -11,7 +11,7 @@
     <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <DalamudLibPath>$(APPDATA)\XIVLauncher\addon\Hooks\dev\</DalamudLibPath>
-    <Version>0.5.5</Version>
+    <Version>0.5.6</Version>
     <RootNamespace>FurRenderer</RootNamespace>
     <!-- Untracked marker: a dev checkout has it, a clean clone (the release build) doesn't. -->
     <DevToolsFlag Condition="Exists('$(MSBuildProjectDirectory)\DevTools.flag')">true</DevToolsFlag>
