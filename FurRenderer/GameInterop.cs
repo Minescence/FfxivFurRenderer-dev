@@ -253,10 +253,13 @@ internal sealed unsafe class GameInterop : IDisposable
     /// reverse-Z by default (bossmod comment; Render.Camera.StandardZ == false), i.e. near plane = depth 1, far/infinite = depth 0,
     /// depth buffer range [0,1]. <see cref="LastCameraReverseZ"/> reports the live StandardZ flag.
     /// </remarks>
-    public bool TryGetCamera(out Matrix4x4 view, out Matrix4x4 projection)
+    /// <param name="jitter">How far the game moves this frame's scene from <paramref name="projection"/>, in clip-space x and y:
+    /// the sub-pixel offset of temporal anti-aliasing and upscalers (DLAA, DLSS, FSR), which its depth buffer carries. Zero without.</param>
+    public bool TryGetCamera(out Matrix4x4 view, out Matrix4x4 projection, out Vector2 jitter)
     {
         view = Matrix4x4.Identity;
         projection = Matrix4x4.Identity;
+        jitter = Vector2.Zero;
 
         var manager = FFXIVClientStructs.FFXIV.Client.Graphics.Scene.CameraManager.Instance();
         if (manager == null)
@@ -272,6 +275,14 @@ internal sealed unsafe class GameInterop : IDisposable
         view = v;
         projection = render->ProjectionMatrix;
         LastCameraReverseZ = !render->StandardZ;
+        // ProjectionMatrix2 is ProjectionMatrix plus this frame's offset in M31/M32 (logged 2026-11-27 with DLAA: up to 0.0004
+        // in clip space, about 0.3 px, a new one every frame).
+        var forward = new Vector4(0, 0, projection.M34 < 0 ? -10f : 10f, 1);
+        var plain = Vector4.Transform(forward, projection);
+        var shifted = Vector4.Transform(forward, render->ProjectionMatrix2);
+        jitter = plain.W > 0 && shifted.W > 0 ? new Vector2(shifted.X / shifted.W - plain.X / plain.W, shifted.Y / shifted.W - plain.Y / plain.W) : Vector2.Zero;
+        if (!(MathF.Abs(jitter.X) < 0.01f && MathF.Abs(jitter.Y) < 0.01f)) // not a sub-pixel offset (NaN, or unset in some mode)
+            jitter = Vector2.Zero;
         return true;
     }
 

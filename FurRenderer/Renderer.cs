@@ -41,6 +41,7 @@ internal struct FrameConstants
     public uint RecolorUndyed; public float TemporalBlend; public uint HideBuried; public float SceneSmoothing;
     public Matrix4x4 LastViewProj;
     public uint SeenBase, SeenDrawn, SurfaceLightWidth, SurfaceLightHeight;
+    public Vector2 SceneJitter, FramePad;
 }
 
 /// <summary>
@@ -571,7 +572,7 @@ internal sealed unsafe class Renderer : IDisposable
     /// <summary>Draws each item's <see cref="FurDraw.Density"/> of its strands.</summary>
     /// <param name="sceneAlbedo">GBuffer 2, see <see cref="GameInterop.GetSceneAlbedo"/>; without it SceneLit can't tell other surfaces from the item.</param>
     public void Draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* backBuffer, ID3D11ShaderResourceView* sceneDepth, ID3D11ShaderResourceView* sceneAlbedo,
-        Vector2 depthSize, List<FurDraw> draws, Matrix4x4 view, Matrix4x4 proj, int childCount, Configuration cfg)
+        Vector2 depthSize, List<FurDraw> draws, Matrix4x4 view, Matrix4x4 proj, Vector2 jitter, int childCount, Configuration cfg)
     {
         FinishTableReads(ctx);
         if (draws.Count == 0) return;
@@ -604,6 +605,7 @@ internal sealed unsafe class Renderer : IDisposable
             CameraPos = invView.Translation,
             MinPixelWidth = cfg.MinPixelWidth,
             ViewportSize = new Vector2(bbDesc.Width, bbDesc.Height),
+            SceneJitter = new Vector2(jitter.X * bbDesc.Width * 0.5f, -jitter.Y * bbDesc.Height * 0.5f), // clip space -> pixels (y down)
             SurfaceLightWidth = SurfaceLightSide(bbDesc.Width),
             SurfaceLightHeight = SurfaceLightSide(bbDesc.Height),
             DepthUvScale = cfg.DepthUvScaleOverride > 0 ? new Vector2(cfg.DepthUvScaleOverride) : autoUv,

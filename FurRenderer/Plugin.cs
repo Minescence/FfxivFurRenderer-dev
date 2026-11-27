@@ -87,6 +87,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         public readonly List<ItemDraw> Items = [];
         public int Growing, Bones, MissingBones;
         public Matrix4x4 View, Proj;
+        public Vector2 Jitter;
     }
     private bool windowOpen;
     private string status = "idle";
@@ -157,6 +158,13 @@ public sealed unsafe class Plugin : IDalamudPlugin
             if (config.OnlyInGpose)
                 (config.Density, config.ChildCount) = (config.GposeDensity ?? config.Density, config.GposeChildCount ?? config.ChildCount);
             config.Version = 13;
+        }
+        // The fur no longer takes the map's per-texel noise as strand colour; Strand variation stands in for it at the old default.
+        if (config.Version < 14)
+        {
+            if (config.HueJitter == 0.2f)
+                config.HueJitter = Defaults.HueJitter;
+            config.Version = 14;
         }
 #if !DEV_TOOLS
         config.DebugSolid = false; // its checkbox is dev-only: one saved on by 0.5.5 would leave the fur magenta
@@ -398,7 +406,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         if (config.OnlyInGpose && !snap.Gpose) { snap.Skip = "waiting for GPose"; return; }
         var character = interop.GetTargetCharacterBase();
         if (character == 0) { snap.Skip = "no target character"; return; }
-        if (!interop.TryGetCamera(out snap.View, out snap.Proj)) { snap.Skip = "camera unavailable"; return; }
+        if (!interop.TryGetCamera(out snap.View, out snap.Proj, out snap.Jitter)) { snap.Skip = "camera unavailable"; return; }
         Diag("camera", $"StandardZ-derived reverseZ {interop.LastCameraReverseZ}; proj row3 {snap.Proj.M31:G4} {snap.Proj.M32:G4} {snap.Proj.M33:G4} {snap.Proj.M34:G4}; row4 {snap.Proj.M41:G4} {snap.Proj.M42:G4} {snap.Proj.M43:G4} {snap.Proj.M44:G4}");
         AddCharacter(snap, character, interop.GetTargetObjectIndex(), "");
         // Others' items by object index, not draw object: a sync plugin applying someone's mods redraws them.
@@ -678,7 +686,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             Diag("depth", config.UseSceneDepth ? interop.DepthInfo : "disabled in settings");
             var albedo = depth != null ? interop.GetSceneAlbedo() : null; // read at the depth's pixels: without depth, texel (0, 0) for every pixel
             Diag("albedo", albedo != null ? "GBuffer 2" : depth == null ? "not used without scene depth" : "no GBuffer 2: scene light also taken from surfaces over the items");
-            renderer.Draw(context, backBuffer, depth, albedo, new Vector2(dw, dh), draws, view, proj, config.ChildCount, config);
+            renderer.Draw(context, backBuffer, depth, albedo, new Vector2(dw, dh), draws, view, proj, snap.Jitter, config.ChildCount, config);
             Interlocked.Increment(ref furDraws);
 #if DEV_TOOLS
             lastFurTarget = (nint)backBuffer;

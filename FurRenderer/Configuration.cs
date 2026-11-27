@@ -6,7 +6,7 @@ namespace FurRenderer;
 [Serializable]
 public sealed class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 13;
+    public int Version { get; set; } = 14;
 
     public bool Enabled { get; set; } = true;
     public bool OnlyInGpose { get; set; }
@@ -58,7 +58,8 @@ public sealed class Configuration : IPluginConfiguration
     public float RootDarken { get; set; } = 0f;
     /// <summary>Coat surface under the fur = BaseColor x this (reference emitter Material.004: colour multiplied by 0.3).</summary>
     public float UndercoatDarken { get; set; } = 0.3f;
-    public float HueJitter { get; set; } = 0.2f;
+    // 0.4: since the fur stopped taking the diffuse map's per-texel noise (v14), this matches the strand contrast that noise gave at 0.2 (measured).
+    public float HueJitter { get; set; } = 0.4f;
     public Vector3 AmbientColor { get; set; } = new(0.45f, 0.42f, 0.45f);
     /// <summary>Towards the strands' key light, only where the game's sun or moon can't be read (GameInterop.KeyLightDirection). Not in the UI.</summary>
     public Vector3 LightDirection { get; set; } = new(-0.4f, 0.8f, 0.45f);
