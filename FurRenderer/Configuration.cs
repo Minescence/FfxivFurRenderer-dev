@@ -6,19 +6,22 @@ namespace FurRenderer;
 [Serializable]
 public sealed class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 12;
+    public int Version { get; set; } = 13;
 
     public bool Enabled { get; set; } = true;
     public bool OnlyInGpose { get; set; }
     /// <summary>Also draw fur on the other visible characters (players around you, actors posed in GPose).</summary>
     public bool OtherPlayers { get; set; }
 
-    /// <summary>Fraction of the packed strands drawn in normal play / in GPose.</summary>
+    /// <summary>Fraction of the packed strands drawn (normal play and GPose).</summary>
     public float Density { get; set; } = 1.0f;
-    public float GposeDensity { get; set; } = 1.0f;
     /// <summary>Strands drawn per baked strand (the assets hold a tenth of the reference density) and how far children spread (m).</summary>
     public int ChildCount { get; set; } = 3;
-    public int GposeChildCount { get; set; } = 6;
+    /// <summary>Removed in v13 (GPose uses Density and ChildCount): read from older configs for that migration step, never saved.</summary>
+    public float? GposeDensity { get; set; }
+    public int? GposeChildCount { get; set; }
+    public bool ShouldSerializeGposeDensity() => false;
+    public bool ShouldSerializeGposeChildCount() => false;
     public float ChildSpread { get; set; } = 0.01f;
     /// <summary>Most strands grown per item: a larger one (4 million is 26 m2 of fur, 432 MB in its largest buffer) grows thinned to it, with a warning. Off: FurGrower.MaxStrands.</summary>
     public bool StrandCapEnabled { get; set; } = true;
@@ -57,6 +60,7 @@ public sealed class Configuration : IPluginConfiguration
     public float UndercoatDarken { get; set; } = 0.3f;
     public float HueJitter { get; set; } = 0.2f;
     public Vector3 AmbientColor { get; set; } = new(0.45f, 0.42f, 0.45f);
+    /// <summary>Towards the strands' key light, only where the game's sun or moon can't be read (GameInterop.KeyLightDirection). Not in the UI.</summary>
     public Vector3 LightDirection { get; set; } = new(-0.4f, 0.8f, 0.45f);
     public float LightIntensity { get; set; } = 0.9f;
     /// <summary>White sheen, about hair's Fresnel reflectance. The lobe is so broad it covers every strand: 0.3 turned black fur grey with white tips.</summary>
@@ -89,8 +93,8 @@ public sealed class Configuration : IPluginConfiguration
     public bool HideBuriedStrands { get; set; } = true;
     /// <summary>How far the game's light on the fur is averaged over about a strand's length on screen (0 = light from the few
     /// pixels around each root, 1 = only the average): the game's shading of the mesh finer than the fur shows as blotches.
-    /// Above 0, strands whose root something hides (a hand under a cuff) take the light around their root too.</summary>
-    public float SceneSmoothing { get; set; } = 0.5f; // 1 lit red fur beside a pale trim 1.85x, past the collar's shadow
+    /// At any value, strands whose root something hides (a hand under a cuff) take the light around their root.</summary>
+    public float SceneSmoothing { get; set; } = 0f; // off: the user preferred 0 to 0.5 by eye (2026-11-27), averaging flattened the rolls' shading
     /// <summary>
     /// Where to draw in the game's render commands: -1 = auto (just before the first back-buffer bind without depth that follows
     /// the scene-depth binds: after the scene is composited, before nameplates/UI), N = right after the Nth back-buffer bind,

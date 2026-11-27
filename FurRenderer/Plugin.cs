@@ -103,9 +103,9 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private int furDraws;
     private readonly System.Diagnostics.Stopwatch cadenceWatch = new();
     private int presentsWindow, furDrawsWindow, emptyPresentsWindow, triggersWindow, depthBindsWindow, uiBindsWindow;
-    private string lastFrameInfo = "";
-    private nint lastFurTarget;
 #if DEV_TOOLS
+    private string lastFrameInfo = ""; // the debug channel's per-frame line
+    private nint lastFurTarget;
     private bool traceRequested;
     private List<string>? trace;
 #endif
@@ -147,6 +147,14 @@ public sealed unsafe class Plugin : IDalamudPlugin
         // 6 (the reference fit) turned every camera-facing stretch of fur into deep crimson bands and spots.
         if (config.Version < 11) { config.FacingDepth = 2f; config.Version = 11; }
         if (config.Version < 12) { config.Version = 12; }
+        if (config.Version < 13)
+        {
+            config.SceneSmoothing = Defaults.SceneSmoothing; // Smooth shadows now off by default
+            // GPose now uses the normal pair. With "Only in GPose" on, the GPose pair was the only one that ever applied.
+            if (config.OnlyInGpose)
+                (config.Density, config.ChildCount) = (config.GposeDensity ?? config.Density, config.GposeChildCount ?? config.ChildCount);
+            config.Version = 13;
+        }
 #if !DEV_TOOLS
         config.DebugSolid = false; // its checkbox is dev-only: one saved on by 0.5.5 would leave the fur magenta
 #endif
@@ -192,7 +200,9 @@ public sealed unsafe class Plugin : IDalamudPlugin
         // The render thread counts its draws while this runs: read and reset at once, or a draw in between went uncounted
         // (logged as presents without fur).
         var drawn = Interlocked.Exchange(ref furDraws, 0);
+#if DEV_TOOLS
         lastFrameInfo = $"frame: binds {backBufferBinds}, fur draws {drawn}, last fur target 0x{lastFurTarget:X}; {renderer?.PerfInfo}";
+#endif
         presentsWindow++; furDrawsWindow += drawn; if (drawn == 0) emptyPresentsWindow++;
         if (presentsWindow == 1) cadenceWatch.Restart();
         if (presentsWindow == 300)
@@ -610,7 +620,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         if (snap.Skip != null) { status = snap.Skip; return; }
         var draws = new List<FurDraw>(snap.Items.Count);
         int strands = 0, drawnStrands = 0;
-        var density = Math.Clamp(snap.Gpose ? config.GposeDensity : config.Density, 0f, 1f);
+        var density = Math.Clamp(config.Density, 0f, 1f);
         Matrix4x4.Invert(snap.View, out var invView);
         // Distances as at the normal field of view: GPose zoom (a narrower one) makes items bigger on screen.
         if (!snap.Gpose) lodFocal = snap.Proj.M22;
@@ -649,7 +659,6 @@ public sealed unsafe class Plugin : IDalamudPlugin
         }
         if (draws.Count == 0) { status = snap.Growing > 0 ? "growing fur" : "waiting for fur"; return; }
         var (view, proj) = (snap.View, snap.Proj);
-        gpose = snap.Gpose;
         if (!interop.TryGetBackBuffer(out var backBuffer)) { status = "no back buffer"; return; }
         if (boundTarget != null)
         {
@@ -666,10 +675,10 @@ public sealed unsafe class Plugin : IDalamudPlugin
             Diag("depth", config.UseSceneDepth ? interop.DepthInfo : "disabled in settings");
             var albedo = depth != null ? interop.GetSceneAlbedo() : null; // read at the depth's pixels: without depth, texel (0, 0) for every pixel
             Diag("albedo", albedo != null ? "GBuffer 2" : depth == null ? "not used without scene depth" : "no GBuffer 2: scene light also taken from surfaces over the items");
-            renderer.Draw(context, backBuffer, depth, albedo, new Vector2(dw, dh), draws, view, proj, gpose ? config.GposeChildCount : config.ChildCount, config);
+            renderer.Draw(context, backBuffer, depth, albedo, new Vector2(dw, dh), draws, view, proj, config.ChildCount, config);
             Interlocked.Increment(ref furDraws);
-            lastFurTarget = (nint)backBuffer;
 #if DEV_TOOLS
+            lastFurTarget = (nint)backBuffer;
             if (debugCapture != null)
             {
                 ID3D11Resource* depthTexture = null;
@@ -761,8 +770,10 @@ public sealed unsafe class Plugin : IDalamudPlugin
         if (ImGui.CollapsingHeader("Performance", ImGuiTreeNodeFlags.DefaultOpen))
         {
             const string density = " Higher: thicker, fuller fur, costs more. Lower: sparser fur, faster.";
+            changed |= Check("Only in GPose", () => config.OnlyInGpose, v => config.OnlyInGpose = v, d.OnlyInGpose,
+                "Show fur only in GPose. Saves all of its cost during normal play.");
             changed |= Slider("Density", () => config.Density, v => config.Density = v, d.Density, 0f, 1f,
-                "How many of the coat's strands are drawn in normal play." + density, 0, "%", 100f);
+                "How many of the coat's strands are drawn, in normal play and GPose." + density, 0, "%", 100f);
             changed |= SliderInt("Strands per root", () => config.ChildCount, v => config.ChildCount = v, d.ChildCount, 1, 16,
                 "Each grown strand is drawn this many times, the extra ones placed around it. Higher: denser fur, costs about that many times more. 1 = no extras.");
             ImGui.BeginDisabled();
@@ -786,20 +797,6 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 "Smoother strand edges and see-through tips. Costs about 1.2 ms per frame more at 1440p; the difference is small.");
             changed |= Slider("Temporal smoothing", () => config.TemporalSmoothing, v => config.TemporalSmoothing = v, d.TemporalSmoothing, 0f, 0.9f,
                 "Blends each frame with the previous ones so thin strands and tips don't flicker. Higher: calmer but softer, can smear in fast motion. Lower: sharper but more shimmer. 0 = off.", 0, "%", 100f);
-        }
-
-        if (ImGui.CollapsingHeader("GPose", ImGuiTreeNodeFlags.DefaultOpen))
-        {
-            const string density = " Higher: thicker, fuller fur, costs more. Lower: sparser fur, faster.";
-            changed |= Check("Only in GPose", () => config.OnlyInGpose, v => config.OnlyInGpose = v, d.OnlyInGpose,
-                "Show fur only in GPose. Saves all of its cost during normal play.");
-            changed |= Slider("Density (GPose)", () => config.GposeDensity, v => config.GposeDensity = v, d.GposeDensity, 0f, 1f,
-                "How many of the coat's strands are drawn in GPose, where you can afford more for screenshots." + density, 0, "%", 100f);
-            changed |= SliderInt("Strands per root (GPose)", () => config.GposeChildCount, v => config.GposeChildCount = v, d.GposeChildCount, 1, 16,
-                "The same as 'Strands per root', used in GPose. Higher: denser fur, costs about that many times more.");
-            ImGui.BeginDisabled();
-            ImGui.TextUnformatted($"Up close: {BaseStrandsPerCm2 * config.GposeDensity * config.GposeChildCount:F0} strands per cm² in GPose.");
-            ImGui.EndDisabled();
         }
 
         if (ImGui.CollapsingHeader("Strand shape", ImGuiTreeNodeFlags.DefaultOpen))
@@ -841,9 +838,9 @@ public sealed unsafe class Plugin : IDalamudPlugin
             changed |= Slider("Depth colour", () => config.Absorption, v => config.Absorption = v, d.Absorption, 0f, 6f,
                 "Deep fur gets darker and richer in colour, like real fur. Higher: stronger, more saturated shadows near the roots. 0 = off.");
             changed |= Slider("Partings", () => config.FacingDepth, v => config.FacingDepth = v, d.FacingDepth, 0f, 10f,
-                "Extra depth colour where you look straight down into the fur (partings, swirls). Higher: darker, more visible partings.", 1, "x");
+                "Extra depth colour where you look straight down into the fur (partings, swirls). Higher: darker, more visible partings. About 4x matches the reference renders.", 1, "x");
             changed |= Slider("Undercoat", () => config.UndercoatDarken, v => config.UndercoatDarken = v, d.UndercoatDarken, 0f, 1f,
-                "Brightness of the surface under the fur, which shows through gaps. Higher: brighter gaps. Lower: darker gaps, more depth.", 2, "x fur colour");
+                "Brightness of the surface under the fur, which shows through gaps. Higher: brighter gaps. Lower: darker gaps, more depth. Barely visible when the fur is dense (GPose).", 2, "x fur colour");
             changed |= Slider("Strand variation", () => config.HueJitter, v => config.HueJitter = v, d.HueJitter, 0f, 0.5f,
                 "Random brightness per strand. Higher: more natural, varied fur. Lower: one even colour.", 0, "%", 100f);
             changed |= Slider("Sheen", () => config.Specular, v => config.Specular = v, d.Specular, 0f, 1f,
@@ -853,13 +850,11 @@ public sealed unsafe class Plugin : IDalamudPlugin
             changed |= Slider("Film look", () => config.AgxToneMap, v => config.AgxToneMap = v, d.AgxToneMap, 0f, 1f,
                 "Higher: softer, filmic brights that don't blow out to white (as in the reference renders). Lower: plainer, punchier colours.", 0, "%", 100f);
             changed |= Slider("Gamma", () => config.OutputGamma, v => config.OutputGamma = v, d.OutputGamma, 1f, 3f,
-                "Fine brightness curve for the midtones while 'Film look' is below 100%. Leave at default unless the fur looks washed out or too dark.");
+                "How the game's picture is read for its lighting, and the fur's midtone curve while 'Film look' is below 100%. Higher: darker fur. Leave at default unless the fur looks washed out or too dark.");
             changed |= Color("Ambient light", () => config.AmbientColor, v => config.AmbientColor = v, d.AmbientColor,
                 "The plugin's own fill light, which keeps shadowed fur from going black.");
             changed |= Slider("Key light", () => config.LightIntensity, v => config.LightIntensity = v, d.LightIntensity, 0f, 3f,
-                "Strength of the plugin's own main light. Higher: brighter highlights and sheen.", 2, "x");
-            changed |= Direction("Key light direction", () => config.LightDirection, v => config.LightDirection = v, d.LightDirection,
-                "Where the plugin's main light comes from (X, Y = up, Z).");
+                "Strength of the light on each strand, from the game's sun by day and moon at night. Higher: brighter highlights and sheen.", 2, "x");
         }
 
         if (ImGui.CollapsingHeader("Advanced / troubleshooting"))
@@ -953,14 +948,6 @@ public sealed unsafe class Plugin : IDalamudPlugin
         var changed = ImGui.InputInt(label, ref v, flags: ImGuiInputTextFlags.EnterReturnsTrue);
         if (changed) set(Math.Clamp(v, min, max));
         return HelpAndReset(label, help, initial.ToString("N0"), () => set(initial)) | changed;
-    }
-
-    private static bool Direction(string label, Func<Vector3> get, Action<Vector3> set, Vector3 initial, string help)
-    {
-        var v = get();
-        var changed = ImGui.SliderFloat3(label, ref v, -1f, 1f, "%.2f", ImGuiSliderFlags.AlwaysClamp);
-        if (changed) set(v);
-        return HelpAndReset(label, help, string.Create(CultureInfo.InvariantCulture, $"{initial.X:F2}, {initial.Y:F2}, {initial.Z:F2}"), () => set(initial)) | changed;
     }
 
     private static bool Color(string label, Func<Vector3> get, Action<Vector3> set, Vector3 initial, string help)

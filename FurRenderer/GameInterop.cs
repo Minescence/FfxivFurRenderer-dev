@@ -47,6 +47,23 @@ internal sealed unsafe class GameInterop : IDisposable
         ReleaseDepthSrv();
     }
 
+    /// <summary>
+    /// The game's key light as the direction towards it: the sun by day, the moon at night. Null where the read isn't a downward
+    /// unit vector (another game version, no EnvManager).
+    /// </summary>
+    // Not in FFXIVClientStructs: EnvManager +1264 (its EnvSimulator +16) is the direction that light travels. Found by dumping
+    // EnvManager at held Eorzea times (2026-11-27): it swings east to west, stays 35 degrees or more above the horizon and jumps
+    // from moon to sun at 06:00 and back at 18:00; +1280 holds its colour (0 at those jumps). EnvManager.ShadowCamera is identity.
+    public static Vector3? KeyLightDirection()
+    {
+        // Not Instance(): it throws when a game patch breaks its signature, and the fur would stop instead of using the fallback.
+        var pp = FFXIVClientStructs.FFXIV.Client.Graphics.Environment.EnvManager.StaticAddressPointers.ppInstance;
+        var env = pp != null ? *pp : null;
+        if (env == null) return null;
+        var travel = *(Vector3*)((byte*)env + 1264);
+        return float.IsFinite(travel.X + travel.Y + travel.Z) && MathF.Abs(travel.LengthSquared() - 1) < 0.01f && travel.Y < 0 ? -travel : null;
+    }
+
     /// <summary>How the device/context were resolved (for the debug log).</summary>
     public string DeviceInfo { get; private set; } = "not queried";
 

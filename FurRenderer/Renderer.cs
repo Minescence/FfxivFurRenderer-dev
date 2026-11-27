@@ -67,6 +67,7 @@ internal sealed unsafe class Renderer : IDisposable
     private ID3D11PixelShader* psDepth;
     private ID3D11PixelShader* psSceneLuma;
     private ID3D11PixelShader* psSurfaceLight;
+    private ID3D11PixelShader* psOverlaid;
     private ID3D11SamplerState* linearClamp, linearWrap;
     private ID3D11ComputeShader* csStrandMatrices;
     private ID3D11ComputeShader* csHiZFirst;
@@ -124,6 +125,8 @@ internal sealed unsafe class Renderer : IDisposable
     private ID3D11ShaderResourceView* historySrv0, historySrv1;
     private bool historyFlip;
     private long historyTime;
+    private Vector3 keyLight; // LightDir as eased towards GameInterop.KeyLightDirection; keyLightTime 0 = not yet
+    private long keyLightTime;
     private Matrix4x4 lastViewProj;
     // Per fur layer sample, where it was on screen last frame (PSTemporal follows it there).
     private ID3D11Texture2D* motion;
@@ -145,6 +148,9 @@ internal sealed unsafe class Renderer : IDisposable
     private ID3D11Texture2D* surfaceLight;
     private ID3D11RenderTargetView* surfaceLightRtv;
     private ID3D11ShaderResourceView* surfaceLightSrv;
+    private ID3D11Texture2D* overlaid; // SurfaceLight's size, R8: where an item's surface lies under something (PSOverlaid)
+    private ID3D11RenderTargetView* overlaidRtv;
+    private ID3D11ShaderResourceView* overlaidSrv;
 
     // GPU time and shader invocations of the fur pass, read back a few frames late so nothing waits for the GPU.
     private const int QueryFrames = 4;
@@ -189,6 +195,7 @@ internal sealed unsafe class Renderer : IDisposable
         Pixel(code, "PSDepth", ref psDepth);
         Pixel(code, "PSSceneLuma", ref psSceneLuma);
         Pixel(code, "PSSurfaceLight", ref psSurfaceLight);
+        Pixel(code, "PSOverlaid", ref psOverlaid);
         var samplerDesc = new D3D11_SAMPLER_DESC
         {
             Filter = D3D11_FILTER.D3D11_FILTER_MIN_MAG_MIP_LINEAR,
@@ -581,7 +588,13 @@ internal sealed unsafe class Renderer : IDisposable
 
         // Constants
         Matrix4x4.Invert(view, out var invView);
-        var light = cfg.LightDirection.LengthSquared() > 0 ? Vector3.Normalize(cfg.LightDirection) : Vector3.UnitY;
+        var lightTarget = GameInterop.KeyLightDirection() ?? (cfg.LightDirection.LengthSquared() > 0 ? Vector3.Normalize(cfg.LightDirection) : Vector3.UnitY);
+        // Eased over about a second: the game's light jumps between moon and sun at 06:00 and 18:00, and the fur would pop.
+        var now = Stopwatch.GetTimestamp();
+        var step = keyLightTime != 0 ? 1f - MathF.Exp(-3f * (float)Stopwatch.GetElapsedTime(keyLightTime, now).TotalSeconds) : 1f;
+        var eased = Vector3.Lerp(keyLight, lightTarget, step);
+        (keyLight, keyLightTime) = (eased.LengthSquared() > 1e-6f ? Vector3.Normalize(eased) : lightTarget, now);
+        var light = keyLight;
         var autoUv = new Vector2(depthSize.X / bbDesc.Width, depthSize.Y / bbDesc.Height);
         var fc = new FrameConstants
         {
@@ -689,41 +702,60 @@ internal sealed unsafe class Renderer : IDisposable
             ctx->Draw(3, 0);
             if (fc.UseSceneDepth != 0)
             {
-                var lightRtv = surfaceLightRtv;
-                ctx->OMSetRenderTargets(1, &lightRtv, null);
-                ctx->ClearRenderTargetView(lightRtv, transparent);
                 var lightViewport = viewport;
                 lightViewport.Width = fc.SurfaceLightWidth;
                 lightViewport.Height = fc.SurfaceLightHeight;
                 ctx->RSSetViewports(1, &lightViewport);
                 ctx->VSSetShader(vsUnder, null, 0);
-                ctx->PSSetShader(psSurfaceLight, null, 0);
-                var luma = sceneLumaSrv;
-                ctx->PSSetShaderResources(4, 1, &luma);
                 var boneSrv = bonesSrv;
                 ctx->VSSetShaderResources(2, 1, &boneSrv);
                 var meshSrvs = stackalloc ID3D11ShaderResourceView*[2];
-                foreach (var draw in draws)
+                // The light on the items' surfaces, then where those surfaces lie under something (PSOverlaid reads the first).
+                for (var pass = 0; pass < 2; pass++)
                 {
-                    var item = draw.Buffers;
-                    if (item.MeshIndices == null) continue;
-                    BindMaterials(ctx, draw, ref fc); // PSSurfaceLight leaves out other surfaces by the item's colour
-                    Upload(ctx, (ID3D11Resource*)constants, &fc, sizeof(FrameConstants));
-                    UploadBones(ctx, draw);
-                    meshSrvs[0] = item.MeshVerticesSrv;
-                    meshSrvs[1] = item.MeshSkinsSrv;
-                    ctx->VSSetShaderResources(5, 2, meshSrvs);
-                    var meshSurfaces = item.MeshSurfacesSrv;
-                    ctx->VSSetShaderResources(20, 1, &meshSurfaces);
-                    ctx->IASetIndexBuffer(item.MeshIndices, DXGI_FORMAT_R32_UINT, 0);
-                    ctx->DrawIndexed(item.MeshIndexCount, 0, 0);
+                    var rtv = pass == 0 ? surfaceLightRtv : overlaidRtv;
+                    ctx->OMSetRenderTargets(1, &rtv, null);
+                    ctx->ClearRenderTargetView(rtv, transparent);
+                    ctx->PSSetShader(pass == 0 ? psSurfaceLight : psOverlaid, null, 0);
+                    // Bound after the target: before it SceneLuma was still the target, and D3D nulls a view of a bound target.
+                    var luma = sceneLumaSrv;
+                    ctx->PSSetShaderResources(4, 1, &luma);
+                    if (pass == 1)
+                    {
+                        var lightSrv0 = surfaceLightSrv;
+                        ctx->PSSetShaderResources(11, 1, &lightSrv0);
+                    }
+                    foreach (var draw in draws)
+                    {
+                        var item = draw.Buffers;
+                        if (item.MeshIndices == null) continue;
+                        if (pass == 0) // PSOverlaid reads neither, and VSUnder no per-item constant
+                        {
+                            BindMaterials(ctx, draw, ref fc); // PSSurfaceLight leaves out other surfaces by the item's colour
+                            Upload(ctx, (ID3D11Resource*)constants, &fc, sizeof(FrameConstants));
+                        }
+                        UploadBones(ctx, draw);
+                        meshSrvs[0] = item.MeshVerticesSrv;
+                        meshSrvs[1] = item.MeshSkinsSrv;
+                        ctx->VSSetShaderResources(5, 2, meshSrvs);
+                        var meshSurfaces = item.MeshSurfacesSrv;
+                        ctx->VSSetShaderResources(20, 1, &meshSurfaces);
+                        ctx->IASetIndexBuffer(item.MeshIndices, DXGI_FORMAT_R32_UINT, 0);
+                        ctx->DrawIndexed(item.MeshIndexCount, 0, 0);
+                    }
                 }
                 ctx->RSSetViewports(1, &viewport);
-                ctx->OMSetRenderTargets(furRtvCount, furRtvs, ownDepthDsv); // or the map can't be read: D3D nulls a view of a bound target
+                ctx->OMSetRenderTargets(furRtvCount, furRtvs, ownDepthDsv); // or the maps can't be read: D3D nulls a view of a bound target
+                ID3D11ShaderResourceView* unbound = null;
+                ctx->PSSetShaderResources(11, 1, &unbound); // PSOverlaid's input, not left bound while GenerateMips writes the mips
                 ctx->GenerateMips(surfaceLightSrv);
+                ctx->GenerateMips(overlaidSrv);
                 var lightSrv = surfaceLightSrv;
                 ctx->PSSetShaderResources(11, 1, &lightSrv);
                 ctx->VSSetShaderResources(11, 1, &lightSrv); // VSMain reads the light at strand roots
+                var overlaidView = overlaidSrv;
+                ctx->PSSetShaderResources(32, 1, &overlaidView);
+                ctx->VSSetShaderResources(32, 1, &overlaidView);
                 var sampler = linearClamp;
                 ctx->PSSetSamplers(0, 1, &sampler);
                 ctx->VSSetSamplers(0, 1, &sampler);
@@ -1010,6 +1042,10 @@ internal sealed unsafe class Renderer : IDisposable
         if (created) fixed (ID3D11Texture2D** out_ = &surfaceLight) created = device->CreateTexture2D(&desc, null, out_).SUCCEEDED;
         if (created) fixed (ID3D11RenderTargetView** out_ = &surfaceLightRtv) created = device->CreateRenderTargetView((ID3D11Resource*)surfaceLight, null, out_).SUCCEEDED;
         if (created) fixed (ID3D11ShaderResourceView** out_ = &surfaceLightSrv) created = device->CreateShaderResourceView((ID3D11Resource*)surfaceLight, null, out_).SUCCEEDED;
+        desc.Format = DXGI_FORMAT_R8_UNORM;
+        if (created) fixed (ID3D11Texture2D** out_ = &overlaid) created = device->CreateTexture2D(&desc, null, out_).SUCCEEDED;
+        if (created) fixed (ID3D11RenderTargetView** out_ = &overlaidRtv) created = device->CreateRenderTargetView((ID3D11Resource*)overlaid, null, out_).SUCCEEDED;
+        if (created) fixed (ID3D11ShaderResourceView** out_ = &overlaidSrv) created = device->CreateShaderResourceView((ID3D11Resource*)overlaid, null, out_).SUCCEEDED;
         if (!created) ReleaseSceneCopy();
         return created;
     }
@@ -1019,6 +1055,7 @@ internal sealed unsafe class Renderer : IDisposable
         Release(ref sceneCopySrv); Release(ref sceneCopy);
         Release(ref sceneLumaSrv); Release(ref sceneLumaRtv); Release(ref sceneLuma);
         Release(ref surfaceLightSrv); Release(ref surfaceLightRtv); Release(ref surfaceLight);
+        Release(ref overlaidSrv); Release(ref overlaidRtv); Release(ref overlaid);
     }
 
     private void EnsureTargets(D3D11_TEXTURE2D_DESC bbDesc)
@@ -1183,7 +1220,7 @@ internal sealed unsafe class Renderer : IDisposable
     // Every shader entry point in Fur.hlsl; the prefix picks the profile (vs_5_0, ps_5_0, cs_5_0).
     private static readonly string[] Entries =
     [
-        "VSMain", "PSMain", "VSUnder", "PSUnder", "VSComposite", "PSComposite", "PSTemporal", "PSDepth", "PSSceneLuma", "PSSurfaceLight",
+        "VSMain", "PSMain", "VSUnder", "PSUnder", "VSComposite", "PSComposite", "PSTemporal", "PSDepth", "PSSceneLuma", "PSSurfaceLight", "PSOverlaid",
         "CSStrandMatrices", "CSBucketOffsets", "CSScatter", "CSHiZFirst", "CSSeen", "CSHiZDown",
     ];
 
@@ -1250,7 +1287,7 @@ internal sealed unsafe class Renderer : IDisposable
     {
         Release(ref vs); Release(ref ps); Release(ref constants);
         Release(ref vsUnder); Release(ref psUnder); Release(ref vsComposite); Release(ref psComposite); Release(ref psTemporal); Release(ref psDepth);
-        Release(ref psSceneLuma); Release(ref psSurfaceLight); Release(ref linearClamp); Release(ref linearWrap); Release(ref csStrandMatrices);
+        Release(ref psSceneLuma); Release(ref psSurfaceLight); Release(ref psOverlaid); Release(ref linearClamp); Release(ref linearWrap); Release(ref csStrandMatrices);
         Release(ref csHiZFirst); Release(ref csHiZDown);
         Release(ref csSeen); Release(ref idSrv); Release(ref idRtv); Release(ref idTarget); Release(ref seenNowUav); Release(ref seenNow);
         Release(ref csBucketOffsets); Release(ref csScatter); Release(ref bucketsUav); Release(ref buckets);
@@ -1294,8 +1331,8 @@ internal sealed unsafe class Renderer : IDisposable
         private readonly ID3D11HullShader* hull;
         private readonly ID3D11DomainShader* domain;
         private readonly ID3D11Buffer* vsCb, psCb, csCb;
-        private readonly ID3D11ShaderResourceView*[] vsSrvs = new ID3D11ShaderResourceView*[30]; // t0..t29
-        private readonly ID3D11ShaderResourceView*[] psSrvs = new ID3D11ShaderResourceView*[29]; // t3..t31
+        private readonly ID3D11ShaderResourceView*[] vsSrvs = new ID3D11ShaderResourceView*[33]; // t0..t32
+        private readonly ID3D11ShaderResourceView*[] psSrvs = new ID3D11ShaderResourceView*[30]; // t3..t32
         private readonly ID3D11SamplerState*[] psSamplers = new ID3D11SamplerState*[2]; // s0..s1
         private readonly ID3D11SamplerState* csSampler; // s1
         private readonly ID3D11SamplerState* vsSampler; // s0

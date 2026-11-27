@@ -35,6 +35,7 @@ struct StrandMatrix
 StructuredBuffer<StrandMatrix> StrandMatrices : register(t9);
 RWStructuredBuffer<StrandMatrix> StrandMatricesOut : register(u0);
 Texture2D<float4> SurfaceLight : register(t11);       // the back buffer's size rounded down to powers of two (SurfaceLightSize), with mips: the light on the fur surface (luminance x its gain) x coverage, coverage, light x LightTint x coverage
+Texture2D<float> Overlaid : register(t32);            // SurfaceLight's size, with mips: 1 where the item's surface lies under something else (PSOverlaid)
 SamplerState LinearClamp : register(s0);
 Texture2D<float4> SceneColor : register(t10);         // copy of the lit frame (display-encoded) taken just before drawing
 Texture2D<float4> FurHistory : register(t30);         // PSTemporal's output last frame
@@ -331,9 +332,9 @@ VsOut VSMain(uint vid : SV_VertexID, uint instance : SV_InstanceID)
     // the item's own silhouette included.
     bool rootSeen = all(root.xy >= 4) && all(root.xy < ViewportSize - 4) && root.z > 0
         && !(UseSceneDepth != 0 && LinearDepth(SceneDepth.Load(int3(root.xy * DepthUvScale, 0))) < root.z - OwnSurface);
-    // Smoothed, a root something hides (a hand under the cuff) takes the item's light around it too. At its own pixel
-    // (PSMain) the light came from SurfaceLight's coarse levels, the coat-wide average: 3x its shaded neighbours (measured).
-    bool smoothed = !rootSeen && SceneSmoothing > 0 && UseSceneDepth != 0 && all(root.xy >= 0) && all(root.xy < ViewportSize) && root.z > 0;
+    // A root something hides (a hand under the cuff) takes the item's light around it too. At its own pixel (PSMain) the
+    // light came from SurfaceLight's coarse levels, the coat-wide average: 3x its shaded neighbours (measured).
+    bool smoothed = !rootSeen && UseSceneDepth != 0 && all(root.xy >= 0) && all(root.xy < ViewportSize) && root.z > 0;
     o.shade = float2(1.0 + (Hash(uint3(o.strand, 17u, 3u)) - 0.5) * 2.0 * HueJitter, rootSeen || smoothed ? 1 : 0);
     o.rootLight = 0;
     [branch] if (o.shade.y > 0) // one call: as ?: fxc ran SceneLit for every root
@@ -604,8 +605,9 @@ float3 SceneLit(float3 color, float2 at, float depth, float gain, float brightes
         tinted += s.x * gain * s.zw;
         count++;
     }
-    // SurfaceLight (t11) is made and bound only with scene depth: without it, only the taps.
-    [branch] if (SceneSmoothing > 0 && UseSceneDepth != 0)
+    // SurfaceLight (t11) is made and bound only with scene depth: without it, only the taps. Read at any SceneSmoothing, for
+    // the outline fix below and the roots without taps.
+    [branch] if (UseSceneDepth != 0)
     {
         // Grown strands are up to 5 cm x LengthScale; SurfaceLight's texels are ViewportSize / SurfaceLightSize pixels.
         float strandPixels = 0.05 * LengthScale * Proj._22 * 0.5 * ViewportSize.y / max(viewDepth, 0.1);
@@ -618,9 +620,11 @@ float3 SceneLit(float3 color, float2 at, float depth, float gain, float brightes
             // Where something lies over the item (a tail on the coat) the game shades the surface beside it dark and hides the
             // rest of this texel: the taps and the texel's average both held only that dark rim, and the fur around the tail
             // drew its outline (gone at SceneSmoothing 1, measured by eye). So the taps give way to the average by the share
-            // of the texel that holds no surface, and the level 4 x as far around fills that share by its own coverage, as
-            // the fallback's levels fill each other. The item's own edge (a hem, a cuff) lacks surface the same way.
-            float hidden = 1 - s.y;
+            // of the texel hidden that way, and the level 4 x as far around fills that share by its own coverage, as the
+            // fallback's levels fill each other. Not where the item just ends (a silhouette, a hem): there it took the light of
+            // the whole roll, at any SceneSmoothing above 0, and collars, cuffs and hems lost their shading (measured: the
+            // whole change from 0 to 1%).
+            float hidden = Overlaid.SampleLevel(LinearClamp, at / ViewportSize, lod);
             float w = count > 0 ? lerp(SceneSmoothing, 1, saturate(hidden * 4)) * saturate(s.y * 20 - 1) // from the 0.05 above, not a jump
                 : saturate(s.y * exp2(2 * lod) / SurfaceSamples);
             s += hidden * SurfaceLight.SampleLevel(LinearClamp, at / ViewportSize, lod + 2);
@@ -721,7 +725,8 @@ float LookingIn(float facing)
 }
 
 // Seen end-on, the asset's sparse strands (a fraction of the reference density) let the dark roots and undercoat show between
-// the tips where a full pelt would hide them: a dark groove that follows the camera. How much to shade those as tips instead.
+// the tips where a full pelt would hide them: a dark groove that follows the camera. How much to shade those as tips instead
+// (still saturated by LookingIn: the reference's whorl cores are crimson, not black).
 float EndOn(float facing)
 {
     return 0.8 * smoothstep(0.5, 1.0, facing);
@@ -767,8 +772,9 @@ float4 PSUnder(UnderOut i, out float2 motion : SV_Target1, out uint strandId : S
     float facing = dot(n, normalize(CameraPos - i.world));
     float brightest;
     float4 surface = SurfaceColor(i.material, i.uv, ddx(i.uv), ddy(i.uv), brightest);
-    float3 albedo = surface.rgb * UndercoatDarken * pow(max(surface.rgb, 1e-3), Absorption * (1.0 + FacingDepth * LookingIn(facing)));
-    albedo = lerp(albedo, surface.rgb, EndOn(facing)); // the gaps between end-on strands, shaded like their tips
+    float looking = Absorption * FacingDepth * LookingIn(facing);
+    float3 albedo = surface.rgb * UndercoatDarken * pow(max(surface.rgb, 1e-3), Absorption + looking);
+    albedo = lerp(albedo, surface.rgb * pow(max(surface.rgb, 1e-3), looking), EndOn(facing)); // the gaps between end-on strands, shaded like their tips (PSMain at t = 1)
     return Output(SceneLit(albedo * (AmbientColor + diffuse * LightIntensity), i.pos.xy, LinearDepth(i.pos.z), surface.a, brightest, LinearDepth(i.pos.z)));
 }
 
@@ -786,6 +792,24 @@ float4 PSSurfaceLight(UnderOut i) : SV_Target
     // beside it 2.7x too bright (measured).
     float light = s.x * gain;
     return float4(light, 1, light * s.zw);
+}
+
+// Into Overlaid, with VSUnder after PSSurfaceLight: the item's surface lies under something else (a tail, hair, a hand). This
+// mesh is here, no surface of the item shows (SurfaceLight holds none) and the frame shows something no farther than the mesh.
+// Not where the item's own front hides its back (SurfaceLight holds the front), nor past its silhouette (no mesh there).
+// Along the item's own seams (a cuff's edge over the sleeve) SurfaceLight's coarser pixels land past the edge and leave holes a
+// pixel or two wide, which made the cuff and collar lose their shading like the tail's rim (measured): only a hole with no
+// surface 2 pixels around counts.
+float PSOverlaid(UnderOut i) : SV_Target
+{
+    float depth = SceneLuma.Load(int3(i.pos.xy * ViewportSize / SurfaceLightSize, 0)).y; // 0 at the soft edges of hair (Unexplained)
+    if (depth > LinearDepth(i.pos.z) + OwnSurface)
+        discard;
+    [unroll] for (int y = -2; y <= 2; y += 2)
+        [unroll] for (int x = -2; x <= 2; x += 2)
+            if (SurfaceLight.Load(int3(int2(i.pos.xy) + int2(x, y), 0)).y > 0)
+                discard;
+    return 1;
 }
 
 float4 PSMain(VsOut i, uint geometry : SV_Coverage, out uint coverage : SV_Coverage, out float2 motion : SV_Target1,
@@ -836,9 +860,11 @@ float4 PSMain(VsOut i, uint geometry : SV_Coverage, out uint coverage : SV_Cover
     float3 albedo = i.surface.rgb * i.shade.x;
     // Light reaching deep into the fur has passed through many strands (Beer-Lambert: colour^path), which makes roots and
     // fur seen end-on (looking down into it) darker and more saturated, like the reference's magenta partings.
+    // Looking down into the fur, the light comes back through many strands whatever depth they end at, so that part isn't
+    // scaled by depth: scaled, EndOn cancelled it where the reference's crimson whorl cores and partings are darkest.
     float cosView = dot(normalize(i.growth), v);
     float buried = (1.0 - i.t) * (1.0 - EndOn(cosView));
-    albedo *= pow(max(i.surface.rgb, 1e-3), Absorption * buried * (1.0 + FacingDepth * LookingIn(cosView)));
+    albedo *= pow(max(i.surface.rgb, 1e-3), Absorption * (buried + FacingDepth * LookingIn(cosView)));
     // Light reaching this depth of the fur (reference: colour x intercept, black at the root). It shades the sheen too, or
     // roots go grey wherever they are seen side-on (silhouettes, partings).
     float shadow = lerp(RootDarken, 1.0, 1.0 - buried);
