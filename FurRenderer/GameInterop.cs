@@ -64,6 +64,25 @@ internal sealed unsafe class GameInterop : IDisposable
         return float.IsFinite(travel.X + travel.Y + travel.Z) && MathF.Abs(travel.LengthSquared() - 1) < 0.01f && travel.Y < 0 ? -travel : null;
     }
 
+    /// <summary>The device's GPU and its memory, for the diagnostics export.</summary>
+    public static string AdapterName(ID3D11Device* device)
+    {
+        IDXGIDevice* dxgi;
+        var hr = device->QueryInterface(__uuidof<IDXGIDevice>(), (void**)&dxgi);
+        if (hr.FAILED) return $"unknown (QueryInterface 0x{hr.Value:X8})";
+        IDXGIAdapter* adapter;
+        hr = dxgi->GetAdapter(&adapter);
+        dxgi->Release();
+        if (hr.FAILED) return $"unknown (GetAdapter 0x{hr.Value:X8})";
+        DXGI_ADAPTER_DESC desc;
+        hr = adapter->GetDesc(&desc);
+        adapter->Release();
+        if (hr.FAILED) return $"unknown (GetDesc 0x{hr.Value:X8})";
+        ReadOnlySpan<char> name = desc.Description;
+        var end = name.IndexOf('\0');
+        return $"{new string(end >= 0 ? name[..end] : name)} ({desc.DedicatedVideoMemory / (1024 * 1024)} MB)";
+    }
+
     /// <summary>How the device/context were resolved (for the debug log).</summary>
     public string DeviceInfo { get; private set; } = "not queried";
 

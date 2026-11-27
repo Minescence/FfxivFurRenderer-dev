@@ -32,6 +32,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
     // Shader bytecode, compiled on a worker thread at load so the render thread doesn't freeze for it (about 1 s).
     private readonly Task<Dictionary<string, byte[]>> shaderCode = Task.Run(() => Renderer.CompileShaders(ReadShader("Shaders.Fur.hlsl"), "Fur.hlsl"));
     private readonly IDataManager dataManager;
+    private readonly IGameConfig gameConfig;
+    private long exportedAt = -1; // Environment.TickCount64 of the last "Export all settings", for its confirmation
     private readonly bool[] found = new bool[Renderer.MaxBones];
     private readonly Dictionary<string, bool> bakedAssets = []; // asset file name -> exists; releases ship none, so not checked per frame
     private volatile FrameSnapshot? snapshot;
@@ -120,6 +122,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         this.commandManager = commandManager;
         this.log = log;
         this.dataManager = dataManager;
+        this.gameConfig = gameConfig;
         this.notifications = notifications;
         config = pluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
         // Each step resets what changed meaning or tuning in that version, leaving out what a later step resets again.
@@ -609,7 +612,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         if (renderer == null && rendererError == null)
         {
             if (!shaderCode.IsCompleted) { status = "compiling shaders"; return; }
-            try { renderer = new Renderer(device, shaderCode.GetAwaiter().GetResult()); Diag("renderer", "initialised"); }
+            try { renderer = new Renderer(device, shaderCode.GetAwaiter().GetResult()); Diag("renderer", "initialised"); Diag("gpu", GameInterop.AdapterName(device)); }
             catch (Exception ex) { rendererError = ex.Message; log.Error(ex, "Renderer init failed"); }
         }
         if (renderer == null) { status = "renderer init failed: " + rendererError; return; }
@@ -737,6 +740,25 @@ public sealed unsafe class Plugin : IDalamudPlugin
         if (renderer is { PerfInfo: { Length: > 0 } perf }) ImGui.TextUnformatted(perf);
         ImGui.TextUnformatted("Ctrl+click a slider to type a value, right-click a setting to reset it, hover for what it means.");
         ImGui.EndDisabled();
+        if (ImGui.Button("Export all settings"))
+        {
+            KeyValuePair<string, string>[] seen;
+            lock (diagLock) seen = lastDiag.OrderBy(p => p.Key, StringComparer.Ordinal).ToArray();
+#if DEV_TOOLS
+            var settings = debugCapture?.ForSaving(config) ?? config; // without the debug channel's overrides
+#else
+            var settings = config;
+#endif
+            ImGui.SetClipboardText(DiagnosticReport.Build(settings, Defaults, status, renderer?.PerfInfo, seen, pluginInterface, dataManager, gameConfig));
+            exportedAt = Environment.TickCount64;
+        }
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip("Copies your settings and what the plugin sees (time of day, weather, zone, the game's graphics options, GPU,\nother plugins) to the clipboard. Paste it when you report a problem.");
+        if (exportedAt >= 0 && Environment.TickCount64 - exportedAt < 4000)
+        {
+            ImGui.SameLine();
+            ImGui.TextUnformatted("Copied to the clipboard.");
+        }
         ImGui.Separator();
 
         var d = Defaults;

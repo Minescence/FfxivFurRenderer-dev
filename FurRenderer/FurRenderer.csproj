@@ -59,6 +59,9 @@
     <Reference Include="Lumina" Private="false">
       <HintPath>$(DalamudLibPath)Lumina.dll</HintPath>
     </Reference>
+    <Reference Include="Lumina.Excel" Private="false">
+      <HintPath>$(DalamudLibPath)Lumina.Excel.dll</HintPath>
+    </Reference>
     <Reference Include="Newtonsoft.Json" Private="false">
       <HintPath>$(DalamudLibPath)Newtonsoft.Json.dll</HintPath>
     </Reference>
