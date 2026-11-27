@@ -867,8 +867,10 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 "How much light reaches deep into the fur. Higher: evenly bright fur. Lower: dark roots, more depth and contrast.", 0, "%", 100f);
             changed |= Slider("Depth colour", () => config.Absorption, v => config.Absorption = v, d.Absorption, 0f, 6f,
                 "Deep fur gets darker and richer in colour, like real fur. Higher: stronger, more saturated shadows near the roots. 0 = off.");
-            changed |= Slider("Partings", () => config.FacingDepth, v => config.FacingDepth = v, d.FacingDepth, 0f, 10f,
-                "Extra depth colour where you look straight down into the fur (partings, swirls). Higher: darker, more visible partings. About 4x matches the reference renders.", 1, "x");
+            changed |= Check("Partings", () => config.FacingDepthEnabled, v => config.FacingDepthEnabled = v, d.FacingDepthEnabled,
+                "Extra depth colour where you look straight down into the fur (partings, swirls), as in the reference renders. Off: fur facing you keeps the colour of the rest, without a dark line that follows the camera.");
+            changed |= Slider("Partings strength", () => config.FacingDepth, v => config.FacingDepth = v, d.FacingDepth, 0f, 10f,
+                "How dark the partings get while 'Partings' is on. Higher: darker, more visible partings. About 4x matches the reference renders.", 1, "x");
             changed |= Slider("Undercoat", () => config.UndercoatDarken, v => config.UndercoatDarken = v, d.UndercoatDarken, 0f, 1f,
                 "Brightness of the surface under the fur, which shows through gaps. Higher: brighter gaps. Lower: darker gaps, more depth. Barely visible when the fur is dense (GPose).", 2, "x fur colour");
             changed |= Slider("Strand variation", () => config.HueJitter, v => config.HueJitter = v, d.HueJitter, 0f, 0.5f,

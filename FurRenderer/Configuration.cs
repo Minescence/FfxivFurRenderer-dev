@@ -71,9 +71,11 @@ public sealed class Configuration : IPluginConfiguration
     /// Colour absorption through the fur depth (darker, more saturated roots) and how much more when looking down into it.
     /// Fitted through AgX to the reference renders: lit fur seen side-on is near the base colour plus sheen, fur pointing at
     /// the camera is deep crimson. That fit gave FacingDepth 6, which in game made bands and spots wherever the coat faces the
-    /// camera; 2 keeps a hint of it.
+    /// camera; 2 keeps a hint of it. Even 2 showed as a dark line along trims facing the camera that follows it as it moves
+    /// (Hikari, 0.6.3), so it is off unless FacingDepthEnabled.
     /// </summary>
     public float Absorption { get; set; } = 0.4f;
+    public bool FacingDepthEnabled { get; set; }
     public float FacingDepth { get; set; } = 2f;
     /// <summary>0 = synthetic lighting only; 1 = brightness taken from the game's lit item around each strand root.</summary>
     public float SceneLighting { get; set; } = 1f;

@@ -641,7 +641,7 @@ internal sealed unsafe class Renderer : IDisposable
             ChildCount = (uint)Math.Clamp(childCount, 1, 16),
             ChildSpread = cfg.ChildSpread,
             Absorption = cfg.Absorption,
-            FacingDepth = cfg.FacingDepth,
+            FacingDepth = cfg.FacingDepthEnabled ? cfg.FacingDepth : 0f,
             SampleCount = sampleCount,
         };
         LastDrawInfo = $"backbuffer {bbDesc.Width}x{bbDesc.Height} {bbDesc.Format}; reverseZ(proj) {reverse}; depthUvScale {fc.DepthUvScale}; sceneDepth {(fc.UseSceneDepth != 0 ? "on" : "off")}";
