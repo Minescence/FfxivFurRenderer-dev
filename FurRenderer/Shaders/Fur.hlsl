@@ -630,14 +630,19 @@ float3 SceneLit(float3 color, float2 at, float depth, float gain, float brightes
         // kept one or two of them, a different one or two every frame as the coat swayed: the hem flickered in daylight
         // (measured: light multiplier 0.07 <-> 0.19 between frames). SurfaceLight compares each pixel with the mesh's own depth
         // there and averages all of them. Where it holds only a sliver (a silhouette), the strand-length level fills in.
-        float near = log2(max(8 * SurfaceLightSize.y / ViewportSize.y, 1));
+        // The square shrinks with distance to a third of a strand's length on screen (8 px up close, at least 2): a fixed 8 px
+        // spanned half a trim's width at 12 m, which took its shading (lit side, dark edges) and made it a flat grey band that
+        // looked wider than the same coat seen up close and shrunk (Hikari's report on 0.6.2). A smaller square holds fewer
+        // pixels, so it's trusted by the share of them on the surface instead of the count SurfaceSamples asks for.
+        float rootPixels = 0.05 * LengthScale * Proj._22 * 0.5 * ViewportSize.y / max(viewDepth, 0.1);
+        float near = log2(max(clamp(rootPixels / 3, 2, 8) * SurfaceLightSize.y / ViewportSize.y, 1));
         float4 s = SurfaceLight.SampleLevel(LinearClamp, at / ViewportSize, near);
         if (s.y > 0)
         {
             luma = s.x / s.y;
             tinted = s.zw / s.y;
             count = 1;
-            nearTrust = saturate(s.y * exp2(2 * near) / SurfaceSamples);
+            nearTrust = saturate(s.y * max(exp2(2 * near) / SurfaceSamples, 1));
         }
     }
     // SurfaceLight (t11) is made and bound only with scene depth: without it, only the taps. Read at any SceneSmoothing, for
