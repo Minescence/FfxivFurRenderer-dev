@@ -35,7 +35,7 @@ struct StrandMatrix
 StructuredBuffer<StrandMatrix> StrandMatrices : register(t9);
 RWStructuredBuffer<StrandMatrix> StrandMatricesOut : register(u0);
 Texture2D<float4> SurfaceLight : register(t11);       // the back buffer's size rounded down to powers of two (SurfaceLightSize), with mips: the light on the fur surface (luminance x its gain) x coverage, coverage, light x LightTint x coverage
-Texture2D<float> Overlaid : register(t32);            // SurfaceLight's size, with mips: 1 where the item's surface lies under something else (PSOverlaid)
+Texture2D<float2> Overlaid : register(t32);           // SurfaceLight's size, with mips: 1 where the item's surface lies under something else (PSOverlaid), 1 / that surface's view depth (m); a mip holds the share and the share x the mean
 SamplerState LinearClamp : register(s0);
 Texture2D<float4> SceneColor : register(t10);         // copy of the lit frame (display-encoded) taken just before drawing
 Texture2D<float4> FurHistory : register(t30);         // PSTemporal's output last frame
@@ -664,7 +664,12 @@ float3 SceneLit(float3 color, float2 at, float depth, float gain, float brightes
             // fallback's levels fill each other. Not where the item just ends (a silhouette, a hem): there it took the light of
             // the whole roll, at any SceneSmoothing above 0, and collars, cuffs and hems lost their shading (measured: the
             // whole change from 0 to 1%).
-            float hidden = Overlaid.SampleLevel(LinearClamp, at / ViewportSize, lod);
+            // Only a hidden surface near this root's own depth counts: legs over the lining behind the front trims are a strand
+            // length away on screen, 20-30 cm deeper, and gave the trims' shaded side leg-shaped patches of the roll's average
+            // light (Hikari's "beams of light" across the shadow, measured: 23% of the crop changed by ignoring it).
+            float2 overlaid = Overlaid.SampleLevel(LinearClamp, at / ViewportSize, lod);
+            float reach = 0.05 * LengthScale; // a strand's length
+            float hidden = overlaid.y > 0 ? overlaid.x * saturate(2 - abs(overlaid.x / overlaid.y - viewDepth) / reach) : 0;
             float w = count > 0 ? max(lerp(SceneSmoothing, 1, saturate(hidden * 4)), 1 - nearTrust) * saturate(s.y * 20 - 1) // from the 0.05 above, not a jump
                 : saturate(s.y * exp2(2 * lod) / SurfaceSamples);
             s += hidden * SurfaceLight.SampleLevel(LinearClamp, at / ViewportSize, lod + 2);
@@ -858,7 +863,7 @@ float4 PSSurfaceLight(UnderOut i) : SV_Target
 // Along the item's own seams (a cuff's edge over the sleeve) SurfaceLight's coarser pixels land past the edge and leave holes a
 // pixel or two wide, which made the cuff and collar lose their shading like the tail's rim (measured): only a hole with no
 // surface 2 pixels around counts.
-float PSOverlaid(UnderOut i) : SV_Target
+float2 PSOverlaid(UnderOut i) : SV_Target
 {
     int2 p = int2(i.pos.xy * ViewportSize / SurfaceLightSize);
     float depth = SceneLuma.Load(int3(p, 0)).y; // 0 at the soft edges of hair (Unexplained)
@@ -868,7 +873,7 @@ float PSOverlaid(UnderOut i) : SV_Target
         [unroll] for (int x = -2; x <= 2; x += 2)
             if (SurfaceLight.Load(int3(int2(i.pos.xy) + int2(x, y), 0)).y > 0)
                 discard;
-    return 1;
+    return float2(1, 1 / max(LinearDepth(i.pos.z), 0.01)); // blended by MAX: the nearest hidden layer (the coat under a tail, not the far side behind the body)
 }
 
 float4 PSMain(VsOut i, uint geometry : SV_Coverage, out uint coverage : SV_Coverage, out float2 motion : SV_Target1,

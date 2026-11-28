@@ -103,6 +103,7 @@ internal sealed unsafe class Renderer : IDisposable
     private ID3D11ShaderResourceView* bonesSrv;
     private ID3D11BlendState* blend;
     private ID3D11BlendState* compositeBlend;
+    private ID3D11BlendState* maxBlend;
     private ID3D11RasterizerState* raster;
     private ID3D11DepthStencilState* depthState;
     private ID3D11DepthStencilState* depthWriteState;
@@ -149,7 +150,7 @@ internal sealed unsafe class Renderer : IDisposable
     private ID3D11Texture2D* surfaceLight;
     private ID3D11RenderTargetView* surfaceLightRtv;
     private ID3D11ShaderResourceView* surfaceLightSrv;
-    private ID3D11Texture2D* overlaid; // SurfaceLight's size, R8: where an item's surface lies under something (PSOverlaid)
+    private ID3D11Texture2D* overlaid; // SurfaceLight's size, R16G16: where an item's surface lies under something, 1 / its depth (PSOverlaid)
     private ID3D11RenderTargetView* overlaidRtv;
     private ID3D11ShaderResourceView* overlaidSrv;
 
@@ -248,6 +249,11 @@ internal sealed unsafe class Renderer : IDisposable
         blendDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ZERO;
         blendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
         fixed (ID3D11BlendState** out_ = &compositeBlend) Check(device->CreateBlendState(&blendDesc, out_), "CreateBlendState(composite)");
+        // Overlaid: PSOverlaid draws every hidden layer of the item without a depth test; MAX keeps the nearest (1 / depth).
+        blendDesc.RenderTarget[0].BlendOp = blendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP.D3D11_BLEND_OP_MAX;
+        blendDesc.RenderTarget[0].DestBlend = blendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+        blendDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+        fixed (ID3D11BlendState** out_ = &maxBlend) Check(device->CreateBlendState(&blendDesc, out_), "CreateBlendState(max)");
 
         var rasterDesc = new D3D11_RASTERIZER_DESC
         {
@@ -719,6 +725,7 @@ internal sealed unsafe class Renderer : IDisposable
                     ctx->OMSetRenderTargets(1, &rtv, null);
                     ctx->ClearRenderTargetView(rtv, transparent);
                     ctx->PSSetShader(pass == 0 ? psSurfaceLight : psOverlaid, null, 0);
+                    ctx->OMSetBlendState(pass == 0 ? blend : maxBlend, blendFactor, 0xFFFFFFFF);
                     // Bound after the target: before it SceneLuma was still the target, and D3D nulls a view of a bound target.
                     var luma = sceneLumaSrv;
                     ctx->PSSetShaderResources(4, 1, &luma);
@@ -747,6 +754,7 @@ internal sealed unsafe class Renderer : IDisposable
                     }
                 }
                 ctx->RSSetViewports(1, &viewport);
+                ctx->OMSetBlendState(blend, blendFactor, 0xFFFFFFFF);
                 ctx->OMSetRenderTargets(furRtvCount, furRtvs, ownDepthDsv); // or the maps can't be read: D3D nulls a view of a bound target
                 ID3D11ShaderResourceView* unbound = null;
                 ctx->PSSetShaderResources(11, 1, &unbound); // PSOverlaid's input, not left bound while GenerateMips writes the mips
@@ -1044,7 +1052,7 @@ internal sealed unsafe class Renderer : IDisposable
         if (created) fixed (ID3D11Texture2D** out_ = &surfaceLight) created = device->CreateTexture2D(&desc, null, out_).SUCCEEDED;
         if (created) fixed (ID3D11RenderTargetView** out_ = &surfaceLightRtv) created = device->CreateRenderTargetView((ID3D11Resource*)surfaceLight, null, out_).SUCCEEDED;
         if (created) fixed (ID3D11ShaderResourceView** out_ = &surfaceLightSrv) created = device->CreateShaderResourceView((ID3D11Resource*)surfaceLight, null, out_).SUCCEEDED;
-        desc.Format = DXGI_FORMAT_R8_UNORM;
+        desc.Format = DXGI_FORMAT_R16G16_FLOAT;
         if (created) fixed (ID3D11Texture2D** out_ = &overlaid) created = device->CreateTexture2D(&desc, null, out_).SUCCEEDED;
         if (created) fixed (ID3D11RenderTargetView** out_ = &overlaidRtv) created = device->CreateRenderTargetView((ID3D11Resource*)overlaid, null, out_).SUCCEEDED;
         if (created) fixed (ID3D11ShaderResourceView** out_ = &overlaidSrv) created = device->CreateShaderResourceView((ID3D11Resource*)overlaid, null, out_).SUCCEEDED;
@@ -1296,7 +1304,7 @@ internal sealed unsafe class Renderer : IDisposable
         ReleaseHiZ();
         ReleaseDrawArgs();
         Release(ref bonesSrv); Release(ref bones);
-        Release(ref blend); Release(ref compositeBlend); Release(ref raster); Release(ref depthState); Release(ref depthWriteState);
+        Release(ref blend); Release(ref compositeBlend); Release(ref maxBlend); Release(ref raster); Release(ref depthState); Release(ref depthWriteState);
         Release(ref ownDepthSrv); Release(ref ownDepthDsv); Release(ref ownDepth); Release(ref sceneDepthDsv);
         Release(ref furColorRtv); Release(ref furColor);
         Release(ref furResolvedSrv); Release(ref furResolved);
